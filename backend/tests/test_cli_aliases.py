@@ -1,5 +1,5 @@
 """The web-session orchestration behind `icp show`'s Hide My Email lookup
-(icp.cli.app._ensure_web_session, _fetch_aliases_best_effort, _show_plain)."""
+(icp.cli.app._ensure_web_session, _fetch_aliases_best_effort)."""
 
 from types import SimpleNamespace
 
@@ -203,53 +203,3 @@ def test_fetch_aliases_returns_parsed_list_on_success(monkeypatch):
 
     assert result == [alias]
     assert saved == [[alias]]
-
-
-def _show_plain_args(query=None, show_passwords=False, plain=True):
-    return SimpleNamespace(query=query, show_passwords=show_passwords, plain=plain)
-
-
-@pytest.fixture(autouse=True)
-def _stub_status_fields(monkeypatch):
-    """`_show_plain` starts by printing `_status_fields()`, which touches the real session
-    file and device identity - irrelevant to these tests, so replace it with a fixed header."""
-    monkeypatch.setattr(app, "_status_fields", lambda: [("Status", "test-fixture")])
-
-
-def test_show_plain_alias_only_match_is_not_treated_as_no_match(monkeypatch, capsys):
-    """This is the whole point of collapsing Hide My Email into `show`: a query that only
-    matches an alias (no saved password) must still succeed, not report "no match"."""
-    alias = HmeAlias(anonymous_id="a1", address="quiet-otter@icloud.com", label="Claude",
-                     note="", forward_to="me@example.com", is_active=True,
-                     domain="claude.ai", created_at=0.0)
-    monkeypatch.setattr(app, "_fetch_aliases_best_effort", lambda interactive: [alias])
-
-    rc = app._show_plain(CredentialStore([]), _show_plain_args(query="claude"))
-
-    out = capsys.readouterr().out
-    assert rc == 0
-    assert "quiet-otter@icloud.com" in out
-
-
-def test_show_plain_no_match_in_either_source_errors(monkeypatch, capsys):
-    monkeypatch.setattr(app, "_fetch_aliases_best_effort", lambda interactive: [])
-
-    rc = app._show_plain(CredentialStore([]), _show_plain_args(query="nonexistent"))
-
-    assert rc == 1
-    assert "no credentials or aliases match" in capsys.readouterr().err
-
-
-def test_show_plain_credential_match_unaffected_by_empty_aliases(monkeypatch, capsys):
-    monkeypatch.setattr(app, "_fetch_aliases_best_effort", lambda interactive: [])
-    store = CredentialStore([Credential("claude.ai", "alice", "hunter2", "Claude")])
-
-    rc = app._show_plain(store, _show_plain_args(query="claude"))
-
-    out = capsys.readouterr().out
-    assert rc == 0
-    assert "claude.ai" in out
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])

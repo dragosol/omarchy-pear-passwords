@@ -3,8 +3,7 @@
 Lives on a unix socket under $XDG_RUNTIME_DIR, which is already 0700, so only your own user can
 reach it. That is also the honest limit of this design: while unlocked, anything running as you
 can ask for the key, exactly as anything running as you can scrape an unlocked Bitwarden. The
-timeout is what bounds the window - there is no way to tell "the browser extension" apart from
-anything else here, because native messaging does not authenticate its caller.
+timeout is what bounds the window. Only used once a passphrase is set.
 
 Auto-spawns on first use; no systemd unit to install.
 """

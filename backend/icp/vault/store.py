@@ -1,4 +1,4 @@
-"""Encrypted local vault of decrypted credentials (read by the native host). Persisted with the
+"""Encrypted local vault of decrypted credentials (read by the app's backend). Persisted with the
 same libsodium secret box + keyring master key as the auth session, file mode 0600."""
 
 from __future__ import annotations

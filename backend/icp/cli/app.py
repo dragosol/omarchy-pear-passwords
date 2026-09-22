@@ -3,7 +3,7 @@
 Interactive: the Apple ID password and 2FA code are read from the terminal and never
 stored. Only the resulting tokens are persisted, encrypted.
 
-Commands: login, show, sync, logout. `show` also folds in Hide My Email aliases.
+Commands: login, sync, logout, plus the app-* JSON commands the Pear Passwords window uses.
 """
 import argparse
 import base64
@@ -296,65 +296,10 @@ def cmd_login(args) -> int:
     return rc
 
 
-def _status_fields() -> list[tuple[str, object]]:
-    """The full account/session state as (label, value) rows - shown by `show`."""
-    s = session.load()
-    if not s:
-        return [("Status", "not signed in - run: icp login")]
-    rows = [("Apple ID", s.get("username")), ("DSID", s.get("dsid")),
-            ("Signed in", _utc(s.get("logged_in_at", 0) * 1000).isoformat())]
-    now = datetime.now(timezone.utc)
-    app_tokens = s.get("app_tokens") or {}
-    icloud_auth = app_tokens.get(ICLOUD_AUTH_TOKEN)
-    if icloud_auth and icloud_auth.get("expiry"):
-        exp = _utc(icloud_auth["expiry"])
-        state = "valid" if exp > now else "EXPIRED"
-        rows.append(("iCloud token", f"{state}, until {exp.date()} (~{(exp - now).days} days)"))
-    rows.append(("App tokens", len(app_tokens)))
-    mme = s.get("mme") or {}
-    rows.append(("mmeAuthToken",
-                 f"present (dsid {mme.get('dsid')}) - persistent" if mme.get("mmeAuthToken")
-                 else "none - run login"))
-    ws = s.get("webservices") or {}
-    rows.append(("Service URLs", f"{len(ws)} cached" if ws else "none - run login"))
-    octagon = s.get("octagon") or {}
-    rows.append(("Octagon peer", octagon.get("peer_id") or "not yet joined"))
-    rows.append(("Device ID", Device.load_or_create().device_id))
-    return rows
-
-
-def _status_summary() -> str:
-    """One-line account state for the TUI header."""
-    s = session.load()
-    if not s:
-        return "not signed in - run: icp login"
-    from ..octagon import client as octagon
-    joined = "joined" if octagon.is_joined(s) else "not joined"
-    token = ""
-    icloud_auth = (s.get("app_tokens") or {}).get(ICLOUD_AUTH_TOKEN) or {}
-    if icloud_auth.get("expiry"):
-        exp = _utc(icloud_auth["expiry"])
-        valid = "valid" if exp > datetime.now(timezone.utc) else "EXPIRED"
-        token = f"  |  token {valid} {exp.date()}"
-    return f"{s.get('username')}  |  dsid {s.get('dsid')}  |  {joined}{token}"
-
-
-def _match(c, q: str) -> bool:
-    """Case-insensitive substring match (q already lowercased) across domain/title/username."""
-    return (not q or q in c.domain.lower() or q in c.title.lower()
-            or q in c.username.lower())
-
-
-def _alias_match(a, q: str) -> bool:
-    """Same idea as `_match`, over a Hide My Email alias's searchable fields."""
-    return (not q or q in a.address.lower() or q in a.label.lower()
-            or q in a.note.lower() or q in a.forward_to.lower())
-
-
 def _fetch_aliases_best_effort(interactive: bool) -> list:
-    """Hide My Email aliases for `show`, fetched via the web session (auth/webauth.py). Never
-    fails `show`: no saved password skips silently, any other error warns and falls back to the
-    cached aliases. On success, refreshes that cache (hme/store.py) for the native host."""
+    """Hide My Email aliases, fetched via the web session (auth/webauth.py). Never fails the
+    caller: no saved password skips silently, any other error warns and falls back to the cached
+    aliases. On success, refreshes that cache (hme/store.py)."""
     from ..auth import webauth
     from ..hme.client import HmeClient, HmeError
     from ..hme.store import load_aliases, save_aliases
@@ -374,151 +319,6 @@ def _fetch_aliases_best_effort(interactive: bool) -> list:
     except (webauth.WebAuthError, HmeError) as e:
         ui.warn(f"Hide My Email unavailable: {e}")
         return load_aliases()
-
-
-def cmd_show(args) -> int:
-    """Browse/search stored credentials, Hide My Email aliases, and account status.
-
-    With a TTY and no arguments, opens a full-screen browser over the vault (offline); a query,
-    --plain, --show-passwords, or non-terminal stdout falls back to plain text (which also folds
-    in aliases). Status to stderr, rows to stdout so the list stays pipe/grep-friendly.
-    """
-    from ..vault.store import load_vault
-
-    try:
-        store = load_vault()
-    except Exception as e:  # noqa: BLE001 - surface keyring/decrypt failures cleanly
-        ui.err(f"could not open the vault: {e}")
-        return 1
-
-    use_tui = (not args.plain and not args.query and not args.show_passwords
-               and sys.stdin.isatty() and sys.stdout.isatty())
-    if use_tui:
-        try:
-            return _run_tui(store)
-        except Exception as e:  # noqa: BLE001 - curses missing/unusable -> plain fallback
-            ui.warn(f"TUI unavailable ({e}); showing plain output")
-    return _show_plain(store, args)
-
-
-def _show_plain(store, args) -> int:
-    for label, value in _status_fields():
-        ui.step(f"{label:<14}{value}")
-
-    query = (args.query or "").strip().lower()
-    creds = store.all()
-    if query:
-        creds = [c for c in creds if _match(c, query)]
-    aliases = _fetch_aliases_best_effort(sys.stdin.isatty())
-    if query:
-        aliases = [a for a in aliases if _alias_match(a, query)]
-
-    if query and not creds and not aliases:
-        ui.err(f"no credentials or aliases match {args.query!r}")
-        return 1
-    if not creds and not aliases:
-        ui.step("vault is empty - run: icp login")
-        return 0
-
-    if creds:
-        creds.sort(key=lambda c: (c.title.lower(), c.username.lower()))
-        dom_w = min(max(len(c.domain) for c in creds), 40)
-        user_w = min(max(len(c.username) for c in creds), 40)
-        for c in creds:
-            pw = c.password if args.show_passwords else "******"
-            ui.out(f"{c.domain:<{dom_w}}  {c.username:<{user_w}}  {pw}")
-        ui.step(f"{len(creds)} credential(s).")
-
-    if aliases:
-        aliases.sort(key=lambda a: a.label.lower())
-        label_w = min(max(len(a.label) for a in aliases), 32)
-        ui.step("")
-        ui.step("Hide My Email:")
-        for a in aliases:
-            state = "" if a.is_active else "  (inactive)"
-            ui.out(f"{a.label:<{label_w}}  {a.address}{state}")
-        ui.step(f"{len(aliases)} alias(es).")
-    return 0
-
-
-def _printable(s: str) -> str:
-    """Replace non-printable bytes with a dot so untrusted values (passwords are arbitrary binary;
-    some keychain items are cert/key blobs full of \\n, \\r, ESC) can't inject terminal escape
-    sequences. Normal printable Unicode is preserved."""
-    return "".join(ch if ch.isprintable() else "." for ch in s)
-
-
-def _run_tui(store) -> int:
-    """A very basic full-screen browser: status header, live-filter search box, and reveal a
-    selected password with Enter. Type to filter, up/down to move, Esc to clear the query (or quit
-    when it is empty)."""
-    import curses
-
-    creds = sorted(store.all(), key=lambda c: (c.title.lower(), c.username.lower()))
-    dom_w = min(max((len(c.domain) for c in creds), default=6), 32)
-    user_w = min(max((len(c.username) for c in creds), default=4), 32)
-    summary = _printable(f"{_status_summary()}  |  {len(creds)} credential(s)")
-    footer = "type to search | up/down move | Enter reveal | Esc clear/quit"
-
-    def draw(stdscr):
-        curses.curs_set(0)
-        stdscr.keypad(True)
-
-        def put(y, x, s, attr=curses.A_NORMAL):
-            # addnstr raises curses.error on the bottom-right cell and other edges; a draw glitch
-            # must never tear the whole TUI down (that drops everything back to the console).
-            try:
-                stdscr.addnstr(y, x, s, max(0, w - 1 - x), attr)
-            except curses.error:
-                pass
-
-        query, sel, offset, revealed = "", 0, 0, set()
-        while True:
-            shown = [c for c in creds if _match(c, query.lower())]
-            sel = max(0, min(sel, len(shown) - 1))
-            h, w = stdscr.getmaxyx()
-            view_h = max(1, h - 4)
-            if sel < offset:
-                offset = sel
-            elif sel >= offset + view_h:
-                offset = sel - view_h + 1
-
-            stdscr.erase()
-            put(0, 0, summary, curses.A_BOLD)
-            put(1, 0, _printable(f"Search: {query}"))
-            if not shown:
-                put(3, 0, "(no matching credentials)", curses.A_DIM)
-            for idx, c in enumerate(shown[offset:offset + view_h]):
-                i = offset + idx
-                pw = c.password if id(c) in revealed else "******"
-                line = _printable(f"{c.domain:<{dom_w}}  {c.username:<{user_w}}  {pw}")
-                put(3 + idx, 0, line, curses.A_REVERSE if i == sel else curses.A_NORMAL)
-            put(h - 1, 0, footer, curses.A_DIM)
-            stdscr.refresh()
-
-            ch = stdscr.getch()
-            if ch == 27:  # Esc: clear the query, or quit when it is already empty
-                if query:
-                    query, sel, offset = "", 0, 0
-                else:
-                    return 0
-            elif ch == curses.KEY_UP:
-                sel = max(0, sel - 1)
-            elif ch == curses.KEY_DOWN:
-                sel = min(len(shown) - 1, sel + 1) if shown else 0
-            elif ch in (curses.KEY_ENTER, 10, 13):
-                if shown:
-                    revealed ^= {id(shown[sel])}
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                query, sel, offset = query[:-1], 0, 0
-            elif 32 <= ch < 127:
-                query, sel, offset = query + chr(ch), 0, 0
-
-    try:
-        curses.wrapper(draw)
-    except KeyboardInterrupt:
-        pass
-    return 0
 
 
 def _join_and_sync(s: dict, device, anisette, username: str, password: str) -> int:
@@ -812,6 +612,17 @@ def cmd_passphrase(args) -> int:
         old_aliases = hme_store.load_aliases()
     except Exception:
         old_aliases = None
+    # History and nicknames sit under the same master key; leaving them out made them
+    # unreadable the moment the key changed.
+    from ..vault import history as history_store, nicknames as nickname_store
+    try:
+        old_history = history_store.load()
+    except Exception:
+        old_history = None
+    try:
+        old_names = nickname_store.load()
+    except Exception:
+        old_names = None
 
     new = prompt.ask_passphrase(text="Choose a passphrase for your keychain")
     again = prompt.ask_passphrase(text="Confirm passphrase")
@@ -834,6 +645,10 @@ def cmd_passphrase(args) -> int:
         vault_store.save_vault(old_vault)
     if old_aliases is not None:
         hme_store.save_aliases(old_aliases)
+    if old_history:
+        history_store.save(old_history)
+    if old_names:
+        nickname_store.save(old_names)
 
     # Drop the pre-passphrase master-key item. The lockbox-derived vault key was
     # just written by held_key.save above.
@@ -879,17 +694,6 @@ def _build_parser():
                          "each time the ~7-day token expires)")
     lp.add_argument("--debug", action="store_true", help="write a redacted debug transcript")
     lp.set_defaults(func=cmd_login)
-
-    sp = sub.add_parser(
-        "show", help="browse/search credentials, Hide My Email aliases, and account status (TUI)")
-    sp.add_argument("query", nargs="?",
-                    help="filter by substring of domain/title/username, or alias/label/note "
-                         "(plain output)")
-    sp.add_argument("-s", "--show-passwords", action="store_true",
-                    help="reveal passwords in plain output")
-    sp.add_argument("--plain", action="store_true",
-                    help="print plain text instead of the interactive TUI")
-    sp.set_defaults(func=cmd_show)
 
     sub.add_parser("sync", help="re-fetch and decrypt the keychain into the vault"
                    ).set_defaults(func=cmd_sync)

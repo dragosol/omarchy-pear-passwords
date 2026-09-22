@@ -1,21 +1,13 @@
-"""Native-messaging host for the browser autofill extension. Speaks Chrome's native-messaging
-protocol on stdin/stdout (4-byte LE length prefix + UTF-8 JSON) and answers domain queries from
-the decrypted vault, read-only.
-
-Protocol (JSON):
-  -> {"cmd":"ping"}                              <- {"ok":true,"count":N}
-  -> {"cmd":"match","domain":"login.example.com"} <- {"ok":true,"credentials":[{...}]}
-  -> {"cmd":"totp","domain":"x","username":"y"}   <- {"ok":true,"code":"123456","seconds":23}
+"""The credential model: one login (Credential) and the in-memory store the app reads
+(CredentialStore), built from decrypted keychain items. Nothing here opens a socket or
+listens for anyone - the app asks the backend CLI, one command at a time.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime
-import json
 import re
-import struct
-import sys
 
 
 @dataclasses.dataclass(frozen=True)
@@ -280,120 +272,3 @@ class CredentialStore:
                                     apple_title=extra.get("apple_title", ""),
                                     aliases=alias, sites=tuple(extra.get("sites") or ())))
         return cls(creds)
-
-
-# native-messaging framing
-def read_message(stream=None) -> dict | None:
-    stream = stream or sys.stdin.buffer
-    raw_len = stream.read(4)
-    if len(raw_len) < 4:
-        return None
-    (length,) = struct.unpack("<I", raw_len)
-    data = stream.read(length)
-    if len(data) < length:
-        return None
-    return json.loads(data.decode("utf-8"))
-
-
-def write_message(message: dict, stream=None) -> None:
-    stream = stream or sys.stdout.buffer
-    encoded = json.dumps(message).encode("utf-8")
-    stream.write(struct.pack("<I", len(encoded)))
-    stream.write(encoded)
-    stream.flush()
-
-
-def handle(request: dict, store: CredentialStore, aliases: list | None = None) -> dict:
-    cmd = request.get("cmd")
-    if cmd == "ping":
-        return {"ok": True, "count": len(store)}
-    if cmd == "totp":
-        # Returns a code that expires in at most `period` seconds - never the secret. A
-        # compromised extension therefore gets one throwaway code rather than a permanent
-        # second factor, which is why the seed still never crosses this socket.
-        domain, username = request.get("domain", ""), request.get("username", "")
-        if not domain:
-            return {"ok": False, "error": "missing domain"}
-        for c in store.match(domain):
-            if c.totp and (not username or c.username == username):
-                code, seconds = c.totp_code()
-                return {"ok": True, "code": code, "seconds": seconds,
-                        "username": c.username, "domain": c.domain}
-        return {"ok": False, "error": "no verification code for that account"}
-
-    if cmd == "match":
-        domain = request.get("domain", "")
-        if not domain:
-            return {"ok": False, "error": "missing domain"}
-        matched = match_aliases(domain, aliases or [])
-        return {"ok": True, "credentials": [c.public_dict() for c in store.match(domain)],
-                "aliases": [a.public_dict() for a in matched]}
-    return {"ok": False, "error": f"unknown cmd {cmd!r}"}
-
-
-def serve(store: CredentialStore, *, aliases: list | None = None,
-         instream=None, outstream=None) -> None:
-    """Blocking native-messaging loop. Returns when the extension disconnects (EOF)."""
-    while True:
-        request = read_message(instream)
-        if request is None:
-            return
-        write_message(handle(request, store, aliases), outstream)
-
-
-def _maybe_trigger_sync() -> None:
-    """If the vault is older than ICP_SYNC_MAX_AGE (default 6h), kick off a detached `sync`
-    in the background and return immediately - the current request is still served from the
-    existing vault, and the refreshed data is picked up on the next host spawn.
-
-    Best-effort: never blocks and never raises. A debounce marker stops a multi-frame page from
-    launching many syncs at once; `sync` itself holds a lock so only one ever runs."""
-    import os
-    import subprocess
-    import time
-
-    from .. import paths
-    try:
-        max_age = int(os.environ.get("ICP_SYNC_MAX_AGE", str(6 * 3600)))
-        if max_age <= 0:
-            return  # auto-sync disabled
-        vault = paths.vault_file()
-        if vault.exists() and (time.time() - vault.stat().st_mtime) < max_age:
-            return  # fresh enough
-        if paths.needs_login_file().exists():
-            return  # latched: a code would only go to the phone with nothing able to accept it
-        attempt = paths.sync_attempt_file()
-        if attempt.exists() and (time.time() - attempt.stat().st_mtime) < 300:
-            return  # already triggered recently
-        attempt.touch()
-        subprocess.Popen(
-            [sys.executable, "-m", "icp.cli.app", "sync"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except Exception:
-        pass
-
-
-def main(argv=None) -> int:
-    """Serve the decrypted vault; fall back to an empty store so the extension can still
-    connect/ping when no vault has been synced yet. Hide My Email aliases are a best-effort
-    add-on (empty list if no cache exists yet - the host never touches the network itself,
-    the cache is only ever populated by `icp show`/`icp sync`)."""
-    _maybe_trigger_sync()
-    try:
-        from .store import load_vault
-        store = load_vault()
-    except Exception:
-        store = CredentialStore([])
-    try:
-        from ..hme.store import load_aliases
-        aliases = load_aliases()
-    except Exception:
-        aliases = []
-    serve(store, aliases=aliases)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
