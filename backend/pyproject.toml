@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pear-passwords-backend"
+version = "1.0.0"
+description = "Backend for Pear Passwords: sign in to iCloud Keychain and sync it on Linux"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "certifi",
+    "srp>=1.0.20",
+    "cryptography>=42.0",
+    "pynacl>=1.5",
+    "secretstorage>=3.3",
+]
+
+license = "MIT"
+
+[project.scripts]
+icp = "icp.cli.app:main"
+
+[tool.setuptools.packages.find]
+include = ["icp*"]
+
+[tool.setuptools.package-data]
+# Apple's root CA, pinned for the gateway TLS chain. Not Python, so it must be declared.
+icp = ["certs/*.pem"]

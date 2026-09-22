@@ -1,0 +1,178 @@
+# Pear Passwords
+
+Your iCloud Keychain passwords on Omarchy, in a native window.
+
+![Pear Passwords](preview.png)
+
+Sign in with your Apple Account, approve this computer once, and your passwords and
+verification codes stay in sync. The window follows your Omarchy theme and is built from
+Omarchy's own shell components.
+
+> Pear Passwords is an independent project. It is not made, endorsed or supported by Apple.
+> iCloud, iCloud Keychain and Apple Account are Apple's trademarks, used here only to say
+> what this works with.
+
+## What it does
+
+- **Your iCloud Keychain, synced.** It signs in as a Mac would, joins your keychain once, then
+  syncs every two hours and when you open it. Apple should not ask for a code again unless it
+  signs you out.
+- **Locked until you say so.** Names, sites and usernames stay hidden until you unlock with your
+  fingerprint or password. Revealing, copying or changing a password asks again, per entry.
+- **Click to copy.** Username, password, website and verification code. Copied passwords clear
+  themselves from the clipboard.
+- **Add passwords.** **+ New** saves a login to iCloud, with a generated password if you want
+  one, and optional notes and verification code.
+- **Edit what Apple stores.** Extra websites, notes and verification codes. Set up a code by
+  pasting the setup key or link, or scan the QR code straight off your screen, and see the
+  live code before you save.
+- **Password history.** Changes seen during sync are kept, alongside the history Apple stores.
+- **Change a password, one at a time.** Writes back to iCloud, so your other devices get it.
+  Each change needs its own fingerprint or password: nothing can rewrite your keychain in bulk.
+- **Strong, memorable passwords.** The generator uses the same six-six-six shape as Apple's.
+- **Names that sync.** Rename an entry here and the name shows up on your other devices too.
+- **Wi-Fi passwords.** Your saved networks, shown as networks rather than websites.
+- **Search that understands what you want.** Type a name or site, or one of these to filter:
+
+  | Search | Shows |
+  | --- | --- |
+  | `2fa`, `mfa`, `2fa codes`, `verification codes` | entries with a verification code |
+  | `notes` | entries with notes |
+  | `websites` | entries with a website |
+  | `wifi` | Wi-Fi networks |
+
+- **Keyboard first.** Arrows to move, Tab into the details, Enter to copy, Esc to go back.
+
+## Install
+
+```bash
+omarchy plugin add https://github.com/dragosol/omarchy-pear-passwords.git --enable
+cd ~/.config/omarchy/plugins/io.github.dragosol.pear-passwords
+./install.sh
+```
+
+Then search **Pear Passwords** in the launcher.
+
+`install.sh` runs as your user and never uses sudo. It installs, all under your home directory:
+
+| What | Where |
+| --- | --- |
+| The backend (Python, in its own virtualenv) | `~/.local/share/pear-passwords/venv` |
+| The app window (Quickshell) | `~/.local/share/pear-passwords/app` |
+| The launcher | `~/.local/share/applications/pear-passwords.desktop` |
+| Sign-in helper + 2-hourly sync (systemd user units) | `~/.config/systemd/user/pear-passwords-*` |
+
+Requires `python3`, `podman`, `quickshell` and `wl-clipboard`. Scanning QR codes also
+uses `grim`, `slurp` and `zbar`. After
+`omarchy plugin update`, run `./install.sh` again to pick up the new version.
+
+### First sign-in
+
+The first launch opens straight into sign-in:
+
+1. **Apple Account and password.** Your password is saved encrypted on this computer so the app
+   can stay signed in on its own.
+2. **Verification code**, sent to your other Apple devices.
+3. **Join your keychain.** Pick one of your devices and enter its **lock-screen passcode**
+   (iPhone, iPad) or **login password** (Mac). This is how Apple lets a new device read your
+   keychain without another device approving it.
+
+> [!WARNING]
+> Step 3 is the one step that can't be undone. Apple allows about 10 wrong passcode attempts per
+> device. After the 10th, Apple permanently destroys that device's escrow record, and it can no
+> longer be used to add new devices. Your passwords on devices that already trust you are not
+> affected. The app shows this warning before you type, and **Not now** backs out without
+> spending an attempt.
+
+## Optional
+
+### Fingerprint unlock through Omarchy's overlay
+
+Without this, unlocking falls back to a standard administrator prompt. With it, the app asks
+through Omarchy's own polkit overlay, which offers your fingerprint. It is one file: copy the
+command as a whole, so nothing from the plugin folder is ever run as root.
+
+```bash
+sudo tee /usr/share/polkit-1/actions/org.icp.unlock.policy >/dev/null <<'POLICY'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <vendor>Pear Passwords</vendor>
+
+  <!-- Re-authentication for an already-unlocked keychain. auth_self prompts via the desktop
+       polkit agent for whichever factors PAM offers - here the user's own password, or a
+       fingerprint, because polkit-1 includes system-auth and that carries pam_fprintd.
+
+       This gates nothing privileged: it is checked with pkcheck, which runs no command. The
+       vault key still comes from the passphrase; this only decides whether an existing agent
+       lease may be used without retyping it. -->
+  <action id="org.icp.unlock">
+    <description>Unlock Pear Passwords</description>
+    <message>Authenticate to view your saved passwords</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+</policyconfig>
+POLICY
+```
+
+The action only asks *you* to authenticate as yourself (`auth_self`). It grants nothing
+privileged.
+
+### Float at the designed size
+
+The window is laid out for 960×640. To have Hyprland float it at that size, add to
+`~/.config/hypr/windows.lua`:
+
+```lua
+o.window({ class = "org.quickshell", title = "Pear Passwords" }, { float = true })
+o.window({ class = "org.quickshell", title = "Pear Passwords" }, { size = "960 640" })
+o.window({ class = "org.quickshell", title = "Pear Passwords" }, { center = true })
+```
+
+## Security
+
+- **Its own process.** The window is not loaded into `omarchy-shell`. Plugins inside the shell
+  share one QML scene and can reach each other's objects, which is no place for decrypted
+  passwords. The plugin half only checks that `install.sh` has been run.
+- **Nothing shown before you unlock.** While locked, the backend does not even send the app the
+  names of your entries. The unlock is tied to that one app window and ends when it closes.
+- **Every sensitive action is asked for.** Revealing, copying, reading notes, viewing history
+  and every edit need a fresh fingerprint or password for that one entry, valid for 60 seconds.
+  Adding a new entry always asks.
+- **Every write is checked.** After saving to iCloud the app syncs and reads the change back,
+  and only then says it is done. An edit that would change anything beyond what you asked for
+  is refused before it is sent.
+- **Encrypted at rest.** Your synced vault and sign-in are encrypted in `~/.config/icp` with a
+  key kept in your login keyring. If there is no keyring the backend stops rather than falling
+  back to a plain key file. To use a passphrase instead:
+  `~/.local/share/pear-passwords/venv/bin/icp passphrase`.
+- **What leaves your computer.** Requests go to Apple only. Apple's sign-in needs anisette data,
+  a device fingerprint normally generated by macOS. The sign-in helper,
+  [anisette-v3-server](https://github.com/Dadoum/anisette-v3-server), provides it in a podman
+  container. It listens on `127.0.0.1` only, and its image is pinned by digest.
+- **Same-user limits.** Like any desktop password manager on Linux, it cannot protect you from
+  other programs running as your own user.
+
+## Uninstall
+
+```bash
+./uninstall.sh            # keeps your synced keychain and this computer's sign-in
+./uninstall.sh --purge    # also deletes them (asks first)
+omarchy plugin remove io.github.dragosol.pear-passwords
+```
+
+## Credits
+
+The backend builds on [iCloud-Keychain-for-Linux](https://github.com/Sank6/iCloud-Keychain-for-Linux)
+by Sankarsh Makam (MIT). Anisette data comes from
+[anisette-v3-server](https://github.com/Dadoum/anisette-v3-server) by Dadoum.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
