@@ -51,7 +51,9 @@ cd ~/.config/omarchy/plugins/io.github.dragosol.pear-passwords
 ./install.sh
 ```
 
-Then search **Pear Passwords** in the launcher.
+Then search **Pear Passwords** in the launcher. The window floats, centred, at the 960×640
+it is designed for. It registers that with Hyprland each time it opens, so nothing is added
+to your Hyprland config.
 
 `install.sh` runs as your user and never uses sudo. It installs, all under your home directory:
 
@@ -131,17 +133,6 @@ POLICY
 The action only asks you to authenticate as yourself (`auth_self`) and grants nothing
 privileged. Without it, unlocking still works: it falls back to `pkexec`, which asks for an
 administrator and runs a no-op command as root to prove it.
-
-### Float at the designed size
-
-The window is laid out for 960×640. To have Hyprland float it at that size, add to
-`~/.config/hypr/windows.lua`:
-
-```lua
-o.window({ class = "org.quickshell", title = "Pear Passwords" }, { float = true })
-o.window({ class = "org.quickshell", title = "Pear Passwords" }, { size = "960 640" })
-o.window({ class = "org.quickshell", title = "Pear Passwords" }, { center = true })
-```
 
 ## Security
 
