@@ -34,8 +34,23 @@ command -v notify-send >/dev/null 2>&1 || warn "notify-send is not installed: si
 mkdir -p "$data" "$apps" "$units"
 
 say "Installing the backend into $data/venv"
-[ -x "$data/venv/bin/python" ] || python3 -m venv "$data/venv"
-"$data/venv/bin/python" -m pip install --quiet --disable-pip-version-check --upgrade "$here/backend"
+# Every package is pinned to an exact version and checked against a committed hash, so what
+# installs is byte-for-byte what was reviewed:
+#   backend/build-requirements.lock  the build toolchain (setuptools)
+#   backend/requirements.lock        every runtime dependency, transitive ones included
+# Wheels only (--only-binary): no dependency is ever built from source, so no build step can
+# fetch tools of its own. The backend itself is then built with the locked setuptools and no
+# network (--no-build-isolation --no-index). A fresh virtualenv each time means nothing left
+# over from an earlier install survives into this one. (It is rebuilt in place: a virtualenv
+# cannot be renamed, its scripts carry their own path.)
+rm -rf "$data/venv"
+python3 -m venv "$data/venv"
+pip_install() { "$data/venv/bin/python" -m pip install --quiet --disable-pip-version-check --no-input "$@"; }
+pip_install --require-hashes --only-binary :all: --no-deps -r "$here/backend/build-requirements.lock"
+pip_install --require-hashes --only-binary :all: --no-deps -r "$here/backend/requirements.lock"
+pip_install --no-deps --no-build-isolation --no-index "$here/backend"
+"$data/venv/bin/python" -m pip check --disable-pip-version-check >/dev/null \
+  || die "installed packages are inconsistent with the lock files"
 
 say "Installing the app into $data/app"
 # Built beside the old copy and swapped in, so a failed copy never leaves a half-installed app.
