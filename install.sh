@@ -78,6 +78,6 @@ Pear Passwords is installed. Open it from the launcher: search "Pear Passwords".
 The first launch asks you to sign in with your Apple Account.
 
 Optional, see README.md:
-  * fingerprint unlock through Omarchy's overlay (one polkit file, needs sudo once)
+  * a dedicated unlock prompt instead of pkexec (one polkit file, needs sudo once)
   * a window rule so the app floats at its designed size
 DONE

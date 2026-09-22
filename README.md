@@ -86,11 +86,18 @@ The first launch opens straight into sign-in:
 
 ## Optional
 
-### Fingerprint unlock through Omarchy's overlay
+### A dedicated unlock prompt
 
-Without this, unlocking falls back to a standard administrator prompt. With it, the app asks
-through Omarchy's own polkit overlay, which offers your fingerprint. It is one file: copy the
-command as a whole, so nothing from the plugin folder is ever run as root.
+Unlocking always goes through Omarchy's polkit overlay, so your fingerprint works either way.
+What this optional file changes is *what* that prompt is:
+
+| | Without it | With it |
+| --- | --- | --- |
+| The prompt says | "run `/usr/bin/true` as root" (via `pkexec`) | "Unlock Pear Passwords" |
+| Runs as root | a command that does nothing | nothing at all |
+| Who can pass it | an administrator | you, as yourself |
+
+It is one file. Copy the command as a whole, so nothing from the plugin folder is ever run as root:
 
 ```bash
 sudo tee /usr/share/polkit-1/actions/org.icp.unlock.policy >/dev/null <<'POLICY'
@@ -121,8 +128,9 @@ sudo tee /usr/share/polkit-1/actions/org.icp.unlock.policy >/dev/null <<'POLICY'
 POLICY
 ```
 
-The action only asks *you* to authenticate as yourself (`auth_self`). It grants nothing
-privileged.
+The action only asks you to authenticate as yourself (`auth_self`) and grants nothing
+privileged. Without it, unlocking still works: it falls back to `pkexec`, which asks for an
+administrator and runs a no-op command as root to prove it.
 
 ### Float at the designed size
 
