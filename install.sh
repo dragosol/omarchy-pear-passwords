@@ -54,12 +54,12 @@ cat > "$apps/pear-passwords.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Pear Passwords
-Comment=Your iCloud Keychain passwords
+Comment=Your iCloud Passwords
 Exec=quickshell -p $data/app
 Icon=$data/app/icon.svg
 Terminal=false
 Categories=Utility;Security;
-Keywords=password;passwords;keychain;icloud;login;credentials;2fa;pear;
+Keywords=password;passwords;icloud;login;credentials;2fa;pear;
 DESKTOP
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$apps" || true
 

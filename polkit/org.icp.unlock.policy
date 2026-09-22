@@ -5,7 +5,7 @@
 <policyconfig>
   <vendor>Pear Passwords</vendor>
 
-  <!-- Re-authentication for an already-unlocked keychain. auth_self prompts via the desktop
+  <!-- Re-authentication for passwords that are already unlocked. auth_self prompts via the desktop
        polkit agent for whichever factors PAM offers - here the user's own password, or a
        fingerprint, because polkit-1 includes system-auth and that carries pam_fprintd.
 

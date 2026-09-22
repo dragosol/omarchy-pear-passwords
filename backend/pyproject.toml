@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pear-passwords-backend"
 version = "1.0.0"
-description = "Backend for Pear Passwords: sign in to iCloud Keychain and sync it on Linux"
+description = "Backend for Pear Passwords: sign in to iCloud Passwords and sync them on Linux"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",

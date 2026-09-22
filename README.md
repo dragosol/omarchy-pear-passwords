@@ -1,6 +1,6 @@
 # Pear Passwords
 
-Your iCloud Keychain passwords on Omarchy, in a native window.
+Your iCloud Passwords on Omarchy, in a native window.
 
 ![Pear Passwords](preview.png)
 
@@ -9,12 +9,12 @@ verification codes stay in sync. The window follows your Omarchy theme and is bu
 Omarchy's own shell components.
 
 > Pear Passwords is an independent project. It is not made, endorsed or supported by Apple.
-> iCloud, iCloud Keychain and Apple Account are Apple's trademarks, used here only to say
+> iCloud and Apple Account are Apple's trademarks, used here only to say
 > what this works with.
 
 ## What it does
 
-- **Your iCloud Keychain, synced.** It signs in as a Mac would, joins your keychain once, then
+- **Your iCloud Passwords, synced.** It signs in as a Mac would, is approved as one of your devices once, then
   syncs every two hours and when you open it. Apple should not ask for a code again unless it
   signs you out.
 - **Locked until you say so.** Names, sites and usernames stay hidden until you unlock with your
@@ -28,7 +28,7 @@ Omarchy's own shell components.
   live code before you save.
 - **Password history.** Changes seen during sync are kept, alongside the history Apple stores.
 - **Change a password, one at a time.** Writes back to iCloud, so your other devices get it.
-  Each change needs its own fingerprint or password: nothing can rewrite your keychain in bulk.
+  Each change needs its own fingerprint or password: nothing can rewrite your passwords in bulk.
 - **Strong, memorable passwords.** The generator uses the same six-six-six shape as Apple's.
 - **Names that sync.** Rename an entry here and the name shows up on your other devices too.
 - **Wi-Fi passwords.** Your saved networks, shown as networks rather than websites.
@@ -73,9 +73,9 @@ The first launch opens straight into sign-in:
 1. **Apple Account and password.** Your password is saved encrypted on this computer so the app
    can stay signed in on its own.
 2. **Verification code**, sent to your other Apple devices.
-3. **Join your keychain.** Pick one of your devices and enter its **lock-screen passcode**
+3. **Approve this computer.** Pick one of your devices and enter its **lock-screen passcode**
    (iPhone, iPad) or **login password** (Mac). This is how Apple lets a new device read your
-   keychain without another device approving it.
+   passwords without another device approving it.
 
 > [!WARNING]
 > Step 3 is the one step that can't be undone. Apple allows about 10 wrong passcode attempts per
@@ -108,7 +108,7 @@ sudo tee /usr/share/polkit-1/actions/org.icp.unlock.policy >/dev/null <<'POLICY'
 <policyconfig>
   <vendor>Pear Passwords</vendor>
 
-  <!-- Re-authentication for an already-unlocked keychain. auth_self prompts via the desktop
+  <!-- Re-authentication for passwords that are already unlocked. auth_self prompts via the desktop
        polkit agent for whichever factors PAM offers - here the user's own password, or a
        fingerprint, because polkit-1 includes system-auth and that carries pam_fprintd.
 
@@ -170,15 +170,15 @@ o.window({ class = "org.quickshell", title = "Pear Passwords" }, { center = true
 ## Uninstall
 
 ```bash
-./uninstall.sh            # keeps your synced keychain and this computer's sign-in
+./uninstall.sh            # keeps your synced passwords and this computer's sign-in
 ./uninstall.sh --purge    # also deletes them (asks first)
 omarchy plugin remove io.github.dragosol.pear-passwords
 ```
 
 ## Credits
 
-The backend builds on [iCloud-Keychain-for-Linux](https://github.com/Sank6/iCloud-Keychain-for-Linux)
-by Sankarsh Makam (MIT). Anisette data comes from
+The backend builds on the original Linux iCloud sync backend by
+[Sankarsh Makam](https://github.com/Sank6) (MIT). Anisette data comes from
 [anisette-v3-server](https://github.com/Dadoum/anisette-v3-server) by Dadoum.
 
 ## License
