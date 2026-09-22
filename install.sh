@@ -54,7 +54,7 @@ cat > "$apps/pear-passwords.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Pear Passwords
-Comment=Your iCloud Passwords
+Comment=Your passwords on iCloud
 Exec=quickshell -p $data/app
 Icon=$data/app/icon.svg
 Terminal=false

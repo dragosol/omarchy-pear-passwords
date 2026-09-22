@@ -1,6 +1,6 @@
 # Pear Passwords
 
-Your iCloud Passwords on Omarchy, in a native window.
+Your passwords on iCloud, in a native Omarchy window.
 
 ![Pear Passwords](preview.png)
 
@@ -14,7 +14,7 @@ Omarchy's own shell components.
 
 ## What it does
 
-- **Your iCloud Passwords, synced.** It signs in as a Mac would, is approved as one of your devices once, then
+- **Your passwords on iCloud, synced.** It signs in as a Mac would, is approved as one of your devices once, then
   syncs every two hours and when you open it. Apple should not ask for a code again unless it
   signs you out.
 - **Locked until you say so.** Names, sites and usernames stay hidden until you unlock with your
