@@ -68,6 +68,16 @@ Requires `python3`, `podman`, `quickshell` and `wl-clipboard`. Scanning QR codes
 uses `grim`, `slurp` and `zbar`. After
 `omarchy plugin update`, run `./install.sh` again to pick up the new version.
 
+### Opening it
+
+Pear Passwords is a standalone app, not a panel in Omarchy's bar. Open it from the launcher
+like any other app: search **Pear Passwords**. It runs as its own window on purpose, because
+plugins inside the shell share one QML scene and can reach each other's objects, which is no
+place for decrypted passwords.
+
+A bar icon or panel version is possible. If enough people ask for one in the
+[issues](https://github.com/dragosol/omarchy-pear-passwords/issues), I can build it.
+
 ### First sign-in
 
 The first launch opens straight into sign-in:
