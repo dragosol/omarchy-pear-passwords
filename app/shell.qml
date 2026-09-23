@@ -16,11 +16,15 @@ ShellRoot {
     property var selected: null
     property string selectedId: ""
 
-    // One unlock per entry, time-boxed. `unlockedId` is what the grant covers.
-    property string unlockedId: ""
-    property real unlockExpires: 0
+    // Two clocks, both restarted by a fingerprint and both app-wide (the backend owns them;
+    // these are only what the window counts down). `unlocked` = the scan still counts, so
+    // revealing, copying and editing work. When it lapses the list stays readable and the next
+    // such action asks again. When `sessionLeft` runs out the whole window locks.
+    property real fullUntil: 0
+    property real sessionUntil: 0
     property int unlockLeft: 0
-    readonly property bool unlocked: unlockedId !== "" && unlockedId === selectedId && unlockLeft > 0
+    property int sessionLeft: 0
+    readonly property bool unlocked: unlockLeft > 0
 
     property string revealed: ""
     property var historyRows: []
@@ -140,9 +144,16 @@ ShellRoot {
     Timer {
         interval: 1000; running: true; repeat: true
         onTriggered: {
-            root.unlockLeft = Math.max(0, Math.ceil(root.unlockExpires - Date.now() / 1000));
-            if (root.unlockLeft === 0 && root.unlockedId !== "" && !root.busy
-                && root.queue.length === 0) root.relock();
+            const now = Date.now() / 1000;
+            const wasUnlocked = root.unlockLeft > 0;
+            root.unlockLeft = Math.max(0, Math.ceil(root.fullUntil - now));
+            root.sessionLeft = Math.max(0, Math.ceil(root.sessionUntil - now));
+            // The scan stopped counting: put the secrets away, keep the list.
+            if (wasUnlocked && root.unlockLeft === 0 && !root.busy && root.queue.length === 0)
+                root.forgetSecrets();
+            // And when the session runs out, the window locks and the backend stops sending.
+            if (root.appUnlocked && root.sessionUntil > 0 && root.sessionLeft === 0
+                && !root.busy && root.queue.length === 0) root.lockApp();
             if (root.totpLeft > 0) root.totpLeft -= 1;
         }
     }
@@ -193,7 +204,9 @@ ShellRoot {
                 let d = null;
                 try { d = JSON.parse(this.text); } catch (e) {}
                 if (!d) return;                // killed for a retry - no verdict to act on
-                if (d.authed) { root.appUnlocked = true; root.status = ""; root.refresh(); }
+                if (d.authed) {
+                    root.appUnlocked = true; root.status = ""; root.readClocks(d); root.refresh();
+                }
                 else if (d.ok === false) root.status = d.error || "authentication failed";
                 else if (d.reason === "error")
                     root.status = "couldn't reach the authentication prompt - press Unlock to retry";
@@ -245,7 +258,8 @@ ShellRoot {
             if (q) search.text = q;
             root.applyFilter();
             root.select(root.entries[0]);
-            root.unlockedId = root.selectedId; root.unlockExpires = now + 60; root.unlockLeft = 60;
+            root.fullUntil = now + 95; root.sessionUntil = now + 275;
+            root.unlockLeft = 95; root.sessionLeft = 275;
             root.notesText = "Recovery email: backup@example.com\nSecurity question: first pet — Pear";
             root.notesLoaded = true;
             root.totpCode = "482 913"; root.totpLeft = 21;
@@ -353,6 +367,7 @@ ShellRoot {
             root.entries = d.entries || [];
             root.needsLogin = !!d.needs_login;
             root.signedIn = d.signed_in !== false;
+            root.readClocks(d);
             if (root.snapshotPath && root.snapshotQuery) search.text = root.snapshotQuery;
             root.applyFilter();
             if (root.snapshotPath) snapshotTimer.start();
@@ -420,15 +435,43 @@ ShellRoot {
         root.selected = null; root.selectedId = ""; root.relock();
     }
 
-    function relock() {
-        root.unlockedId = ""; root.unlockExpires = 0; root.unlockLeft = 0;
-        root.revealed = ""; root.historyRows = []; root.revealedHistory = ({});
-        root.totpCode = ""; root.totpLeft = 0; root.confirming = false;
-        root.generated = false; root.renaming = false; root.historyLoaded = false;
-        root.changing = false;
+    // Every gated reply carries the clocks, so the window never has to guess.
+    function readClocks(d) {
+        if (!d || d.expires === undefined) return;
+        root.fullUntil = d.full_until || 0;
+        root.sessionUntil = d.expires || 0;
+        const now = Date.now() / 1000;
+        root.unlockLeft = Math.max(0, Math.ceil(root.fullUntil - now));
+        root.sessionLeft = Math.max(0, Math.ceil(root.sessionUntil - now));
+    }
+
+    // The scan stopped counting. Everything on screen that came from it goes.
+    function forgetSecrets() {
+        root.revealed = ""; root.totpCode = ""; root.totpLeft = 0;
         root.notesText = ""; root.notesLoaded = false;
-        root.detailIndex = 0;
+        root.historyRows = []; root.revealedHistory = ({}); root.historyLoaded = false;
+        root.confirming = false; root.changing = false; root.generated = false;
+        root.renaming = false;
         newPw.text = "";
+    }
+
+    // Out of time: back to the locked window, with nothing in it.
+    function lockApp() {
+        root.forgetSecrets();
+        root.appUnlocked = false;
+        root.autoAuthTried = true;            // don't re-prompt on our own; the screen invites it
+        root.fullUntil = 0; root.sessionUntil = 0; root.unlockLeft = 0; root.sessionLeft = 0;
+        root.entries = []; root.filtered = [];
+        root.clearSelection();
+        root.editorOpen = false;
+        search.text = "";
+    }
+
+    // Selecting another entry hides what was on screen for the last one. The clocks are the
+    // app's, not the entry's, so they keep running.
+    function relock() {
+        root.forgetSecrets();
+        root.detailIndex = 0;
     }
 
     function select(e) {
@@ -448,12 +491,11 @@ ShellRoot {
     function unlockThen(after) {
         if (root.unlocked) { if (after) after(); return; }
         root.status = "waiting for fingerprint…";
-        run(["app-unlock", root.selectedId], "", function (d) {
-            root.unlockedId = d.id;
-            root.unlockExpires = d.expires;
-            root.unlockLeft = Math.max(0, Math.ceil(d.expires - Date.now() / 1000));
+        run(["app-unlock"], "", function (d) {
+            root.readClocks(d);
             if (after) after();
-            // Fetch history under the grant we just took. Queued, so it cannot clobber
+            if (!root.selectedId) return;
+            // Fetch history under the scan just given. Queued, so it cannot clobber
             // whatever `after` started.
             root.run(["app-history", root.selectedId], "", function (h) {
                 root.historyRows = h.history || [];
@@ -734,7 +776,7 @@ ShellRoot {
         if (!root.selected) return "";
         const parts = [];
         if (root.selected.mdat) parts.push("changed " + root.ago(root.selected.mdat));
-        if (root.unlocked) parts.push("unlocked " + root.unlockLeft + "s");
+        if (root.unlocked) parts.push("unlocked " + root.clock(root.unlockLeft));
         return parts.join("   ·   ");
     }
 
@@ -996,6 +1038,11 @@ ShellRoot {
     }
 
     // ---------------------------------------------------------------- helpers
+    function clock(seconds) {
+        const s = Math.max(0, seconds);
+        return Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2);
+    }
+
     function monogram(e) {
         const s = (e.primary || "").replace(/^www\./, "");
         const letters = s.replace(/[^A-Za-z0-9]/g, "");
@@ -1532,7 +1579,7 @@ ShellRoot {
                                 Layout.alignment: Qt.AlignHCenter
                                 text: root.authing
                                     ? "Waiting for your fingerprint or password. Nothing appeared? Retry"
-                                    : "Use your fingerprint or password to open it"
+                                    : "Click anywhere, or press Unlock, and use your fingerprint or password"
                                 color: Theme.dim
                                 opacity: 0.65
                                 font.family: Theme.uiFont
@@ -2039,6 +2086,19 @@ ShellRoot {
                             elide: Text.ElideRight
                             opacity: root.appUnlocked || root.flash ? 1 : 0.45
                         }
+                        // Which of the two states the app is in, and how long is left of it.
+                        // Click it to scan now rather than waiting to be asked mid-action.
+                        Text {
+                            visible: root.appUnlocked && root.sessionLeft > 0
+                            text: root.unlocked ? "unlocked " + root.clock(root.unlockLeft)
+                                                : "read-only · locks in " + root.clock(root.sessionLeft)
+                            color: root.unlocked ? Theme.accent : (hLock.hovered ? Theme.fg : Theme.dim)
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            font.underline: hLock.hovered && !root.unlocked
+                            HoverHandler { id: hLock; cursorShape: root.unlocked ? Qt.ArrowCursor : Qt.PointingHandCursor }
+                            TapHandler { onTapped: if (!root.unlocked) root.unlockThen(null) }
+                        }
                         // Always reachable - the banner only appears once Apple has already
                         // refused a sync, which is no help for a first sign-in.
                         Text {
@@ -2064,6 +2124,18 @@ ShellRoot {
                     }
                 }
             }
+        }
+
+        // Locked: the whole window is the way back in. Under the sheets (z 90/100) so a
+        // sign-in or an editor still takes its own clicks.
+        MouseArea {
+            parent: scope
+            z: 50
+            anchors.fill: parent
+            enabled: !root.appUnlocked && root.signedIn && !root.signinOpen && !root.editorOpen
+            visible: enabled
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.authenticate()
         }
 
         // ---------------------------------------------------------------- editor sheet

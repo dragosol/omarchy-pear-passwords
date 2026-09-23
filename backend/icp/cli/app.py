@@ -717,8 +717,8 @@ def _build_parser():
     sub.add_parser("app-lock", help=argparse.SUPPRESS).set_defaults(func=appapi.cmd_app_lock)
     sub.add_parser("app-auth", help=argparse.SUPPRESS).set_defaults(func=appapi.cmd_app_auth)
     sub.add_parser("app-lock-app", help=argparse.SUPPRESS).set_defaults(func=appapi.cmd_app_lock_app)
-    for name, fn in (("app-unlock", appapi.cmd_app_unlock),
-                     ("app-reveal", appapi.cmd_app_reveal),
+    sub.add_parser("app-unlock", help=argparse.SUPPRESS).set_defaults(func=appapi.cmd_app_unlock)
+    for name, fn in (("app-reveal", appapi.cmd_app_reveal),
                      ("app-history", appapi.cmd_app_history),
                      ("app-totp", appapi.cmd_app_totp),
                      ("app-set-password", appapi.cmd_app_set_password),

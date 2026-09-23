@@ -5,7 +5,9 @@ Your passwords on iCloud, in a native Omarchy window.
 ![Pear Passwords](preview.png)
 
 Sign in with your Apple Account, approve this computer once, and your passwords and
-verification codes stay in sync. The window follows your Omarchy theme and is built from
+verification codes stay in sync.
+
+![The window](docs/window.png) The window follows your Omarchy theme and is built from
 Omarchy's own shell components.
 
 > Pear Passwords is an independent project. It is not made, endorsed or supported by Apple.
@@ -18,7 +20,8 @@ Omarchy's own shell components.
   syncs every two hours and when you open it. Apple should not ask for a code again unless it
   signs you out.
 - **Locked until you say so.** Names, sites and usernames stay hidden until you unlock with your
-  fingerprint or password. Revealing, copying or changing a password asks again, per entry.
+  fingerprint or password. That one scan then covers everything for two minutes, so a normal
+  visit never asks twice.
 - **Click to copy.** Username, password, website and verification code. Copied passwords clear
   themselves from the clipboard.
 - **Add passwords.** **+ New** saves a login to iCloud, with a generated password if you want
@@ -151,9 +154,11 @@ administrator and runs a no-op command as root to prove it.
   passwords. The plugin half only checks that `install.sh` has been run.
 - **Nothing shown before you unlock.** While locked, the backend does not even send the app the
   names of your entries. The unlock is tied to that one app window and ends when it closes.
-- **Every sensitive action is asked for.** Revealing, copying, reading notes, viewing history
-  and every edit need a fresh fingerprint or password for that one entry, valid for 60 seconds.
-  Adding a new entry always asks.
+- **One scan, two clocks.** A fingerprint (or your password) gives full access for **2 minutes**.
+  After that the window still shows what is in it, but revealing, copying and editing ask for
+  another scan, which restarts the two minutes everywhere rather than for one entry. **5 minutes**
+  after the last scan the window locks completely: what was on screen is dropped, the backend
+  stops sending names, and clicking anywhere asks to unlock again.
 - **Every write is checked.** After saving to iCloud the app syncs and reads the change back,
   and only then says it is done. An edit that would change anything beyond what you asked for
   is refused before it is sent.

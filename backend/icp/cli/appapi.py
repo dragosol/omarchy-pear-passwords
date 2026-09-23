@@ -8,10 +8,12 @@ Two rules shape the whole file:
   metadata; **copying never returns it at all** - the value goes straight to the clipboard from
   this process, so it never crosses into QML, never lands in a JS string, and never sits in the
   UI's heap waiting to be swapped out.
-* One fingerprint authorises one entry, for a short window. `app-unlock` takes the scan and
-  writes a grant naming that single entry; reveal/history/change/copy honour it until it
-  expires. This is not a weakening: the alternative was prompting three times for one entry,
-  which trains people to approve prompts without reading them.
+* One fingerprint opens the app and starts two clocks, not a grant per entry. For
+  `FULL_TTL` seconds everything works; after that the app still shows what is in it but
+  revealing, copying and editing ask for another scan (which restarts both clocks, for the
+  whole app, not one entry). After `SESSION_TTL` the app locks completely and the backend
+  stops sending names at all. Prompting per entry trained people to approve prompts without
+  reading them; one scan that clearly buys two minutes does not.
 """
 
 from __future__ import annotations
@@ -25,66 +27,75 @@ import time
 from ..vault import history as hist, nicknames as nick
 from ..vault.store import load_vault
 
-GRANT_TTL = 60.0
+# Two clocks, both restarted by a scan. FULL_TTL is how long the answer to "is this you?"
+# is treated as still true; SESSION_TTL is how long the window may keep showing anything.
+FULL_TTL = 120.0
+SESSION_TTL = 300.0
 _UUIDISH = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-")
 
 
-# --------------------------------------------------------------------------- grants
+# ------------------------------------------------------------------ the session
+#
+# Opening the app needs a fingerprint (or the system password - whichever PAM offers). Until
+# then the backend withholds every name, domain and username rather than handing them to the UI
+# to blur: obfuscating data that has already been sent is decoration, while data that was never
+# sent cannot be read, searched, or scraped out of the window.
+#
+# The session is bound to the app instance - the PID of the process that runs these commands -
+# so quitting and relaunching asks again. Honest scope: this is against someone at the keyboard
+# or looking at the screen. Code running as this user can already read vault.key, and the
+# session file is no barrier to it.
 
-def _grant_path():
+
+def _runtime_dir() -> str:
     base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     d = os.path.join(base, "icp")
     os.makedirs(d, exist_ok=True)
     os.chmod(d, 0o700)
-    return os.path.join(d, "grant.json")
-
-
-def _read_grant() -> dict | None:
-    try:
-        with open(_grant_path()) as fh:
-            g = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(g, dict) or g.get("expires", 0) < time.time():
-        return None
-    return g
-
-
-def _write_grant(entry_id: str) -> float:
-    expires = time.time() + GRANT_TTL
-    path = _grant_path()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump({"id": entry_id, "expires": expires}, fh)
-    return expires
-
-
-# ------------------------------------------------------------------ app session
-#
-# Opening the app itself needs a fingerprint (or the system password - whichever PAM offers).
-# Until then the backend withholds every name, domain and username rather than handing them to
-# the UI to blur: obfuscating data that has already been sent is decoration, while data that was
-# never sent cannot be read, searched, or scraped out of the window.
-#
-# The session is bound to the app instance - the PID of the process that runs these commands -
-# so quitting and relaunching asks again, even inside the TTL. Honest scope: this is against
-# someone at the keyboard or looking at the screen. Code running as this user can already read
-# vault.key, and the session file is no barrier to it.
-APP_SESSION_TTL = 8 * 3600.0
+    return d
 
 
 def _app_session_path() -> str:
-    return os.path.join(os.path.dirname(_grant_path()), "app-session.json")
+    return os.path.join(_runtime_dir(), "app-session.json")
 
 
-def _app_session_ok() -> bool:
+def _read_session() -> dict | None:
     try:
         with open(_app_session_path()) as fh:
             s = json.load(fh)
     except (OSError, ValueError):
-        return False
-    return (isinstance(s, dict) and s.get("pid") == os.getppid()
-            and s.get("expires", 0) > time.time())
+        return None
+    if not isinstance(s, dict) or s.get("pid") != os.getppid():
+        return None
+    return s if s.get("expires", 0) > time.time() else None
+
+
+def _write_session() -> dict:
+    """Start (or restart) both clocks. Returns what the window needs to count down."""
+    now = time.time()
+    s = {"pid": os.getppid(), "expires": now + SESSION_TTL, "full_until": now + FULL_TTL}
+    fd = os.open(_app_session_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(s, fh)
+    return s
+
+
+def _app_session_ok() -> bool:
+    return _read_session() is not None
+
+
+def _full_access() -> bool:
+    """Inside the window where the last scan still counts."""
+    s = _read_session()
+    return bool(s and s.get("full_until", 0) > time.time())
+
+
+def _session_state(s: dict | None = None) -> dict:
+    s = s if s is not None else _read_session()
+    if not s:
+        return {"unlocked": False, "full": False, "full_until": 0, "expires": 0}
+    return {"unlocked": True, "full": s.get("full_until", 0) > time.time(),
+            "full_until": s.get("full_until", 0), "expires": s.get("expires", 0)}
 
 
 def _locked_reply() -> int:
@@ -120,11 +131,8 @@ def cmd_app_auth(args) -> int:
         json.dump({"ok": True, "authed": False, "via": via, "reason": status}, sys.stdout)
         return 0
 
-    path = _app_session_path()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump({"pid": os.getppid(), "expires": time.time() + APP_SESSION_TTL}, fh)
-    json.dump({"ok": True, "authed": True, "via": via}, sys.stdout)
+    json.dump({"ok": True, "authed": True, "via": via, **_session_state(_write_session())},
+              sys.stdout)
     return 0
 
 
@@ -137,15 +145,17 @@ def cmd_app_lock_app(args) -> int:
     return 0
 
 
-def _authorised(entry_id: str) -> bool:
-    """A live grant for this exact entry, or a fresh fingerprint for it."""
-    g = _read_grant()
-    if g and g.get("id") == entry_id:
+def _elevate() -> bool:
+    """True when the last scan still counts, or a fresh one is given now.
+
+    A scan restarts both clocks for the whole app: the next action within the window does not
+    ask again, whichever entry it is on."""
+    if _full_access():
         return True
     from ..ui import reauth
     if not reauth.available() or not reauth.challenge():
         return False
-    _write_grant(entry_id)
+    _write_session()
     return True
 
 
@@ -254,17 +264,16 @@ def cmd_app_list(args) -> int:
     from .. import paths
     json.dump({"ok": True, "count": len(entries), "entries": entries,
                "needs_login": paths.needs_login_file().exists(),
-               "signed_in": paths.session_file().exists()}, sys.stdout)
+               "signed_in": paths.session_file().exists(), **_session_state()}, sys.stdout)
     return 0
 
 
 def cmd_app_unlock(args) -> int:
-    """Take one fingerprint and open a single entry for GRANT_TTL seconds."""
+    """Take one fingerprint and give the whole app full access again for FULL_TTL seconds."""
     if not _app_session_ok():
         return _locked_reply()
-    g = _read_grant()
-    if g and g.get("id") == args.id:
-        json.dump({"ok": True, "id": args.id, "expires": g["expires"]}, sys.stdout)
+    if _full_access():
+        json.dump({"ok": True, **_session_state()}, sys.stdout)
         return 0
     from ..ui import reauth
     if not reauth.available():
@@ -273,30 +282,34 @@ def cmd_app_unlock(args) -> int:
     if not reauth.challenge():
         json.dump({"ok": False, "error": "authentication cancelled"}, sys.stdout)
         return 1
-    json.dump({"ok": True, "id": args.id, "expires": _write_grant(args.id)}, sys.stdout)
+    json.dump({"ok": True, **_session_state(_write_session())}, sys.stdout)
     return 0
 
 
 def cmd_app_lock(args) -> int:
-    try:
-        os.unlink(_grant_path())
-    except OSError:
-        pass
-    json.dump({"ok": True}, sys.stdout)
+    """End full access now, but keep the app open: the list stays readable, and the next
+    reveal/copy/edit asks for a scan."""
+    s = _read_session()
+    if s:
+        s["full_until"] = 0
+        fd = os.open(_app_session_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(s, fh)
+    json.dump({"ok": True, **_session_state()}, sys.stdout)
     return 0
 
 
 def cmd_app_reveal(args) -> int:
     if not _app_session_ok():
         return _locked_reply()
-    if not _authorised(args.id):
+    if not _elevate():
         json.dump({"ok": False, "error": "not authorised"}, sys.stdout)
         return 1
     c = _find(load_vault(), args.id)
     if c is None:
         json.dump({"ok": False, "error": "no such entry"}, sys.stdout)
         return 1
-    json.dump({"ok": True, "id": args.id, "password": c.password}, sys.stdout)
+    json.dump({"ok": True, "id": args.id, "password": c.password, **_session_state()}, sys.stdout)
     return 0
 
 
@@ -314,7 +327,7 @@ def cmd_app_copy(args) -> int:
     field = getattr(args, "field", "password")
     # Only the password is gated. Making someone scan a finger to copy their own email
     # address teaches them the prompt is noise, which is how real prompts stop being read.
-    if field == "password" and not _authorised(args.id):
+    if field == "password" and not _elevate():
         json.dump({"ok": False, "error": "not authorised"}, sys.stdout)
         return 1
     c = _find(load_vault(), args.id)
@@ -407,7 +420,7 @@ def cmd_app_set_nickname(args) -> int:
     if not _app_session_ok():
         return _locked_reply()
     name = _read_payload()
-    if not _authorised(args.id):
+    if not _elevate():
         json.dump({"ok": False, "error": "not authorised"}, sys.stdout)
         return 1
     c = _find(load_vault(), args.id)
@@ -449,7 +462,7 @@ def cmd_app_generate(args) -> int:
 def cmd_app_totp(args) -> int:
     if not _app_session_ok():
         return _locked_reply()
-    if not _authorised(args.id):
+    if not _elevate():
         json.dump({"ok": False, "error": "not authorised"}, sys.stdout)
         return 1
     c = _find(load_vault(), args.id)
@@ -457,14 +470,14 @@ def cmd_app_totp(args) -> int:
         json.dump({"ok": False, "error": "no verification code for this entry"}, sys.stdout)
         return 1
     code, seconds = c.totp_code()
-    json.dump({"ok": True, "id": args.id, "code": code, "seconds": seconds}, sys.stdout)
+    json.dump({"ok": True, "id": args.id, "code": code, "seconds": seconds, **_session_state()}, sys.stdout)
     return 0
 
 
 def cmd_app_history(args) -> int:
     if not _app_session_ok():
         return _locked_reply()
-    if not _authorised(args.id):
+    if not _elevate():
         json.dump({"ok": False, "error": "not authorised"}, sys.stdout)
         return 1
     c = _find(load_vault(), args.id)
@@ -487,7 +500,7 @@ def cmd_app_set_password(args) -> int:
     if not new:
         json.dump({"ok": False, "error": "no password on stdin"}, sys.stdout)
         return 1
-    if not _authorised(args.id):
+    if not _elevate():
         json.dump({"ok": False, "error": "not authorised"}, sys.stdout)
         return 1
     c = _find(load_vault(), args.id)
@@ -526,14 +539,14 @@ def cmd_app_details(args) -> int:
     """The unlocked view of an entry's extras: its notes."""
     if not _app_session_ok():
         return _locked_reply()
-    if not _authorised(args.id):
+    if not _elevate():
         json.dump({"ok": False, "error": "not authorised"}, sys.stdout)
         return 1
     c = _find(load_vault(), args.id)
     if c is None:
         json.dump({"ok": False, "error": "no such entry"}, sys.stdout)
         return 1
-    json.dump({"ok": True, "id": args.id, "notes": c.notes, "sites": list(c.sites)}, sys.stdout)
+    json.dump({"ok": True, "id": args.id, "notes": c.notes, "sites": list(c.sites), **_session_state()}, sys.stdout)
     return 0
 
 
@@ -543,7 +556,7 @@ def cmd_app_set_details(args) -> int:
     if not _app_session_ok():
         return _locked_reply()
     d = _payload_json()
-    if not _authorised(args.id):
+    if not _elevate():
         json.dump({"ok": False, "error": "not authorised"}, sys.stdout)
         return 1
     c = _find(load_vault(), args.id)
@@ -603,7 +616,7 @@ def cmd_app_set_totp(args) -> int:
         except totp.SetupError as e:
             json.dump({"ok": False, "error": str(e)}, sys.stdout)
             return 1
-    if not _authorised(args.id):
+    if not _elevate():
         json.dump({"ok": False, "error": "not authorised"}, sys.stdout)
         return 1
     c = _find(load_vault(), args.id)
@@ -684,7 +697,6 @@ def cmd_app_create(args) -> int:
         return 1
     new = next((x for x in load_vault().all()
                 if x.username == str(d.get("username") or "") and x.password == str(d["password"])), None)
-    if new is not None:
-        _write_grant(_entry_id(new))       # just proved it's you; don't ask again to look at it
+    _write_session()                       # the scan just given also restarts the clocks
     json.dump({"ok": True, "id": _entry_id(new) if new else ""}, sys.stdout)
     return 0
