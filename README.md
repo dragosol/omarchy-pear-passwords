@@ -31,7 +31,8 @@ Omarchy's own shell components.
   live code before you save.
 - **Password history.** Changes seen during sync are kept, alongside the history Apple stores.
 - **Change a password, one at a time.** Writes back to iCloud, so your other devices get it.
-  Each change needs its own fingerprint or password: nothing can rewrite your passwords in bulk.
+  Each change is written and read back on its own; nothing rewrites your passwords in bulk, and
+  an edit outside the unlocked window asks you to prove it's you first.
 - **Strong, memorable passwords.** The generator uses the same six-six-six shape as Apple's.
 - **Names that sync.** Rename an entry here and the name shows up on your other devices too.
 - **Wi-Fi passwords.** Your saved networks, shown as networks rather than websites.

@@ -6,7 +6,7 @@
   "author": "dragosol",
   "license": "MIT",
   "homepage": "https://github.com/dragosol/omarchy-pear-passwords",
-  "description": "Your passwords on iCloud, in a native Omarchy window. Sign in with your Apple Account, approve this computer once, and your passwords and verification codes stay in sync every two hours. Locked behind your fingerprint or password, copy fields with a click, see password history, generate strong passwords, rename entries and change a password with a fingerprint per change. Not affiliated with Apple.",
+  "description": "Your passwords on iCloud, in a native Omarchy window. Sign in with your Apple Account, approve this computer once, and your passwords and verification codes stay in sync every two hours. Nothing is shown until you unlock with your fingerprint or password; that one scan covers the app for two minutes, then revealing, copying and editing ask again, and the window locks itself after five. Copy fields with a click, add entries, see password history, generate strong passwords, pair verification codes by scanning a QR code, and keep notes and extra websites. Not affiliated with Apple.",
   "kinds": [
     "service"
   ],
