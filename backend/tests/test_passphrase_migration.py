@@ -32,7 +32,8 @@ def keys(monkeypatch, tmp_path):
     monkeypatch.setattr(agent, "lock", lambda: None)
     monkeypatch.setattr(agent, "unlock", lambda p: None)
     import icp.auth.held_key as held_key
-    monkeypatch.setattr(held_key, "save", lambda k: None)
+    # The derived key is no longer written to disk; purge is all that is left.
+    monkeypatch.setattr(held_key, "purge", lambda: None)
     monkeypatch.setitem(sys.modules, "secretstorage", types.SimpleNamespace(
         dbus_init=lambda: (_ for _ in ()).throw(RuntimeError("no dbus in tests"))))
     return state

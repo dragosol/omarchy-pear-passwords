@@ -637,7 +637,8 @@ def cmd_passphrase(args) -> int:
     agent.lock()
     agent.unlock(new)
     from ..auth import held_key
-    held_key.save(key)
+    # The derived key is never written down; the agent above is holding it for this session.
+    held_key.purge()
 
     if old_session is not None:
         session.save(old_session)
@@ -650,8 +651,8 @@ def cmd_passphrase(args) -> int:
     if old_names:
         nickname_store.save(old_names)
 
-    # Drop the pre-passphrase master-key item. The lockbox-derived vault key was
-    # just written by held_key.save above.
+    # Drop the pre-passphrase master-key item. The lockbox-derived vault key is not
+    # stored anywhere; held_key.purge above removed any copy an older version left.
     try:
         import secretstorage
         conn = secretstorage.dbus_init()

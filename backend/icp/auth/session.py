@@ -79,24 +79,18 @@ def _key_from_file() -> bytes:
 
 
 def _master_key() -> bytes:
-    # Once a passphrase is set, it is the only source of the key: nothing derived from it is
-    # stored, so there is no copy for a same-user process to fetch behind our back. The agent
-    # caches it and drops it after ICP_LOCK_TIMEOUT.
-    from . import agent, lockbox, prompt
+    # Once a passphrase is set, it is the only source of the key. Nothing derived from it is
+    # written to disk, so a copy of the config directory cannot be decrypted without it. The
+    # agent holds it in memory and drops it after ICP_LOCK_TIMEOUT.
+    from . import agent, held_key, lockbox, prompt
     if lockbox.is_initialised():
+        # An older version wrote the derived key to disk beside the vault, which let a copy of
+        # ~/.config/icp be decrypted without the passphrase. Clear that out on the way past.
+        held_key.purge()
         key = agent.get_key()
-        if key is None:
-            from . import held_key
-            stored = held_key.load()
-            if stored is not None:
-                agent.load_key(stored)
-                key = agent.get_key()
         if key is None:
             agent.unlock(prompt.ask_passphrase())
             key = agent.get_key()
-            if key is not None:
-                from . import held_key
-                held_key.save(key)
         if key is None:
             raise SessionError("keychain is locked")
         return key
