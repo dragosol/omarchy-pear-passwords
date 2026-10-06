@@ -9,7 +9,15 @@
 # Your keychain data lives in ~/.config/icp and is never touched by this script.
 #
 # Re-run it after `omarchy plugin update` to pick up a new version.
+#
+# --app-only installs just the window and its launcher, and nothing else: no virtualenv, no
+# services, no podman. The plugin runs it that way on first load so that `omarchy plugin add`
+# alone gives you something you can open, which then asks for the rest. Running it with no
+# arguments is the full install and is unchanged.
 set -euo pipefail
+
+app_only=0
+[ "${1:-}" = "--app-only" ] && app_only=1
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 data="$HOME/.local/share/pear-passwords"
@@ -23,7 +31,9 @@ die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -ne 0 ] || die "run this as your own user, not root - nothing here needs root"
 
-for cmd in python3 podman quickshell systemctl; do
+needed="python3 podman quickshell systemctl"
+[ "$app_only" -eq 1 ] && needed="quickshell"
+for cmd in $needed; do
   command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not installed"
 done
 [ -d "$omarchy_shell/Ui" ] && [ -d "$omarchy_shell/Commons" ] \
@@ -33,6 +43,7 @@ command -v notify-send >/dev/null 2>&1 || warn "notify-send is not installed: si
 
 mkdir -p "$data" "$apps" "$units"
 
+if [ "$app_only" -eq 0 ]; then
 say "Installing the backend into $data/venv"
 # Every package is pinned to an exact version and checked against a committed hash, so what
 # installs is byte-for-byte what was reviewed:
@@ -51,6 +62,7 @@ pip_install --require-hashes --only-binary :all: --no-deps -r "$here/backend/req
 pip_install --no-deps --no-build-isolation --no-index "$here/backend"
 "$data/venv/bin/python" -m pip check --disable-pip-version-check >/dev/null \
   || die "installed packages are inconsistent with the lock files"
+fi
 
 say "Installing the app into $data/app"
 # Built beside the old copy and swapped in, so a failed copy never leaves a half-installed app.
@@ -77,6 +89,14 @@ Categories=Utility;Security;
 Keywords=password;passwords;icloud;login;credentials;2fa;pear;
 DESKTOP
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$apps" || true
+
+# Where this checkout is, so the window can offer to finish the install from inside itself.
+printf '%s\n' "$here" > "$data/app/.source"
+
+if [ "$app_only" -eq 1 ]; then
+  echo "The Pear Passwords window is installed. Open it and it will set up the rest."
+  exit 0
+fi
 
 say "Installing the sign-in helper and the 2-hourly sync"
 install -m 644 "$here/systemd/pear-passwords-anisette.service" \

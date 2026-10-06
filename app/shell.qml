@@ -90,6 +90,25 @@ ShellRoot {
         || (Quickshell.env("HOME") + "/.local/share/pear-passwords/venv/bin/icp")
     readonly property bool debugWheel: Quickshell.env("PEAR_PASSWORDS_DEBUG_WHEEL") === "1"
 
+    // ---- setup gate
+    // `omarchy plugin add` installs this window and its launcher but deliberately not the
+    // backend: building it downloads pinned wheels, which should be a decision rather than a
+    // side effect of enabling a plugin. So the window opens either way and asks here. Nothing
+    // below this is reachable until the backend exists - there is nothing to show without it.
+    property bool backendReady: true          // assumed until the check below says otherwise
+    property bool setupRunning: false
+    property string setupLog: ""
+    property string setupError: ""
+    property string setupSource: ""
+    // install.sh colours its own output for a terminal; a Text renders the escape codes as
+    // visible junk. Strip them rather than asking the installer to stop being readable.
+    function plain(s) {
+        return (s || "").replace(/\u001b\[[0-9;]*m/g, "").replace(/\u001b\][^\u0007]*\u0007/g, "").trim();
+    }
+    // install.sh --app-only wrote this when the plugin laid the window down.
+    readonly property string sourceDir: Quickshell.env("PEAR_PASSWORDS_SOURCE")
+        || (Quickshell.env("HOME") + "/.local/share/pear-passwords/app/.source")
+
     // Development only. With PEAR_PASSWORDS_SNAPSHOT set, the window renders itself to that PNG
     // and quits - run under QT_QPA_PLATFORM=offscreen and nothing ever appears on screen, so
     // a visual change can be checked without a window landing on top of whatever you're doing.
@@ -175,6 +194,59 @@ ShellRoot {
             }
         }
     }
+    // ---- setup gate plumbing
+    Process {
+        id: backendCheck
+        running: true
+        command: ["test", "-x", root.icp]
+        onExited: function (code) {
+            root.backendReady = (code === 0);
+            // The usual snapshot hooks all hang off a reply from the backend, which is the one
+            // thing missing when the gate is showing. Without this the gate is the only screen
+            // in the app that cannot be captured, which is exactly the screen worth checking.
+            if (!root.backendReady && root.snapshotPath) snapshotTimer.start();
+        }
+    }
+
+    Process {
+        id: sourceRead
+        running: true
+        command: ["cat", root.sourceDir]
+        stdout: StdioCollector {
+            onStreamFinished: root.setupSource = this.text.trim();
+        }
+    }
+
+    // The repository's own installer, run on an explicit click. User-level: it never uses sudo
+    // and refuses to run as root, and every wheel it installs is pinned to a committed hash.
+    Process {
+        id: setupProc
+        running: false
+        command: root.setupSource ? [root.setupSource + "/install.sh"] : []
+        onRunningChanged: root.setupRunning = running
+        stdout: SplitParser {
+            splitMarker: "\n"
+            onRead: function (line) { root.setupLog = root.plain(line); }
+        }
+        stderr: SplitParser {
+            splitMarker: "\n"
+            onRead: function (line) { if (line.trim()) root.setupError = root.plain(line); }
+        }
+        onExited: function (code) {
+            if (code !== 0) {
+                if (!root.setupError) root.setupError = "Setup stopped with code " + code;
+                return;
+            }
+            root.setupError = "";
+            root.setupLog = "";
+            // The backend exists now. Hiding the gate is not enough: the app's first app-list
+            // ran before it was there and failed, so nothing would ever ask again. Start the
+            // normal load, which is what would have happened had the backend been present.
+            root.backendReady = true;
+            root.refresh();
+        }
+    }
+
     Timer {
         id: previewDebounce
         interval: 300
@@ -1098,6 +1170,89 @@ ShellRoot {
             // Painted inside the scope rather than beside it, so a grab of the scope (the
             // offscreen snapshot) includes the real background instead of transparency.
             Rectangle { anchors.fill: parent; color: Theme.bg; z: -1 }
+
+            // ---- setup gate. Covers everything until the backend exists, because there is
+            // nothing to show without it. Installing it is one click rather than a sentence
+            // telling you to go and find a terminal.
+            Rectangle {
+                id: setupGate
+                anchors.fill: parent
+                visible: !root.backendReady
+                color: Theme.bg
+                z: 90
+
+                Column {
+                    anchors.centerIn: parent
+                    width: Math.min(460, parent.width - 80)
+                    spacing: 14
+
+                    Text {
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        text: "One more step"
+                        color: Theme.fg
+                        font.family: Theme.uiFont
+                        font.pixelSize: Math.round(Theme.fBody * 1.5)
+                    }
+                    Text {
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        color: Theme.dim
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                        text: "Pear Passwords keeps its own copy of the few Python packages it "
+                            + "needs, so it never depends on what happens to be installed on "
+                            + "this machine. Setting that up downloads them now. Every package "
+                            + "is pinned to an exact version and checked against a hash that "
+                            + "ships with the app, nothing is built from source, and none of it "
+                            + "needs your password."
+                    }
+                    Text {
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        visible: root.setupSource === "" && !root.setupRunning
+                        color: Theme.danger
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                        text: "Can't find where Pear Passwords was installed from, so it can't "
+                            + "set itself up. Run ./install.sh from the plugin folder instead."
+                    }
+                    Text {
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        visible: root.setupRunning || root.setupLog !== ""
+                        color: Theme.dim
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fCaption
+                        elide: Text.ElideRight
+                        maximumLineCount: 2
+                        text: root.setupLog
+                    }
+                    Text {
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        visible: root.setupError !== ""
+                        color: Theme.danger
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                        text: root.setupError
+                    }
+                    AppButton {
+                        text: root.setupRunning ? "Setting up…"
+                                                : (root.setupError !== "" ? "Try again" : "Set up")
+                        enabled: !root.setupRunning && root.setupSource !== ""
+                        onClicked: {
+                            root.setupError = "";
+                            root.setupLog = "";
+                            setupProc.running = true;
+                        }
+                    }
+                }
+            }
 
             Keys.onPressed: function (ev) {
                 if (ev.key === Qt.Key_Escape) {

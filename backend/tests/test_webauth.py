@@ -348,5 +348,52 @@ class QmlTextFormatTests(unittest.TestCase):
                       "secretWord() returns signinDevice.secret unchecked")
 
 
+class OneCommandInstallTest(unittest.TestCase):
+    """`omarchy plugin add` used to leave a plugin that did nothing but post a notification
+    telling you to find a terminal. The plugin now lays the window down itself and the window
+    asks before building the backend, so the install is one command plus one button."""
+
+    ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+
+    def _read(self, *parts):
+        with open(os.path.join(self.ROOT, *parts)) as fh:
+            return fh.read()
+
+    def test_installer_has_an_app_only_mode(self):
+        body = self._read("install.sh")
+        self.assertIn("--app-only", body, "the window-only install mode is gone")
+        self.assertRegex(body, r'app_only=1', "the flag is not set anywhere")
+        # app-only must not build the venv or install services
+        after = body[body.index("if [ \"$app_only\" -eq 1 ]; then"):]
+        self.assertIn("exit 0", after, "app-only no longer stops before the services")
+
+    def test_app_only_does_not_need_the_heavy_dependencies(self):
+        body = self._read("install.sh")
+        self.assertRegex(body, r'\[ "\$app_only" -eq 1 \] && needed="quickshell"',
+                         "app-only still demands podman/systemctl it does not use")
+
+    def test_the_plugin_provisions_the_window(self):
+        qml = self._read("plugin", "Service.qml")
+        self.assertIn("--app-only", qml, "the plugin no longer lays the window down")
+        self.assertIn("manifest.json", qml,
+                      "nothing re-provisions when the plugin is updated")
+        self.assertNotIn("venv", qml,
+                         "the plugin must not build the backend; the window asks first")
+
+    def test_the_window_gates_on_the_backend(self):
+        qml = self._read("app", "shell.qml")
+        self.assertIn("property bool backendReady", qml, "the setup gate is gone")
+        self.assertRegex(qml, r'command: \["test", "-x", root\.icp\]',
+                         "nothing checks whether the backend is actually there")
+        self.assertIn("root.refresh();", qml)
+
+    def test_installer_output_is_stripped_before_display(self):
+        """install.sh colours its output for a terminal; a Text renders the escape codes."""
+        qml = self._read("app", "shell.qml")
+        self.assertIn("function plain(", qml, "the ANSI stripper is gone")
+        self.assertRegex(qml, r'root\.setupLog = root\.plain\(line\)',
+                         "the installer's output reaches the gate unstripped")
+
+
 if __name__ == "__main__":
     unittest.main()
