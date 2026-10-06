@@ -6,7 +6,6 @@ import logging
 import plistlib as plist
 
 import requests
-import urllib3
 
 from . import ca
 from .anisette import Anisette
@@ -14,7 +13,6 @@ from .device import Device
 from .headers import identity_headers
 from ..errors import AppleError
 
-urllib3.disable_warnings()
 logger = logging.getLogger(__name__)
 
 LOGIN_DELEGATES_URL = "https://setup.icloud.com/setup/iosbuddy/loginDelegates"

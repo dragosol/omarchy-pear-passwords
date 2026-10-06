@@ -266,5 +266,28 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(restored.session_data["session_token"], "tok-1")
 
 
+class TlsVerificationTests(unittest.TestCase):
+    """The session carries session/trust tokens, cookies and 2FA codes. It verified nothing at
+    all until 1.0.2, which also silently disabled verification for Hide My Email, since
+    HmeClient is handed this very session."""
+
+    def test_session_verifies_certificates(self):
+        self.assertIs(_session().http.verify, True)
+
+    def test_hme_client_inherits_a_verifying_session(self):
+        from icp.hme.client import HmeClient
+        sess = _session()
+        client = HmeClient("https://p1-maildomainws.icloud.com", sess.http)
+        self.assertIs(client.http.verify, True)
+
+    def test_module_does_not_silence_tls_warnings(self):
+        """`urllib3.disable_warnings()` at import time hides InsecureRequestWarning for the
+        whole process, so a future accidental bypass anywhere would fail silently."""
+        import inspect
+        for mod in (webauth, __import__("icp.auth.icloud", fromlist=["x"])):
+            src = inspect.getsource(mod)
+            self.assertNotIn("disable_warnings", src, f"{mod.__name__} silences urllib3 warnings")
+
+
 if __name__ == "__main__":
     unittest.main()
