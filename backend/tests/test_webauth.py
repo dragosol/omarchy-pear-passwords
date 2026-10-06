@@ -9,6 +9,8 @@ Run: .venv/bin/python -m unittest tests.test_webauth
 """
 
 import base64
+import os
+import re
 import unittest
 from unittest import mock
 
@@ -287,6 +289,60 @@ class TlsVerificationTests(unittest.TestCase):
         for mod in (webauth, __import__("icp.auth.icloud", fromlist=["x"])):
             src = inspect.getsource(mod)
             self.assertNotIn("disable_warnings", src, f"{mod.__name__} silences urllib3 warnings")
+
+
+class QmlTextFormatTests(unittest.TestCase):
+    """Vault entry titles, usernames, domains and field values are rendered in QML labels. A
+    label left on the default Text.AutoText parses them as markup, so an entry whose title or
+    notes contain an <img> would make Qt fetch that URL when the vault is opened: an outbound
+    request against README.md's "Requests go to Apple only", and a signal that the vault was
+    opened and which entry was viewed. Entries can come from a shared iCloud group or be
+    authored by a website through autofill, so their text is not all the owner's own."""
+
+    QML = [os.path.join(os.path.dirname(__file__), "..", "..", d)
+           for d in ("app", "plugin")]
+    ELEMENT = re.compile(r"^\s*(Text|TextEdit|TextArea|TextInput)\s*\{")
+
+    def _files(self):
+        for folder in self.QML:
+            for name in sorted(os.listdir(folder)):
+                if name.endswith(".qml"):
+                    with open(os.path.join(folder, name)) as fh:
+                        yield name, fh.read().split("\n")
+
+    def test_every_text_element_declares_a_format(self):
+        missing = []
+        for name, lines in self._files():
+            for i, line in enumerate(lines):
+                if (self.ELEMENT.match(line)
+                        and not line.strip().startswith("TextInput")   # plain text only, no property
+                        and "textFormat" not in " ".join(lines[i:i + 14])):
+                    missing.append(f"{name}:{i + 1} {line.strip()[:50]}")
+        self.assertEqual(missing, [], "on the AutoText default:\n" + "\n".join(missing))
+
+    def test_markup_is_only_rendered_for_fixed_text(self):
+        """StyledText and RichText fetch remote <img> just as AutoText does, so the only
+        elements allowed to use them must not render anything that came off the network."""
+        rich = []
+        for name, lines in self._files():
+            for i, line in enumerate(lines):
+                if re.search(r"textFormat:\s*\w+\.(RichText|StyledText|AutoText)", line):
+                    rich.append((name, i + 1, lines[max(0, i - 8):i + 2]))
+        self.assertEqual(len(rich), 1, f"expected one markup element, got {[(n, l) for n, l, _ in rich]}")
+        name, lineno, block = rich[0]
+        joined = "\n".join(block)
+        self.assertIn("This can't be undone", joined,
+                      f"the markup element at {name}:{lineno} is no longer the fixed warning")
+        self.assertNotIn("modelData", joined, "it renders model data")
+
+    def test_secret_word_is_clamped(self):
+        """secretWord() is interpolated into that one markup element and takes its value from
+        an Apple API response, so it must only ever return a word this file branches on."""
+        shell = dict(self._files())["shell.qml"]
+        start = next(i for i, l in enumerate(shell) if "function secretWord()" in l)
+        body = "\n".join(shell[start:start + 12])
+        self.assertIn("indexOf(root.signinDevice.secret)", body,
+                      "secretWord() returns signinDevice.secret unchecked")
 
 
 if __name__ == "__main__":

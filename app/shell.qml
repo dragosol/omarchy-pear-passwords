@@ -709,7 +709,11 @@ ShellRoot {
     // The word follows the device: a Mac escrows with its login password, iPhone/iPad a passcode.
     function deviceName() { return root.signinDevice.name || root.signinDetail; }
     function secretWord() {
-        if (root.signinDevice.secret) return root.signinDevice.secret;
+        // This is interpolated into a StyledText warning, and signinDevice.secret comes off an
+        // Apple API response rather than from here, so it is clamped to the words the rest of
+        // this file branches on instead of being rendered as whatever arrives.
+        const named = ["password", "passcode", "PIN"];
+        if (named.indexOf(root.signinDevice.secret) >= 0) return root.signinDevice.secret;
         const d = root.signinDetail;
         if (/mac/i.test(d)) return "password";
         if (/iphone|ipad|ipod|vision|watch/i.test(d)) return "passcode";
@@ -1134,6 +1138,7 @@ ShellRoot {
                         anchors.rightMargin: 10
                         spacing: 10
                         Text {
+                            textFormat: Text.PlainText
                             Layout.fillWidth: true
                             text: root.signedIn ? "Apple needs you to sign in again — your passwords are not syncing"
                                                 : "Not signed in to iCloud — these are the passwords saved on this computer"
@@ -1173,6 +1178,7 @@ ShellRoot {
                             // field makes the whole window read as a dialog.
                             // New entry: a word in the corner, like the search it sits beside.
                             Text {
+                                textFormat: Text.PlainText
                                 id: newButton
                                 anchors.right: parent.right
                                 anchors.rightMargin: 16
@@ -1423,6 +1429,7 @@ ShellRoot {
                                         radius: Theme.radius
                                         color: root.chipColor(modelData)
                                         Text {
+                                            textFormat: Text.PlainText
                                             anchors.centerIn: parent
                                             text: root.monogram(modelData)
                                             color: "#ffffff"
@@ -1439,6 +1446,7 @@ ShellRoot {
                                             Layout.fillWidth: true
                                             spacing: 6
                                             Text {
+                                                textFormat: Text.PlainText
                                                 Layout.fillWidth: true
                                                 text: modelData.primary
                                                 color: Theme.fg
@@ -1453,6 +1461,7 @@ ShellRoot {
                                             }
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             visible: text.length > 0
                                             // The account first; "no website" only when there is nothing else to say.
@@ -1470,6 +1479,7 @@ ShellRoot {
                                     }
 
                                     Text {
+                                        textFormat: Text.PlainText
                                         visible: modelData.has_totp
                                         text: "⧗"
                                         color: Theme.dim
@@ -1569,6 +1579,7 @@ ShellRoot {
                             // Everything here is greyed except the one thing you can do. A locked
                             // screen shouldn't shout its own state louder than the way out of it.
                             Text {
+                                textFormat: Text.PlainText
                                 Layout.alignment: Qt.AlignHCenter
                                 text: "Pear Passwords is locked"
                                 color: Theme.dim
@@ -1576,6 +1587,7 @@ ShellRoot {
                                 font.pixelSize: Theme.fHeading
                             }
                             Text {
+                                textFormat: Text.PlainText
                                 Layout.alignment: Qt.AlignHCenter
                                 text: root.authing
                                     ? "Waiting for your fingerprint or password. Nothing appeared? Retry"
@@ -1602,6 +1614,7 @@ ShellRoot {
                             visible: (root.appUnlocked && root.entries.length === 0) || (!root.appUnlocked && !root.signedIn)
                             spacing: 10
                             Text {
+                                textFormat: Text.PlainText
                                 Layout.alignment: Qt.AlignHCenter
                                 text: "No passwords yet"
                                 color: Theme.fg
@@ -1609,6 +1622,7 @@ ShellRoot {
                                 font.pixelSize: Theme.fHeading
                             }
                             Text {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 horizontalAlignment: Text.AlignHCenter
                                 text: root.signedIn
@@ -1631,6 +1645,7 @@ ShellRoot {
                         }
 
                         Text {
+                            textFormat: Text.PlainText
                             anchors.centerIn: parent
                             visible: root.appUnlocked && !root.selected && root.entries.length > 0
                             text: "Select an entry"
@@ -1661,6 +1676,7 @@ ShellRoot {
                                     radius: Theme.radius
                                     color: root.selected ? root.chipColor(root.selected) : "transparent"
                                     Text {
+                                        textFormat: Text.PlainText
                                         anchors.centerIn: parent
                                         text: root.selected ? root.monogram(root.selected) : ""
                                         color: "#ffffff"
@@ -1678,6 +1694,7 @@ ShellRoot {
                                         Layout.fillWidth: true
                                         spacing: 10
                                         Text {
+                                            textFormat: Text.PlainText
                                             visible: !root.renaming
                                             Layout.fillWidth: true
                                             text: root.selected ? root.selected.primary : ""
@@ -1699,6 +1716,7 @@ ShellRoot {
                                             }
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             visible: !root.renaming
                                             text: "rename"
                                             color: Theme.dim
@@ -1721,6 +1739,7 @@ ShellRoot {
                                             onClicked: root.saveNickname(nickField.text)
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             visible: root.renaming && root.selected && root.selected.nickname
                                             text: "reset"
                                             color: Theme.dim
@@ -1739,6 +1758,7 @@ ShellRoot {
                                     // no pills. "Unlocked" belongs here rather than as a badge
                                     // because it is state, not identity.
                                     Text {
+                                        textFormat: Text.PlainText
                                         Layout.fillWidth: true
                                         text: root.metaLine()
                                         visible: text.length > 0
@@ -1789,6 +1809,7 @@ ShellRoot {
                                         anchors.fill: parent
                                         spacing: 18
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.preferredWidth: 88
                                             text: frow.modelData.label
                                             color: Theme.dim
@@ -1796,6 +1817,7 @@ ShellRoot {
                                             font.pixelSize: Theme.fSmall
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             text: frow.modelData.value
                                             color: frow.modelData.quiet ? Theme.dim : Theme.fg
@@ -1834,6 +1856,7 @@ ShellRoot {
                                 spacing: 0
                                 visible: root.selected && root.selected.aliases && root.selected.aliases.length > 0
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "also on   "
                                     color: Theme.dim
                                     font.family: Theme.uiFont
@@ -1890,6 +1913,7 @@ ShellRoot {
                                         onClicked: root.confirming = true
                                     }
                                     Text {
+                                        textFormat: Text.PlainText
                                         text: "cancel"
                                         color: Theme.dim
                                         font.family: Theme.uiFont
@@ -1909,6 +1933,7 @@ ShellRoot {
                                     visible: root.confirming
                                     spacing: 10
                                     Text {
+                                        textFormat: Text.PlainText
                                         Layout.fillWidth: true
                                         text: "Change this password on every device signed into your iCloud account?"
                                         color: Theme.fg
@@ -1917,6 +1942,7 @@ ShellRoot {
                                         wrapMode: Text.Wrap
                                     }
                                     Text {
+                                        textFormat: Text.PlainText
                                         Layout.fillWidth: true
                                         text: (root.revealed ? root.revealed : "current password") + "   →   " + newPw.text
                                         color: Theme.dim
@@ -1939,6 +1965,7 @@ ShellRoot {
                                 Layout.topMargin: 30
                                 spacing: 10
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "History"
                                     color: Theme.dim
                                     font.family: Theme.uiFont
@@ -1947,6 +1974,7 @@ ShellRoot {
                                 }
                                 Item { Layout.fillWidth: true }
                                 Text {
+                                    textFormat: Text.PlainText
                                     visible: !root.unlocked
                                     text: "unlock"
                                     readonly property bool keyed: root.panelFocus && !root.unlocked
@@ -1966,6 +1994,7 @@ ShellRoot {
                             }
 
                             Text {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 Layout.topMargin: 10
                                 visible: root.unlocked && root.historyLoaded && root.historyRows.length === 0
@@ -2037,6 +2066,7 @@ ShellRoot {
                                         anchors.verticalCenter: parent.verticalCenter
                                         spacing: 3
                                         Text {
+                                            textFormat: Text.PlainText
                                             text: Qt.formatDateTime(new Date(hrow.modelData.at * 1000), "d MMM yyyy") + "   "
                                                   + (hrow.modelData.source === "sync" ? "changed on another device"
                                                      : hrow.modelData.source === "local" ? "changed here" : "from Apple")
@@ -2045,6 +2075,7 @@ ShellRoot {
                                             font.pixelSize: Theme.fSmall
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             text: root.revealedHistory[hrow.index]
                                                 ? ((hrow.modelData.old ? hrow.modelData.old + "   →   " : "") + (hrow.modelData.new || ""))
@@ -2073,6 +2104,7 @@ ShellRoot {
                         anchors.rightMargin: 12
                         spacing: 10
                         Text {
+                            textFormat: Text.PlainText
                             Layout.fillWidth: true
                             text: root.flash ? root.flash
                                 : root.status ? root.status
@@ -2089,6 +2121,7 @@ ShellRoot {
                         // Which of the two states the app is in, and how long is left of it.
                         // Click it to scan now rather than waiting to be asked mid-action.
                         Text {
+                            textFormat: Text.PlainText
                             visible: root.appUnlocked && root.sessionLeft > 0
                             text: root.unlocked ? "unlocked " + root.clock(root.unlockLeft)
                                                 : "read-only · locks in " + root.clock(root.sessionLeft)
@@ -2102,6 +2135,7 @@ ShellRoot {
                         // Always reachable - the banner only appears once Apple has already
                         // refused a sync, which is no help for a first sign-in.
                         Text {
+                            textFormat: Text.PlainText
                             text: "sign in…"
                             opacity: root.appUnlocked ? 1 : 0.45
                             color: hSign.hovered ? Theme.accent : Theme.dim
@@ -2112,6 +2146,7 @@ ShellRoot {
                             TapHandler { onTapped: root.startSignin("login") }
                         }
                         Text {
+                            textFormat: Text.PlainText
                             visible: root.entries.length > 0
                             text: root.panelFocus
                                 ? "↑↓ move   ⏎ copy / open   ␣ show   esc list"
@@ -2176,6 +2211,7 @@ ShellRoot {
                     spacing: 0
 
                     Text {
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         text: root.editorTitle()
                         color: Theme.fg
@@ -2185,6 +2221,7 @@ ShellRoot {
                         wrapMode: Text.Wrap
                     }
                     Text {
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         Layout.topMargin: 6
                         visible: text !== ""
@@ -2205,6 +2242,7 @@ ShellRoot {
                         spacing: 8
                         visible: root.editorMode === "sites" || root.editorMode === "notes"
                         Text {
+                            textFormat: Text.PlainText
                             Layout.fillWidth: true
                             visible: root.editorMode === "sites" && root.selected && !root.selected.no_site
                             text: "Main website   " + (root.selected ? root.selected.domain : "")
@@ -2214,6 +2252,7 @@ ShellRoot {
                             elide: Text.ElideRight
                         }
                         Text {
+                            textFormat: Text.PlainText
                             text: root.editorMode === "sites"
                                   ? (root.selected && !root.selected.no_site ? "Other websites" : "Websites") : "Notes"
                             color: Theme.fg
@@ -2231,6 +2270,7 @@ ShellRoot {
                                 anchors.fill: parent
                                 anchors.margins: 1
                                 TextArea {
+                                    textFormat: TextArea.PlainText
                                     id: edArea
                                     wrapMode: TextEdit.Wrap
                                     color: Theme.fg
@@ -2245,6 +2285,7 @@ ShellRoot {
                             }
                         }
                         Text {
+                            textFormat: Text.PlainText
                             Layout.fillWidth: true
                             text: root.editorMode === "sites"
                                   ? "One per line. The password is offered on each of these."
@@ -2298,6 +2339,7 @@ ShellRoot {
                                 anchors.margins: 16
                                 spacing: 4
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: root.groupCode(root.totpPreview.code)
                                     color: Theme.fg
                                     font.family: Theme.uiFont
@@ -2305,6 +2347,7 @@ ShellRoot {
                                     font.letterSpacing: 2
                                 }
                                 Text {
+                                    textFormat: Text.PlainText
                                     Layout.fillWidth: true
                                     text: [root.totpPreview.issuer, root.totpPreview.account].filter(function (x) { return x; }).join("  ·  ")
                                           || "Enter this code on the site to finish setting it up."
@@ -2316,6 +2359,7 @@ ShellRoot {
                             }
                         }
                         Text {
+                            textFormat: Text.PlainText
                             visible: root.editorMode === "totp" && root.selected && root.selected.has_totp && !root.editorBusy
                             text: "Remove verification code"
                             color: hRemove.hovered ? Theme.danger : Theme.dim
@@ -2387,6 +2431,7 @@ ShellRoot {
                             }
                         }
                         Text {
+                            textFormat: Text.PlainText
                             Layout.row: 4; Layout.column: 1
                             Layout.topMargin: 4
                             visible: !root.createMore
@@ -2399,6 +2444,7 @@ ShellRoot {
                             TapHandler { onTapped: root.createMore = true }
                         }
                         Text {
+                            textFormat: Text.PlainText
                             Layout.row: 5; Layout.column: 0
                             visible: root.createMore
                             text: "Notes"
@@ -2412,6 +2458,7 @@ ShellRoot {
                             placeholderText: "Optional"
                         }
                         Text {
+                            textFormat: Text.PlainText
                             Layout.row: 6; Layout.column: 0
                             visible: root.createMore
                             text: "Code"
@@ -2435,6 +2482,7 @@ ShellRoot {
                             }
                         }
                         Text {
+                            textFormat: Text.PlainText
                             Layout.row: 7; Layout.column: 1
                             visible: root.createMore && !!root.totpPreview.code
                             text: "Code now: " + root.groupCode(root.totpPreview.code)
@@ -2466,6 +2514,7 @@ ShellRoot {
                         }
                     }
                     Text {
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         Layout.topMargin: 10
                         visible: root.editorBusy || root.editorError !== ""
@@ -2570,6 +2619,7 @@ ShellRoot {
                                     Behavior on color { ColorAnimation { duration: 200 } }
                                 }
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: modelData
                                     color: parent.state === 1 ? Theme.fg : Theme.dim
                                     opacity: parent.state === 0 ? 0.6 : 1
@@ -2590,6 +2640,7 @@ ShellRoot {
                         border.width: 2
                         border.color: root.signinOutcome === "ok" ? Theme.accent : Theme.danger
                         Text {
+                            textFormat: Text.PlainText
                             anchors.centerIn: parent
                             text: root.signinOutcome === "ok" ? "✓" : "!"
                             color: parent.border.color
@@ -2601,6 +2652,7 @@ ShellRoot {
 
                     // ---- title + subtitle
                     Text {
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         Layout.topMargin: root.signinOutcome === "" ? 28 : 18
                         text: root.signinTitle()
@@ -2611,6 +2663,7 @@ ShellRoot {
                         wrapMode: Text.Wrap
                     }
                     Text {
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         Layout.topMargin: 8
                         visible: text !== ""
@@ -2654,6 +2707,7 @@ ShellRoot {
                         visible: (root.signinNeed === "text" || root.signinNeed === "secret")
                                  && root.signinKind !== "code"
                         Text {
+                            textFormat: Text.PlainText
                             Layout.fillWidth: true
                             wrapMode: Text.Wrap
                             visible: text !== ""
@@ -2675,6 +2729,7 @@ ShellRoot {
                             Keys.onEscapePressed: root.signinCancel()
                         }
                         Text {
+                            textFormat: Text.PlainText
                             Layout.fillWidth: true
                             visible: text !== ""
                             text: root.fieldHelper()
@@ -2715,6 +2770,7 @@ ShellRoot {
                                     border.width: current ? 2 : 1
                                     border.color: current ? Theme.accent : Theme.line
                                     Text {
+                                        textFormat: Text.PlainText
                                         anchors.centerIn: parent
                                         text: codeField.text.charAt(index)
                                         color: Theme.fg
@@ -2779,6 +2835,7 @@ ShellRoot {
                                         Layout.fillWidth: true
                                         spacing: 3
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             text: modelData
                                             color: parent.parent.parent.chosen ? Theme.selectedText : Theme.fg
@@ -2787,6 +2844,7 @@ ShellRoot {
                                             elide: Text.ElideRight
                                         }
                                         Text {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             visible: text !== ""
                                             text: parent.parent.parent.detail
@@ -2844,6 +2902,7 @@ ShellRoot {
 
                     // ---- done: the facts, then quiet warnings
                     Text {
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         Layout.topMargin: 14
                         visible: root.signinOutcome === "ok" && root.signinCount >= 0
@@ -2868,6 +2927,7 @@ ShellRoot {
 
                     // ---- error: what it said, verbatim, on request
                     Text {
+                        textFormat: Text.PlainText
                         Layout.topMargin: 14
                         visible: root.signinOutcome === "error" && root.signinLog.length > 0
                         text: (root.signinShowDetails ? "Hide details" : "Show details")
@@ -2892,6 +2952,7 @@ ShellRoot {
                         color: Theme.panel
                         clip: true
                         Text {
+                            textFormat: Text.PlainText
                             id: logText
                             anchors.fill: parent
                             anchors.margins: 10

@@ -172,6 +172,12 @@ administrator and runs a no-op command as root to prove it.
   gone at logout, so a copy of `~/.config/icp` cannot be opened without the passphrase. The cost
   is that a restart asks for it once more. Earlier versions kept that key in a 0600 file beside
   the vault; updating removes it automatically.
+- **Vault text is never treated as markup.** Every label renders as plain text, so an entry
+  whose title, username, domain or notes contains something like an `<img>` tag is shown as
+  those characters rather than fetched. Otherwise opening the vault would have made a silent
+  request to whoever wrote that entry, telling them the vault was opened and which entry was
+  looked at, which is not something the entries are all your own to rule out: they can come
+  from a shared iCloud group or be written by a website through autofill.
 - **Every connection to Apple is verified.** All of them check the certificate and the
   hostname, so nothing on the network can pose as Apple and read your sign-in. `gsa.apple.com`
   is served from Apple's own private authority, which a stock Python does not know, so instead
