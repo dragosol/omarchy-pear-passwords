@@ -301,7 +301,10 @@ class QmlTextFormatTests(unittest.TestCase):
 
     QML = [os.path.join(os.path.dirname(__file__), "..", "..", d)
            for d in ("app", "plugin")]
-    ELEMENT = re.compile(r"^\s*(Text|TextEdit|TextArea|TextInput)\s*\{")
+    # A word boundary, not a line anchor: `delegate: Text {` and `component Foo: Text {` are
+    # elements too. A ^ anchor skipped them, this test still passed, and the reviewer then
+    # found one of them. TextInput has no textFormat property, so it is excluded by name.
+    ELEMENT = re.compile(r"(?<![A-Za-z0-9_])(TextEdit|TextArea|TextInput|Text)\s*\{")
 
     def _files(self):
         for folder in self.QML:
@@ -314,9 +317,9 @@ class QmlTextFormatTests(unittest.TestCase):
         missing = []
         for name, lines in self._files():
             for i, line in enumerate(lines):
-                if (self.ELEMENT.match(line)
-                        and not line.strip().startswith("TextInput")   # plain text only, no property
-                        and "textFormat" not in " ".join(lines[i:i + 14])):
+                found = self.ELEMENT.search(line)
+                if (found and found.group(1) != "TextInput"
+                        and "textFormat" not in " ".join(lines[i:i + 16])):
                     missing.append(f"{name}:{i + 1} {line.strip()[:50]}")
         self.assertEqual(missing, [], "on the AutoText default:\n" + "\n".join(missing))
 

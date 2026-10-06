@@ -1830,6 +1830,7 @@ ShellRoot {
                                         Repeater {
                                             model: frow.modelData.actions
                                             delegate: Text {
+                                                textFormat: Text.PlainText
                                                 required property var modelData
                                                 text: modelData.label
                                                 color: hAct.hovered ? Theme.fg : Theme.dim
@@ -1865,6 +1866,7 @@ ShellRoot {
                                 Repeater {
                                     model: root.selected ? root.selected.aliases : []
                                     delegate: Text {
+                                        textFormat: Text.PlainText
                                         required property var modelData
                                         required property int index
                                         text: (index > 0 ? "  ·  " : "") + modelData
@@ -2383,6 +2385,7 @@ ShellRoot {
                             model: [{ l: "Name", f: "name" }, { l: "Website", f: "site" },
                                     { l: "Username", f: "user" }, { l: "Password", f: "pass" }]
                             delegate: Text {
+                                textFormat: Text.PlainText
                                 required property var modelData
                                 required property int index
                                 Layout.row: index
