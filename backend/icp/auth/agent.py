@@ -2,14 +2,32 @@
 
 Lives on a unix socket under $XDG_RUNTIME_DIR, which is already 0700, so only your own user can
 reach it. That is also the honest limit of this design: while unlocked, anything running as you
-can ask for the key, exactly as anything running as you can scrape an unlocked Bitwarden. The
-timeout is what bounds the window. Only used once a passphrase is set.
+can ask for the key, exactly as anything running as you can scrape an unlocked Bitwarden. Only
+used once a passphrase is set.
+
+Releasing the key goes through polkit (`org.icp.unlock`, ALWAYS_CHECK), so day to day it is a
+fingerprint, or the account password in the same dialog where there is no reader - the prompt
+every other privileged action on the desktop uses. A successful check opens a grace window of
+ICP_LOCK_TIMEOUT seconds, so opening the app scans once rather than once per read.
+
+That check is defence in depth, not a boundary: the socket is reachable only by this user, and
+this user is exactly who polkit would approve. It raises the cost of a background process
+quietly draining the key; it does not stop code running as you that is willing to ask.
+
+Two commands exist because the caller's situation differs:
+  GET   someone is at the keyboard - may scan a finger, may open a dialog
+  PEEK  nobody is - answers only from an open grace window, never prompts
+The unattended sync uses PEEK, which is why a timer can no longer put a password box on screen.
+
+Where the polkit action is not installed, the key keeps the previous idle-timeout behaviour
+instead, so a machine without the policy is never locked out of its own vault.
 
 Auto-spawns on first use; no systemd unit to install.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import subprocess
@@ -18,6 +36,8 @@ import time
 
 from . import lockbox
 from ..errors import AppleError
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 900  # seconds of idleness before the key is dropped
 
@@ -44,6 +64,51 @@ def socket_path() -> str:
 # --------------------------------------------------------------------------- server
 
 
+# How the key is protected once the agent holds it:
+#   polkit   a check before each release, with a grace window (fingerprint, or the account
+#            password in the same dialog). The key stays in memory until LOCK or logout.
+#   timeout  no check; the key is wiped after ICP_LOCK_TIMEOUT seconds of idleness.
+# "auto" picks polkit where the action is installed. ICP_KEY_GATE forces one, which is also how
+# the tests exercise each path without a prompt on screen.
+GATE_TIMEOUT = 20  # seconds to wait for the gate inside the socket loop
+
+
+def _gate_usable() -> bool:
+    """Whether to protect the key with polkit rather than an idle timeout.
+
+    Checked per request, so installing the policy takes effect without restarting the agent.
+    False keeps the previous behaviour, because a machine with no polkit action must not end up
+    locked out of its own vault.
+    """
+    choice = os.environ.get("ICP_KEY_GATE", "auto").strip().lower()
+    if choice == "timeout":
+        return False
+    if choice == "polkit":
+        return True
+    try:
+        from ..ui import reauth
+        return reauth.available()
+    except Exception:
+        return False
+
+
+def _authorize() -> str:
+    """Run the gate. Returns "authed", "denied" or "error".
+
+    Bounded by GATE_TIMEOUT, because this runs inside the loop that serves every other client,
+    and it deliberately does NOT fall through to pkexec the way cmd_app_auth does: pkexec waits
+    up to 90s more, which is far too long to hold the socket. A gate that is merely *broken*
+    reports "error" and the caller degrades to the idle-timeout rule instead of refusing, so a
+    damaged policy costs residency time rather than access to the vault.
+    """
+    try:
+        from ..ui import reauth
+        return reauth.challenge_status(timeout=GATE_TIMEOUT)
+    except Exception as e:
+        logger.warning("key release gate could not run (%s)", e)
+        return "error"
+
+
 def _serve() -> int:
     path = socket_path()
     try:
@@ -57,21 +122,22 @@ def _serve() -> int:
     srv.listen(8)
     srv.settimeout(60)
 
-    key = None          # bytearray so it can be wiped; bytes are immutable
-    expires = 0.0
+    key = None              # bytearray so it can be wiped; bytes are immutable
+    expires = 0.0           # idle expiry, used only where the polkit gate is unavailable
+    authorized_until = 0.0  # grace window opened by a successful polkit check
 
     def wipe():
-        nonlocal key, expires
+        nonlocal key, expires, authorized_until
         if key is not None:
             for i in range(len(key)):
                 key[i] = 0
-        key, expires = None, 0.0
+        key, expires, authorized_until = None, 0.0, 0.0
 
     while True:
         try:
             conn, _ = srv.accept()
         except socket.timeout:
-            if key is not None and time.monotonic() >= expires:
+            if key is not None and not _gate_usable() and time.monotonic() >= expires:
                 wipe()
             continue
         with conn:
@@ -82,19 +148,51 @@ def _serve() -> int:
                 continue
             cmd, _, arg = line.partition(" ")
 
-            if key is not None and time.monotonic() >= expires:
+            gated = _gate_usable()
+            if key is not None and not gated and time.monotonic() >= expires:
                 wipe()
 
-            if cmd == "GET":
+            if cmd in ("GET", "PEEK"):
+                now = time.monotonic()
+                if key is None:
+                    conn.sendall(b"LOCKED\n")
+                elif not gated:
+                    expires = now + _timeout()  # idle timeout, so refresh on use
+                    conn.sendall(b"OK " + bytes(key).hex().encode() + b"\n")
+                elif now < authorized_until:
+                    expires = now + _timeout()
+                    conn.sendall(b"OK " + bytes(key).hex().encode() + b"\n")
+                elif cmd == "PEEK":
+                    # Nobody is at the keyboard. Report locked rather than prompt.
+                    conn.sendall(b"LOCKED\n")
+                else:
+                    verdict = _authorize()
+                    if verdict == "authed":
+                        authorized_until = time.monotonic() + _timeout()
+                        conn.sendall(b"OK " + bytes(key).hex().encode() + b"\n")
+                    elif verdict == "error" and now < expires:
+                        # The gate is broken, not refusing. Fall back to the idle-timeout rule
+                        # rather than locking someone out of their own passwords.
+                        expires = now + _timeout()
+                        conn.sendall(b"OK " + bytes(key).hex().encode() + b"\n")
+                    else:
+                        conn.sendall(b"DENIED\n")
+            elif cmd == "AUTHORIZED":
+                # The window just passed the same polkit check in its own process (cmd_app_auth).
+                # Trust it rather than prompting twice for one deliberate unlock; the socket is
+                # reachable only by this user, which is who polkit would have approved anyway.
                 if key is None:
                     conn.sendall(b"LOCKED\n")
                 else:
-                    expires = time.monotonic() + _timeout()  # idle timeout, so refresh on use
-                    conn.sendall(b"OK " + bytes(key).hex().encode() + b"\n")
+                    authorized_until = time.monotonic() + _timeout()
+                    conn.sendall(b"OK\n")
             elif cmd == "UNLOCK":
                 try:
                     key = bytearray(lockbox.unlock(arg))
                     expires = time.monotonic() + _timeout()
+                    # Typing the passphrase is a stronger proof than the gate asks for, so do
+                    # not demand a fingerprint immediately afterwards.
+                    authorized_until = time.monotonic() + _timeout()
                     conn.sendall(b"OK\n")
                 except lockbox.WrongPassphrase:
                     conn.sendall(b"ERR wrong passphrase\n")
@@ -111,6 +209,7 @@ def _serve() -> int:
                 else:
                     key = bytearray(raw)
                     expires = time.monotonic() + _timeout()
+                    authorized_until = time.monotonic() + _timeout()
                     conn.sendall(b"OK\n")
             elif cmd == "LOCK":
                 wipe()
@@ -170,6 +269,30 @@ def get_key() -> bytes | None:
     if resp.startswith("OK "):
         return bytes.fromhex(resp[3:])
     return None
+
+
+def peek_key() -> bytes | None:
+    """The cached key, but only while the agent is inside an open grace window.
+
+    Never prompts and never scans, so an unattended caller gets None instead of putting a
+    dialog on someone's screen. `autostart=False`: a timer has no business starting an agent
+    that could only answer "locked" anyway.
+    """
+    try:
+        resp = _request("PEEK", autostart=False)
+    except AgentError:
+        return None
+    if resp.startswith("OK "):
+        return bytes.fromhex(resp[3:])
+    return None
+
+
+def mark_authorized() -> None:
+    """Record that the caller has just passed the polkit check itself. Best effort."""
+    try:
+        _request("AUTHORIZED", autostart=False)
+    except (AgentError, OSError):
+        pass
 
 
 def unlock(passphrase: str) -> None:

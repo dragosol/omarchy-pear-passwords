@@ -81,16 +81,26 @@ def _key_from_file() -> bytes:
 def _master_key() -> bytes:
     # Once a passphrase is set, it is the only source of the key. Nothing derived from it is
     # written to disk, so a copy of the config directory cannot be decrypted without it. The
-    # agent holds it in memory and drops it after ICP_LOCK_TIMEOUT.
+    # agent holds it in memory. Releasing it goes through polkit where that action is
+    # installed - a fingerprint, or the account password in the same dialog - and falls back to
+    # an ICP_LOCK_TIMEOUT idle drop where it is not. See auth/agent.py.
     from . import agent, held_key, lockbox, prompt
     if lockbox.is_initialised():
         # An older version wrote the derived key to disk beside the vault, which let a copy of
         # ~/.config/icp be decrypted without the passphrase. Clear that out on the way past.
         held_key.purge()
-        key = agent.get_key()
-        if key is None:
-            agent.unlock(prompt.ask_passphrase())
+        if prompt.is_allowed():
+            # GET may put a polkit prompt on screen (a fingerprint, or the account password in
+            # the same dialog). That is only acceptable because someone is at the keyboard.
             key = agent.get_key()
+            if key is None:
+                agent.unlock(prompt.ask_passphrase())
+                key = agent.get_key()
+        else:
+            # PEEK never prompts and never scans: it answers only from the grace window the
+            # agent is already inside. An unattended run gets a locked keychain instead of a
+            # dialog nobody asked for.
+            key = agent.peek_key()
         if key is None:
             raise SessionError("keychain is locked")
         return key

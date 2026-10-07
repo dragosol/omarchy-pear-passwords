@@ -212,6 +212,20 @@ administrator and runs a no-op command as root to prove it.
   into the process that handles your credentials; re-recording the digests is a deliberate step.
   [docs/anisette-provenance.md](docs/anisette-provenance.md) sets out the whole chain, link by
   link, including what stays unverified.
+- **Unlocking, and what asks you for what.** Once a passphrase is set it is the only thing that
+  can derive the vault key, and that key is never written to disk - a copy of `~/.config/icp` is
+  useless without it. The key lives in a small agent in memory, and releasing it goes through
+  polkit (`org.icp.unlock`, `ALWAYS_CHECK`): a fingerprint, or your account password in the same
+  dialog on a machine with no reader, which is the prompt every other privileged action on the
+  desktop uses. A successful check opens a grace window, so opening the app scans once rather
+  than once per password you read. Where that polkit action isn't installed the key keeps the
+  older behaviour instead and is wiped after `ICP_LOCK_TIMEOUT` seconds idle, so a machine
+  without the policy is never locked out of its own vault; `ICP_KEY_GATE=timeout` forces that.
+  The passphrase itself is asked for once per login session, when the agent has no key yet.
+  **The background sync never asks for anything**: it runs with `--no-prompt`, reads the key only
+  if the agent already has it available, and otherwise skips and syncs the next time you unlock
+  the app. A timer has no business putting a password box on your screen.
+
 - **Locked dependencies.** Every Python package, including the build tool and every
   transitive dependency, is pinned to an exact version and installed with
   `pip --require-hashes` from `backend/requirements.lock` and `backend/build-requirements.lock`.

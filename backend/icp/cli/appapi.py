@@ -19,6 +19,7 @@ Two rules shape the whole file:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -26,6 +27,8 @@ import time
 
 from ..vault import history as hist, nicknames as nick
 from ..vault.store import load_vault
+
+logger = logging.getLogger(__name__)
 
 # Two clocks, both restarted by a scan. FULL_TTL is how long the answer to "is this you?"
 # is treated as still true; SESSION_TTL is how long the window may keep showing anything.
@@ -131,9 +134,34 @@ def cmd_app_auth(args) -> int:
         json.dump({"ok": True, "authed": False, "via": via, "reason": status}, sys.stdout)
         return 0
 
+    # The person just passed the gate in this process. Tell the agent, so reading the vault does
+    # not ask them for the same thing twice, and take the opportunity to sync while the key is
+    # legitimately available - the timer cannot, because it is not allowed to prompt.
+    from ..auth import agent
+    agent.mark_authorized()
+    _sync_in_background()
+
     json.dump({"ok": True, "authed": True, "via": via, **_session_state(_write_session())},
               sys.stdout)
     return 0
+
+
+def _sync_in_background() -> None:
+    """Kick off a sync and do not wait for it.
+
+    The unattended timer skips whenever the keychain is locked, so an unlock is the moment that
+    reliably has a key. Detached and fully silent: this is a side effect of opening the app and
+    must never delay the window or write to its stdout, which carries the JSON reply.
+    """
+    import subprocess
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "icp", "sync"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as e:
+        logger.debug("background sync after unlock did not start: %s", e)
 
 
 def cmd_app_lock_app(args) -> int:

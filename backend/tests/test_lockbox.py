@@ -55,10 +55,16 @@ class AgentTimeoutTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._old = {k: os.environ.get(k) for k in
-                     ("XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "ICP_LOCK_TIMEOUT")}
+                     ("XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "ICP_LOCK_TIMEOUT",
+                      "ICP_KEY_GATE")}
         os.environ["XDG_CONFIG_HOME"] = self._tmp.name
         os.environ["XDG_RUNTIME_DIR"] = self._tmp.name
         os.environ["ICP_LOCK_TIMEOUT"] = "0"  # expire immediately
+        # Pin the idle-timeout gate for these socket tests. Under "auto" the agent would run a
+        # real polkit check on GET wherever org.icp.unlock is installed, which blocks the loop
+        # waiting for a dialog nobody is going to answer in a test run.
+        self._old["ICP_KEY_GATE"] = os.environ.get("ICP_KEY_GATE")
+        os.environ["ICP_KEY_GATE"] = "timeout"
 
     def tearDown(self):
         from icp.auth import agent
@@ -73,13 +79,22 @@ class AgentTimeoutTests(unittest.TestCase):
                 os.environ[k] = v
         self._tmp.cleanup()
 
-    def test_key_is_dropped_after_timeout(self):
+    def test_key_is_dropped_after_timeout_without_the_polkit_gate(self):
+        """ICP_KEY_GATE=timeout keeps the pre-1.3.1 behaviour, which is what a machine with no
+        org.icp.unlock action falls back to."""
         from icp.auth import agent, lockbox
         lockbox.initialise("a passphrase that is long")
         agent.unlock("a passphrase that is long")
         # ICP_LOCK_TIMEOUT=0 means the lease is already stale on the next request.
         self.assertIsNone(agent.get_key(), "key survived past its timeout")
         self.assertEqual(agent.status(), "locked")
+
+    def test_peek_never_prompts_and_reports_locked(self):
+        """PEEK is what the unattended sync uses; it must answer, not block."""
+        from icp.auth import agent, lockbox
+        lockbox.initialise("a passphrase that is long")
+        agent.unlock("a passphrase that is long")
+        self.assertIsNone(agent.peek_key(), "PEEK served a key outside any grace window")
 
     def test_socket_is_private(self):
         from icp.auth import agent, lockbox

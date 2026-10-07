@@ -456,7 +456,13 @@ def cmd_sync(args) -> int:
     from ..paths import sync_lock_file
 
     from ..paths import needs_login_file
+    from ..auth import prompt
     interactive = sys.stdin.isatty()
+    # The 2-hourly timer runs with a desktop session in its environment, so ask_passphrase()
+    # would find zenity and put a modal password box on screen every two hours - which is what
+    # it did until 1.3.1. A background job gets no dialog; it skips and the next unlock syncs.
+    if getattr(args, "no_prompt", False) or not interactive:
+        prompt.set_allowed(False)
     if needs_login_file().exists() and not interactive:
         ui.err("standing down: Apple wants an interactive sign-in "
                "(run `icp login`, or `icp sync` from a terminal)")
@@ -470,7 +476,16 @@ def cmd_sync(args) -> int:
         return 0
 
     try:
-        s = session.load()
+        try:
+            s = session.load()
+        except SessionError as e:
+            # Locked keychain: the key lives only in the agent's memory and nobody is here to
+            # release it. Not a failure - there is nothing wrong, it is simply not the moment.
+            # Exit 0 so systemd does not record a failed unit for a perfectly normal state.
+            if not prompt.is_allowed():
+                ui.warn(f"skipping sync: {e}; it will run when you next unlock the app")
+                return 0
+            raise
         if not s:
             ui.err("not signed in - run: icp login")
             return 1
@@ -701,8 +716,12 @@ def _build_parser():
     lp.add_argument("--debug", action="store_true", help="write a redacted debug transcript")
     lp.set_defaults(func=cmd_login)
 
-    sub.add_parser("sync", help="re-fetch and decrypt the keychain into the vault"
-                   ).set_defaults(func=cmd_sync)
+    op = sub.add_parser("sync", help="re-fetch and decrypt the keychain into the vault")
+    # The systemd timer passes this. It is explicit rather than inferred so the unit states
+    # plainly that the unattended path cannot prompt, and so a test can assert the unit uses it.
+    op.add_argument("--no-prompt", action="store_true",
+                    help="never ask for the passphrase; skip if the keychain is locked")
+    op.set_defaults(func=cmd_sync)
 
     op = sub.add_parser("logout", help="clear the stored session")
     op.add_argument("--wipe-device", action="store_true", help="also remove the device identity")
