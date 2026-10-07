@@ -9,8 +9,11 @@ Run: .venv/bin/python -m unittest tests.test_webauth
 """
 
 import base64
+import hashlib
 import os
 import re
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -447,6 +450,99 @@ class AnisetteProvenanceTest(unittest.TestCase):
         self.assertLess(body.index("anisette/build.sh"),
                         body.index("enable --now pear-passwords-anisette.service"),
                         "the unit is enabled before the image it runs exists")
+
+    # --- the libraries are gated at startup, not merely recorded ---------------
+
+    def _entrypoint_harness(self, tmp, core, ssc, preexisting=None):
+        """Run anisette/entrypoint.sh with its download stubbed out.
+
+        LIBDIR and DIGESTS are deliberately hardcoded in the real script, so that
+        an argument cannot point the gate at a directory the server does not read.
+        That also means they have to be rewritten to exercise it. The sed-like
+        replacements below are asserted to have applied: if the script changes
+        shape, this fails loudly rather than testing nothing.
+        """
+        libdir = os.path.join(tmp, "lib")
+        digests = os.path.join(tmp, "digests")
+        script = os.path.join(tmp, "entrypoint.sh")
+
+        with open(digests, "w") as fh:
+            fh.write("# comment the checker must skip\n\n")
+            fh.write(hashlib.sha256(b"REAL-CORE").hexdigest() + "  libCoreADI.so\n")
+            fh.write(hashlib.sha256(b"REAL-SSC").hexdigest() + "  libstoreservicescore.so\n")
+
+        body = self._read("anisette", "entrypoint.sh")
+        swaps = [
+            ("LIBDIR=/home/Alcoholic/.config/anisette-v3/lib", "LIBDIR=%s" % libdir),
+            ("DIGESTS=/opt/apple-libs.sha256", "DIGESTS=%s" % digests),
+            ('curl -fsSL "$APK_URL" -o "$tmp/applemusic.apk"', ":"),
+            ('unzip -p "$tmp/applemusic.apk" lib/x86_64/libCoreADI.so > "$tmp/libCoreADI.so"',
+             'printf "%s" "$FAKE_CORE" > "$tmp/libCoreADI.so"'),
+            ('unzip -p "$tmp/applemusic.apk" lib/x86_64/libstoreservicescore.so'
+             ' > "$tmp/libstoreservicescore.so"',
+             'printf "%s" "$FAKE_SSC" > "$tmp/libstoreservicescore.so"'),
+            ('exec /opt/anisette-v3-server "$@"', 'echo STARTED'),
+        ]
+        for old, repl in swaps:
+            self.assertIn(old, body, "entrypoint.sh no longer contains %r" % old)
+            body = body.replace(old, repl)
+        with open(script, "w") as fh:
+            fh.write(body)
+        os.chmod(script, 0o755)
+
+        if preexisting is not None:
+            os.makedirs(libdir, exist_ok=True)
+            for name, data in preexisting.items():
+                with open(os.path.join(libdir, name), "wb") as fh:
+                    fh.write(data)
+
+        env = dict(os.environ, FAKE_CORE=core, FAKE_SSC=ssc)
+        run = subprocess.run(["/bin/sh", script], env=env,
+                             capture_output=True, text=True)
+        return run, libdir
+
+    def test_matching_libraries_start_the_server(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, libdir = self._entrypoint_harness(tmp, "REAL-CORE", "REAL-SSC")
+            self.assertEqual(0, run.returncode, run.stderr)
+            self.assertIn("STARTED", run.stdout)
+            self.assertTrue(os.path.exists(os.path.join(libdir, "libCoreADI.so")))
+
+    def test_a_substituted_library_stops_the_server_and_is_not_installed(self):
+        """The finding: Apple's APK is mutable and the libraries were loaded unchecked."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run, libdir = self._entrypoint_harness(tmp, "REAL-CORE", "TAMPERED")
+            self.assertNotEqual(0, run.returncode, "a substituted library still started the server")
+            self.assertNotIn("STARTED", run.stdout)
+            self.assertIn("REFUSING TO START", run.stderr)
+            self.assertFalse(os.path.exists(os.path.join(libdir, "libCoreADI.so")),
+                             "libraries were installed despite the digest mismatch")
+
+    def test_libraries_already_in_the_volume_are_checked_too(self):
+        """The volume outlives the image and is writable, so a previous start is not evidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run, _ = self._entrypoint_harness(
+                tmp, "REAL-CORE", "REAL-SSC",
+                preexisting={"libCoreADI.so": b"REAL-CORE",
+                             "libstoreservicescore.so": b"SWAPPED-LATER"})
+            self.assertNotEqual(0, run.returncode,
+                                "a swapped library in the volume still started the server")
+            self.assertIn("REFUSING TO START", run.stderr)
+
+    def test_the_container_runs_the_gate_and_not_the_server_directly(self):
+        cf = self._read("anisette", "Containerfile")
+        self.assertRegex(cf, r'ENTRYPOINT \[ "/opt/entrypoint\.sh" \]',
+                         "the image starts the server directly, bypassing the digest gate")
+        self.assertIn("COPY apple-libs.sha256 /opt/apple-libs.sha256", cf,
+                      "the digests are not in the image, so the gate has nothing to check against")
+        for tool in ("curl", "unzip"):
+            self.assertIn(tool, cf, "the runtime image cannot fetch and unpack the APK itself")
+
+    def test_the_gate_keeps_the_library_directory_out_of_argv(self):
+        """--adi-path moves where the server loads libraries from; the gate would
+        then be checking a directory nothing reads."""
+        body = self._read("anisette", "entrypoint.sh")
+        self.assertIn("--adi-path", body, "the gate no longer refuses to be pointed elsewhere")
 
     def test_build_output_is_not_shown_as_an_error(self):
         """podman writes build progress to stderr; the gate used to paint all of it red."""

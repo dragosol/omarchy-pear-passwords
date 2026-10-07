@@ -125,8 +125,9 @@ Apple libraries and calls into them:
     libstoreservicescore.so
 
 **These are not in the image, and this project does not ship them.** They are
-downloaded by the server on first start, into `lib/` inside the `icp-anisette`
-volume. From `source/app.d` at the pinned commit:
+downloaded on first start, into `lib/` inside the `icp-anisette` volume.
+Upstream does that download itself, unchecked. From `source/app.d` at the
+pinned commit:
 
     auto coreADIPath = libraryPath.buildPath("libCoreADI.so");
     auto SSCPath = libraryPath.buildPath("libstoreservicescore.so");
@@ -156,19 +157,48 @@ In plain terms:
 - The download happens only when both files are absent, so it is a first-start
   event, not traffic on every start.
 
-### What is not checked
+That last line is also what lets the download be taken out of upstream's hands.
+`anisette/entrypoint.sh` is the container's entrypoint, and it runs **before**
+the server: it fetches the APK, extracts the same two members, checks them
+against `anisette/apple-libs.sha256`, and only then writes them into `lib/`.
+By the time `anisette-v3-server` starts, both files exist, so the code quoted
+above never runs. On a mismatch nothing is written and the server is not
+started at all, so a mismatch is an outage rather than a silent substitution.
+That is deliberate: the alternative is loading unreviewed native code into the
+process that handles Apple credentials.
 
-- **The APK is not digest-pinned.** The URL is a moving target. Whatever Apple
-  serves at the moment of first start is what gets loaded.
-- **No signature is verified.** The APK's own Android signature is not checked,
-  and neither library is checked against any expected hash before it is loaded
-  and executed in-process.
-- **There is no fallback or allowlist.** If Apple ships a different build, the
-  new libraries are used silently.
+The gate checks `lib/` again even when the files were already there. A previous
+start having written them is not evidence, because the volume outlives the
+image and anything with access to it can write there.
 
-So the guarantee is: these libraries came from Apple, over a connection that
-was verified to be Apple, out of the shipping Apple Music APK. The guarantee is
-not: these are a specific reviewed set of bytes.
+### What is checked, and what still is not
+
+Checked, by `anisette/entrypoint.sh`, before the server starts:
+
+- **The two libraries, by SHA-256**, against `anisette/apple-libs.sha256`. This
+  is the whole point: those two files are what gets loaded and executed
+  in-process, so they are what is pinned.
+- **Again on every start**, not only the first, against whatever is in the
+  volume.
+- **Before installation.** The fetch lands in a temporary directory and is
+  checked there. On a mismatch, `lib/` is left untouched.
+
+Still not checked:
+
+- **The APK is not digest-pinned.** The URL is a moving target and Apple
+  publishes no immutable, versioned URL to pin instead. A new Apple Music
+  release changes those bytes, which is why the pin is on what comes out of the
+  APK and not on the APK.
+- **No Android signature is verified.** The APK's own signing is not checked.
+  TLS establishes that the bytes came from Apple's CDN; the digests establish
+  that they are the reviewed bytes. Neither is a signature check.
+- **The libraries themselves are closed-source and unaudited.** Pinning says
+  *which* opaque bytes run, not that they are benign.
+
+So the guarantee is now: these libraries came from Apple, over a connection
+verified to be Apple, out of the shipping Apple Music APK, **and they are the
+exact bytes recorded in this repository**. What it is still not: an audit of
+what that code does.
 
 ### The bytes currently being served
 
@@ -187,14 +217,33 @@ The `Last-Modified` date says Apple has not replaced that APK in about eighteen
 months, which is why recording the digests is worth anything: the expected
 value is stable enough that a change means something.
 
-These are observations, not a pin. The server does not consult them. They make
-a change **detectable**, after the fact, by running:
+These two library digests are a pin: `anisette/entrypoint.sh` enforces them and
+the container does not start without a match. The APK's own digest in that file
+is a record, not a pin, for the reason given above.
 
-    anisette/verify-apple-libs.sh
+`anisette/verify-apple-libs.sh` checks a live volume from the host against the
+same file. It is now a convenience for looking, not the control: the control is
+in the container, because a check the operator has to remember to run is not a
+check.
 
-A `CHANGED` result is not by itself a compromise; the ordinary cause is a new
-Apple Music release. It does mean the code being loaded is not the code these
-digests describe, and that should be looked at rather than assumed.
+### When Apple ships a new Apple Music build
+
+The container will refuse to start, with `REFUSING TO START` and both digests
+in the log. That is the intended failure: the libraries are different from the
+ones recorded here, and no one has looked at them yet.
+
+Re-recording is deliberately a person's decision, not an automatic update:
+
+    curl -fsSL -o /tmp/applemusic.apk \
+        https://apps.mzstatic.com/content/android-apple-music-apk/applemusic.apk
+    cd /tmp && unzip -o -j applemusic.apk 'lib/x86_64/libCoreADI.so' \
+        'lib/x86_64/libstoreservicescore.so'
+    sha256sum libCoreADI.so libstoreservicescore.so
+
+Put those digests in `anisette/apple-libs.sha256`, note the APK's new
+`Last-Modified` and digest in its header, rebuild with `anisette/build.sh`, and
+delete `lib/` from the volume so the new ones are fetched. The old digests stay
+in git history, which is where the before-and-after lives.
 
 ## Summary of what is and is not authenticated
 
@@ -209,4 +258,8 @@ digests describe, and that should be looked at rather than assumed.
 | Upstream repository history | Trusted, not independently verified; commits not signature-checked |
 | Upstream license | None declared upstream, so the image label is `NOASSERTION` |
 | Apple library origin | Apple's CDN over verified TLS, from the official Apple Music APK |
-| Apple library bytes | Not pinned and not signature-checked; recorded so changes are detectable |
+| Apple library bytes | Pinned by SHA-256 in `apple-libs.sha256`, enforced before the server starts |
+| Apple library fetch | Done by `entrypoint.sh`, not by the server, so nothing loads unchecked |
+| Apple Music APK | Not digest-pinned; no immutable URL exists. A change fails the start |
+| Apple library signature | Android APK signature not verified |
+| What the Apple libraries do | Closed source and unaudited; pinning names the bytes, not their behaviour |

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Check the Apple libraries in the live anisette volume against the digests
-# recorded in anisette/apple-libs.sha256.
+# Look at the Apple libraries in the live anisette volume from the host, and
+# compare them with the digests in anisette/apple-libs.sha256.
 #
-# A mismatch is not automatically a compromise: Apple ships a new Apple Music
-# APK and the next first-start fetch picks it up. It means the bytes being
-# loaded are not the bytes that were reviewed, and someone should look.
+# This is for looking, not for enforcing. The enforcement is anisette/entrypoint.sh
+# inside the container, which checks the same file before the server starts and
+# refuses to start it on a mismatch - a check the operator has to remember to run
+# is not a check. This script exists because inspecting a volume without starting
+# anything is sometimes what you want.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

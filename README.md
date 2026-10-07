@@ -195,12 +195,15 @@ administrator and runs a no-op command as root to prove it.
   what source produced them. `install.sh` builds it, which takes a couple of minutes the first
   time, and the built image carries the commit it came from in
   `org.opencontainers.image.revision`.
-  On first start that server downloads two closed-source Apple libraries, `libCoreADI.so` and
-  `libstoreservicescore.so`, from Apple's own CDN out of the official Android Apple Music APK
-  over verified TLS. They are not shipped here and they are not digest-pinned, so the exact
-  bytes are whatever Apple currently serves. The digests seen on 2026-10-07 are recorded in
-  `anisette/apple-libs.sha256` and `anisette/verify-apple-libs.sh` checks the installed copies
-  against them, which makes a change detectable but does not prevent one.
+  That server also needs two closed-source Apple libraries, `libCoreADI.so` and
+  `libstoreservicescore.so`, which are not shipped here: they come from Apple's own CDN, out of
+  the official Android Apple Music APK, over verified TLS, on first start. Upstream downloads
+  and loads them without checking anything, so the container's entrypoint does it instead -
+  it fetches them, checks both against the digests in `anisette/apple-libs.sha256`, and refuses
+  to start the server at all if either one differs, on every start and not just the first. The
+  APK itself can't be digest-pinned because Apple publishes no immutable URL for it, so a new
+  Apple Music release stops the container rather than quietly loading different native code
+  into the process that handles your credentials; re-recording the digests is a deliberate step.
   [docs/anisette-provenance.md](docs/anisette-provenance.md) sets out the whole chain, link by
   link, including what stays unverified.
 - **Locked dependencies.** Every Python package, including the build tool and every

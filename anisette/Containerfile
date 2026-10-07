@@ -6,8 +6,10 @@
 # to a source revision. This Containerfile builds the server here, from one
 # named upstream commit, and labels the result with that commit.
 #
-# Apple's libCoreADI.so / libstoreservicescore.so are NOT in this image. The
-# server downloads them on first start. See docs/anisette-provenance.md.
+# Apple's libCoreADI.so / libstoreservicescore.so are NOT in this image. They
+# are fetched on first start by entrypoint.sh, which checks them against the
+# digests in apple-libs.sha256 and refuses to start the server on a mismatch.
+# See docs/anisette-provenance.md.
 
 # debian:stable-20250520-slim, linux/amd64
 ARG DEBIAN_BUILDER=docker.io/library/debian:stable-20250520-slim@sha256:bd002736c5671297bbc7b056bd693c9b214c47191a70505b1ae5ccc722572cc5
@@ -53,15 +55,22 @@ ARG ANISETTE_REV
 ARG DEBIAN_RUNTIME
 
 # ca-certificates is what makes the first-start download from apps.mzstatic.com
-# a TLS-verified fetch rather than an unauthenticated one. curl is upstream's.
+# a TLS-verified fetch rather than an unauthenticated one. curl and unzip are
+# what entrypoint.sh fetches and unpacks the APK with, so that the digests are
+# checked before the server ever sees a library.
 RUN apt-get update \
  && apt-get install --no-install-recommends -y \
-      ca-certificates curl libplist-dev libplist-2.0-4 \
+      ca-certificates curl unzip libplist-dev libplist-2.0-4 \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/
 COPY --from=builder /opt/anisette-v3-server /opt/anisette-v3-server
+
+# The digests travel in the image, next to the gate that enforces them, so the
+# running container does not depend on the checkout still being present.
+COPY apple-libs.sha256 /opt/apple-libs.sha256
+COPY entrypoint.sh /opt/entrypoint.sh
 
 RUN mkdir -p /opt/anisette-v3/provisioning
 
@@ -74,11 +83,18 @@ RUN useradd -ms /bin/bash Alcoholic \
  && chown -R Alcoholic /opt/ \
  && chmod -R +wx /opt/
 
+# After the blanket chmod above, not before it: the gate and the digests it
+# reads are the two files in this image that the server's own user has no
+# reason to be able to rewrite.
+RUN chown root:root /opt/entrypoint.sh /opt/apple-libs.sha256 \
+ && chmod 0555 /opt/entrypoint.sh \
+ && chmod 0444 /opt/apple-libs.sha256
+
 # NOASSERTION is deliberate: as of the pinned revision the upstream repository
 # carries no LICENSE file and GitHub reports no license for it, so there is
 # nothing to cite. Claiming a license here would be an invention.
 LABEL org.opencontainers.image.title="anisette-v3-server (Pear Passwords build)" \
-      org.opencontainers.image.description="Anisette server for Apple sign-in, built from pinned upstream source for the Pear Passwords Omarchy plugin. Apple's libCoreADI.so and libstoreservicescore.so are downloaded at first start, not baked in." \
+      org.opencontainers.image.description="Anisette server for Apple sign-in, built from pinned upstream source for the Pear Passwords Omarchy plugin. Apple's libCoreADI.so and libstoreservicescore.so are downloaded at first start, not baked in, and are checked against apple-libs.sha256 before the server starts." \
       org.opencontainers.image.source="https://github.com/Dadoum/anisette-v3-server" \
       org.opencontainers.image.revision="${ANISETTE_REV}" \
       org.opencontainers.image.licenses="NOASSERTION" \
@@ -87,4 +103,7 @@ LABEL org.opencontainers.image.title="anisette-v3-server (Pear Passwords build)"
 
 USER Alcoholic
 EXPOSE 6969
-ENTRYPOINT [ "/opt/anisette-v3-server" ]
+# The gate, not the server: it fetches and verifies the libraries, then execs
+# the server. Going straight to the server would restore upstream's unchecked
+# download, which is the finding this closes.
+ENTRYPOINT [ "/opt/entrypoint.sh" ]
