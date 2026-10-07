@@ -100,6 +100,7 @@ ShellRoot {
     property string setupLog: ""
     property string setupError: ""
     property string setupSource: ""
+    property string setupTail: ""
     // install.sh colours its own output for a terminal; a Text renders the escape codes as
     // visible junk. Strip them rather than asking the installer to stop being readable.
     function plain(s) {
@@ -228,13 +229,23 @@ ShellRoot {
             splitMarker: "\n"
             onRead: function (line) { root.setupLog = root.plain(line); }
         }
+        // Not every line on stderr is a failure. The install compiles the anisette server and
+        // podman writes its build progress to stderr, so treating that as an error showed two
+        // minutes of red text while everything was fine. Keep the last few lines and only
+        // call them an error if the process actually exits non-zero.
         stderr: SplitParser {
             splitMarker: "\n"
-            onRead: function (line) { if (line.trim()) root.setupError = root.plain(line); }
+            onRead: function (line) {
+                var t = root.plain(line);
+                if (!t)
+                    return;
+                root.setupLog = t;
+                root.setupTail = (root.setupTail + "\n" + t).split("\n").slice(-4).join("\n").trim();
+            }
         }
         onExited: function (code) {
             if (code !== 0) {
-                if (!root.setupError) root.setupError = "Setup stopped with code " + code;
+                root.setupError = root.setupTail || ("Setup stopped with code " + code);
                 return;
             }
             root.setupError = "";
@@ -1205,8 +1216,10 @@ ShellRoot {
                             + "needs, so it never depends on what happens to be installed on "
                             + "this machine. Setting that up downloads them now. Every package "
                             + "is pinned to an exact version and checked against a hash that "
-                            + "ships with the app, nothing is built from source, and none of it "
-                            + "needs your password."
+                            + "ships with the app, and none of it needs your password. The "
+                            + "sign-in helper is compiled here from its own pinned source "
+                            + "instead of being pulled as a prebuilt image, so the first run "
+                            + "takes a couple of minutes."
                     }
                     Text {
                         textFormat: Text.PlainText

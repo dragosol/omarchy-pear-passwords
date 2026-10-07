@@ -98,6 +98,24 @@ if [ "$app_only" -eq 1 ]; then
   exit 0
 fi
 
+say "Building the anisette server from pinned source"
+# The sign-in helper is third-party code (Dadoum/anisette-v3-server). The published image on
+# Docker Hub has no provenance labels and ships a binary built elsewhere, so it is built here
+# instead, from the one upstream commit pinned in anisette/Containerfile. Takes a couple of
+# minutes the first time; after that the image is reused. See docs/anisette-provenance.md.
+anisette_rev="$(sed -n 's/^ARG ANISETTE_REV=\([0-9a-f]\{40\}\)$/\1/p' "$here/anisette/Containerfile")"
+[ -n "$anisette_rev" ] || die "could not read the pinned anisette revision from anisette/Containerfile"
+anisette_image="localhost/pear-passwords-anisette:$anisette_rev"
+# A unit pointing at a tag nobody builds would fail at start with a bare "image not known".
+grep -qF "$anisette_image" "$here/systemd/pear-passwords-anisette.service" \
+  || die "systemd/pear-passwords-anisette.service does not run $anisette_image"
+if [ "$(podman image inspect --format '{{index .Labels "org.opencontainers.image.revision"}}' \
+        "$anisette_image" 2>/dev/null)" = "$anisette_rev" ]; then
+  say "Already built at ${anisette_rev:0:12}, reusing it"
+else
+  "$here/anisette/build.sh" "$anisette_rev"
+fi
+
 say "Installing the sign-in helper and the 2-hourly sync"
 install -m 644 "$here/systemd/pear-passwords-anisette.service" \
                "$here/systemd/pear-passwords-sync.service" \

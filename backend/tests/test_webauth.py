@@ -395,5 +395,66 @@ class OneCommandInstallTest(unittest.TestCase):
                          "the installer's output reaches the gate unstripped")
 
 
+class AnisetteProvenanceTest(unittest.TestCase):
+    """The reviewer could not authenticate what source produced the published anisette image
+    or where its Apple libraries come from. The image is now built here from one pinned
+    upstream commit, and the chain is written down."""
+
+    ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+
+    def _read(self, *parts):
+        with open(os.path.join(self.ROOT, *parts)) as fh:
+            return fh.read()
+
+    def test_the_revision_is_a_full_sha_and_appears_once(self):
+        """An abbreviated SHA is not a pin, and a second copy of it is a thing that drifts."""
+        body = self._read("anisette", "Containerfile")
+        found = re.search(r"^ARG ANISETTE_REV=([0-9a-f]{40})$", body, re.M)
+        self.assertIsNotNone(found, "the pinned revision is gone or is not a full 40-char SHA")
+        rev = found.group(1)
+        # the unit must run exactly what the Containerfile pins
+        unit = self._read("systemd", "pear-passwords-anisette.service")
+        self.assertIn(f"localhost/pear-passwords-anisette:{rev}", unit,
+                      "the service runs an image the Containerfile does not build")
+        # build.sh must not carry its own copy of the revision
+        self.assertNotIn(rev, self._read("anisette", "build.sh"),
+                         "build.sh hardcodes the revision instead of reading the Containerfile")
+
+    def test_the_published_image_is_no_longer_run(self):
+        """It is still named in a comment, explaining why it is not used - which is fine. What
+        matters is that no line the unit executes mentions it."""
+        unit = self._read("systemd", "pear-passwords-anisette.service")
+        for n, line in enumerate(unit.split("\n"), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            self.assertNotIn("docker.io/dadoum", line,
+                             f"line {n} still runs the unattested Docker Hub image: {line.strip()}")
+
+    def test_build_refuses_a_revision_that_is_not_a_full_sha(self):
+        self.assertIn("[0-9a-f]{40}", self._read("anisette", "build.sh"),
+                      "build.sh no longer validates the revision it is given")
+
+    def test_the_provenance_document_states_the_apple_library_source(self):
+        doc = self._read("docs", "anisette-provenance.md")
+        for needed in ("apps.mzstatic.com", "libCoreADI.so", "libstoreservicescore.so"):
+            self.assertIn(needed, doc, f"the provenance doc no longer mentions {needed}")
+        # and must not oversell: the APK is not pinned
+        self.assertRegex(doc, r"(?i)not .{0,24}pinned|no digest",
+                         "the doc does not say the Apple APK is unpinned")
+
+    def test_the_installer_builds_before_enabling_the_unit(self):
+        body = self._read("install.sh")
+        self.assertLess(body.index("anisette/build.sh"),
+                        body.index("enable --now pear-passwords-anisette.service"),
+                        "the unit is enabled before the image it runs exists")
+
+    def test_build_output_is_not_shown_as_an_error(self):
+        """podman writes build progress to stderr; the gate used to paint all of it red."""
+        qml = self._read("app", "shell.qml")
+        self.assertIn("root.setupTail", qml, "stderr is no longer buffered")
+        self.assertNotRegex(qml, r"onRead: function \(line\) \{ if \(line\.trim\(\)\) root\.setupError",
+                            "a single stderr line still becomes an error")
+
+
 if __name__ == "__main__":
     unittest.main()

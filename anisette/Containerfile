@@ -1,0 +1,90 @@
+# Pear Passwords: anisette server built from pinned upstream source.
+#
+# Why this file exists: the published docker.io/dadoum/anisette-v3-server image
+# carries no OCI provenance labels and ships the server as a binary copied in
+# from a build that happened elsewhere, so nothing in it ties the running code
+# to a source revision. This Containerfile builds the server here, from one
+# named upstream commit, and labels the result with that commit.
+#
+# Apple's libCoreADI.so / libstoreservicescore.so are NOT in this image. The
+# server downloads them on first start. See docs/anisette-provenance.md.
+
+# debian:stable-20250520-slim, linux/amd64
+ARG DEBIAN_BUILDER=docker.io/library/debian:stable-20250520-slim@sha256:bd002736c5671297bbc7b056bd693c9b214c47191a70505b1ae5ccc722572cc5
+# debian:stable-slim, linux/amd64, resolved 2026-10-07
+ARG DEBIAN_RUNTIME=docker.io/library/debian:stable-slim@sha256:d405c1e1d9eecbf30022d23766a0eea235e7f499aa33e357dfd29271a839f82a
+
+# Upstream revision to build. Full 40-character commit SHA only: a tag or a
+# branch name would reintroduce exactly the gap this file closes.
+ARG ANISETTE_REV=684895737aaf1a1c4586fcd5b67509ffd500a36c
+ARG ANISETTE_REPO=https://github.com/Dadoum/anisette-v3-server.git
+
+FROM ${DEBIAN_BUILDER} AS builder
+ARG ANISETTE_REV
+ARG ANISETTE_REPO
+
+RUN apt-get update \
+ && apt-get install --no-install-recommends -y \
+      ca-certificates ldc git clang dub libz-dev libssl-dev libplist-dev libplist-2.0-4 \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/
+
+# Fetch exactly the pinned commit and refuse to build anything else. The
+# length check rejects an abbreviated SHA; the rev-parse check rejects a
+# repository that resolved the argument to something other than that commit.
+RUN test "${#ANISETTE_REV}" -eq 40 \
+ && git init -q . \
+ && git remote add origin "${ANISETTE_REPO}" \
+ && git fetch -q --depth 1 origin "${ANISETTE_REV}" \
+ && git -c advice.detachedHead=false checkout -q FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "${ANISETTE_REV}" \
+ && echo "building anisette-v3-server at ${ANISETTE_REV}"
+
+# Dependency versions come from the checked-in dub.selections.json, which pins
+# registry packages to exact versions and the Dadoum git dependencies
+# (provision, plist, plist-d, dynamic-loader) to exact commits.
+RUN DC=ldc2 dub build -c "static" --build-mode allAtOnce -b release --compiler=ldc2 \
+ && test -x /opt/anisette-v3-server
+
+FROM ${DEBIAN_RUNTIME}
+ARG ANISETTE_REV
+ARG DEBIAN_RUNTIME
+
+# ca-certificates is what makes the first-start download from apps.mzstatic.com
+# a TLS-verified fetch rather than an unauthenticated one. curl is upstream's.
+RUN apt-get update \
+ && apt-get install --no-install-recommends -y \
+      ca-certificates curl libplist-dev libplist-2.0-4 \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/
+COPY --from=builder /opt/anisette-v3-server /opt/anisette-v3-server
+
+RUN mkdir -p /opt/anisette-v3/provisioning
+
+# Same user and same paths as the upstream image, so an existing icp-anisette
+# volume keeps working and the machine identity in adi.pb is not re-minted.
+RUN useradd -ms /bin/bash Alcoholic \
+ && mkdir /home/Alcoholic/.config/anisette-v3/lib/ -p \
+ && chown -R Alcoholic /home/Alcoholic/ \
+ && chmod -R +wx /home/Alcoholic/ \
+ && chown -R Alcoholic /opt/ \
+ && chmod -R +wx /opt/
+
+# NOASSERTION is deliberate: as of the pinned revision the upstream repository
+# carries no LICENSE file and GitHub reports no license for it, so there is
+# nothing to cite. Claiming a license here would be an invention.
+LABEL org.opencontainers.image.title="anisette-v3-server (Pear Passwords build)" \
+      org.opencontainers.image.description="Anisette server for Apple sign-in, built from pinned upstream source for the Pear Passwords Omarchy plugin. Apple's libCoreADI.so and libstoreservicescore.so are downloaded at first start, not baked in." \
+      org.opencontainers.image.source="https://github.com/Dadoum/anisette-v3-server" \
+      org.opencontainers.image.revision="${ANISETTE_REV}" \
+      org.opencontainers.image.licenses="NOASSERTION" \
+      org.opencontainers.image.base.name="${DEBIAN_RUNTIME}" \
+      org.opencontainers.image.documentation="https://github.com/dragosol/omarchy-pear-passwords/blob/main/docs/anisette-provenance.md"
+
+USER Alcoholic
+EXPOSE 6969
+ENTRYPOINT [ "/opt/anisette-v3-server" ]

@@ -14,6 +14,10 @@ rm -f "$HOME/.config/systemd/user/pear-passwords-anisette.service" \
 systemctl --user daemon-reload
 rm -f "$HOME/.local/share/applications/pear-passwords.desktop"
 rm -rf "$data"
+# The locally built anisette image is a build artefact of install.sh, not data: anisette/build.sh
+# makes it again. The icp-anisette volume holding the device identity is left alone unless --purge.
+podman image rm -f $(podman images --filter reference='localhost/pear-passwords-anisette' \
+                       --format '{{.ID}}' 2>/dev/null) >/dev/null 2>&1 || true
 echo "Pear Passwords removed."
 
 if [ "${1:-}" = "--purge" ]; then
