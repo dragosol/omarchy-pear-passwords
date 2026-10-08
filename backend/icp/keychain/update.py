@@ -213,10 +213,11 @@ def edit_details(meta_plist: dict, *, notes=_KEEP, sites=_KEEP, totp=_KEEP,
     stamp = _apple_date(now if now is not None else time.time())
     if notes_body is not _KEEP or tags is not _KEEP:
         text = stored_notes(inner, strict=tags is not _KEEP)
-        if notes_body is not _KEEP:
-            text = tagline.replace_body(text, (notes_body or "").strip("\n"))
+        # Tags first: a "Tags:" line typed at the end of the body then joins them, as on create.
         if tags is not _KEEP:
             text = tagline.replace_tags(text, list(tags or ()))
+        if notes_body is not _KEEP:
+            text = tagline.replace_body(text, (notes_body or "").strip("\n"))
         if text:
             inner["notes"] = text.encode("utf-8")
         else:

@@ -217,10 +217,10 @@ def push_details(zone: Zone, domain: str, username: str, *, notes=up._KEEP, site
     else:
         rec, ck, plist = targets[AGRP_PASSWORD]
         text = "" if notes is up._KEEP else notes
-        if notes_body is not up._KEEP:
-            text = (notes_body or "").strip("\n")
         if tags is not up._KEEP:
             text = tagline.replace_tags(text, list(tags or ()))
+        if notes_body is not up._KEEP:
+            text = tagline.replace_body(text, (notes_body or "").strip("\n"))
         edited = up.new_metadata_plist(
             domain, username, ptcl=str(plist.get("ptcl") or "htps"), notes=text,
             sites=() if sites is up._KEEP else sites,

@@ -4,7 +4,7 @@ import os
 import pytest
 
 from icp.cli import push
-from icp.keychain import metadata as md, update as up
+from icp.keychain import metadata as md, tagline, update as up
 from icp.transport import ckks
 from icp.transport.ckks import CloudKitRecord
 
@@ -277,6 +277,22 @@ def test_tags_on_an_entry_without_a_details_record(monkeypatch):
     (_, created, plist), = z.saved
     assert created and _notes_of(plist) == b"body\n\nTags: #x"
     assert expect["notes"] == "body\n\nTags: #x"
+
+
+@pytest.mark.parametrize("stored", [b"old body\n\nTags: #keep", b"old body", None])
+def test_a_tag_line_typed_last_in_a_body_edit_joins_the_tags(monkeypatch, stored):
+    # The same rule with or without tags already, with or without a details record, and with
+    # tags sent in the same edit: the typed line joins them, as on create, never dropped.
+    recs = [("PW", up.new_password_plist("s.example", "u", "pw"))]
+    if stored is not None:
+        recs.append(("META", _meta_notes("s.example", "u", stored)))
+    keep = ["keep"] if stored and b"#keep" in stored else []
+    z = _zone(monkeypatch, recs)
+    push.push_details(z, "s.example", "u", notes_body="new\nTags: #typed")
+    assert tagline.split(_notes_of(z.saved[-1][2]).decode()) == ("new", keep + ["typed"])
+    z = _zone(monkeypatch, recs)
+    push.push_details(z, "s.example", "u", notes_body="new\nTags: #typed", tags=["sent"])
+    assert tagline.split(_notes_of(z.saved[-1][2]).decode()) == ("new", ["sent", "typed"])
 
 
 def test_whole_notes_and_a_splice_are_not_mixed():

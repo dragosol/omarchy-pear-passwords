@@ -124,6 +124,37 @@ class ComposeTests(unittest.TestCase):
         out = tl.replace_body("x\nTags: #a", "y\n")
         self.assertEqual(tl.split(out), ("y\n", ["a"]))
 
+    def test_removing_every_tag_never_promotes_a_body_line(self):
+        # The body's own last line reads as a tag line: it stays body text (a secret), not
+        # tier-1 list metadata, and the user who removed every tag sees none.
+        raw = "door code below\nTags: #a1b2\n\nTags: #work"
+        self.assertEqual(tl.split(raw), ("door code below\nTags: #a1b2", ["work"]))
+        out = tl.replace_tags(raw, [])
+        self.assertEqual(out, "door code below\nTags: #a1b2\n")
+        self.assertEqual(tl.split(out), (out, []))
+        out = tl.replace_tags("x\r\nTags: #a\r\n\r\nTags: #b", [])
+        self.assertEqual(out, "x\r\nTags: #a\r\n")
+        self.assertEqual(tl.split(out)[1], [])
+        # Adding a tag again composes after it, and the body line still stays body text.
+        self.assertEqual(tl.split(tl.replace_tags(out, ["c"])), (out, ["c"]))
+
+    def test_a_typed_last_tag_line_in_a_body_edit_joins_the_tags_either_way(self):
+        # One rule, with or without tags already: the typed line joins the tag line, as create
+        # and an Apple device treat it.
+        for raw in ("notes\n\nTags: #a", "notes"):
+            out = tl.replace_body(raw, "x\nTags: #b")
+            self.assertEqual(tl.split(out), ("x", ["a", "b"] if "#a" in raw else ["b"]), raw)
+        self.assertEqual(tl.replace_body("notes\n\nTags: #a", "x\nTags: #A #b"),
+                         "x\n\nTags: #a #b")
+        self.assertEqual(tl.replace_body("Tags: #a", "Tags: #b"), "Tags: #a #b")
+        # A typed line that is not last stays body text.
+        out = tl.replace_body("n\n\nTags: #a", "x\nTags: #c\n\nTags: #b")
+        self.assertEqual(tl.split(out), ("x\nTags: #c", ["a", "b"]))
+        # Past 16 together it would not be a tag line: body text, the old line kept.
+        full = "n\n\nTags: " + " ".join(f"#t{i}" for i in range(16))
+        out = tl.replace_body(full, "x\nTags: #more")
+        self.assertEqual(tl.split(out), ("x\nTags: #more", tl.split(full)[1]))
+
     def test_fixtures_round_trip(self):
         for raw in FIXTURES:
             body, tags = tl.split(raw)
@@ -167,17 +198,31 @@ class PropertyTests(unittest.TestCase):
             self.assertTrue(after.startswith(prefix), (b, t))
             if t:
                 self.assertEqual(tl.split(after), (prefix, t), (b, t))
-            # Removing all tags gives exactly the original body.
-            self.assertEqual(tl.replace_tags(b, []), prefix, b)
+            # Removing all tags gives exactly the original body, and never a tag: a body whose
+            # own last line reads as a tag line keeps one line break after it.
+            gone = tl.replace_tags(b, [])
+            self.assertEqual(tl.split(gone), (gone, []), b)
+            if tl.split(prefix)[1]:
+                self.assertIn(gone, (prefix + "\n", prefix + "\r\n"), b)
+            else:
+                self.assertEqual(gone, prefix, b)
             if not cur:
                 # Adding tags, then removing them, restores the raw notes byte for byte.
                 self.assertEqual(tl.replace_tags(tl.replace_tags(b, t), []), b, (b, t))
             elif b[b.rfind("\n") + 1:] == tl.line(cur):
                 self.assertEqual(tl.replace_tags(b, cur), b, b)
-            # A body edit keeps the tag line and reads back exactly.
+            # A body edit keeps the tag line and reads back exactly. A tag line typed last in
+            # the new body joins the tags whether or not there were any, unless the two together
+            # would pass 16 (then it is body text, as such a line is anywhere).
             nb = self.body(rnd)
-            if cur:
-                self.assertEqual(tl.split(tl.replace_body(b, nb)), (nb, cur), (b, nb))
+            out = tl.replace_body(b, nb)
+            nbody, typed = tl.split(nb)
+            if not cur:
+                want = (nbody, typed)
+            else:
+                merged = cur + [x for x in typed if tl.fold(x) not in {tl.fold(c) for c in cur}]
+                want = (nbody, merged) if len(merged) <= tl.MAX_TAGS else (nb, cur)
+            self.assertEqual(tl.split(out), want, (b, nb))
 
     def test_canon_is_idempotent(self):
         for t in self.TAGS + ["İstanbul", "ǅemal", "Ångström", "ﬁx"]:

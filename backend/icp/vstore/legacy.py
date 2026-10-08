@@ -296,10 +296,10 @@ def merge_duplicate(kept: tuple[Meta, Secrets], dropped: tuple[Meta, Secrets]
             merged.append(t)
     # Splice into the kept item's own notes, so what nothing changed stays byte for byte.
     raw = ks.notes or ""
-    if notes != tagline.split(raw)[0]:
-        raw = tagline.replace_body(raw, notes)
     if merged != tags:
         raw = tagline.replace_tags(raw, merged)
+    if notes != tagline.split(raw)[0]:
+        raw = tagline.replace_body(raw, notes)
     notes = raw
     ks2 = Secrets(password=ks.password, notes=notes, totp_secret=seed, apple_history=hist,
                   totp_params=params)

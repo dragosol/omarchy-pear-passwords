@@ -154,28 +154,59 @@ def compose(body: str, tags) -> str:
     return body + sep + sep + line(tags)
 
 
+def _hold_open(body: str) -> str:
+    """`body`, kept from becoming notes whose final line is a tag line: a body that ends in one
+    gets one line break after it, so that line stays body text."""
+    if not _parts(body):
+        return body
+    return body + ("\r\n" if _sep(body) == "\r\n" else "\n")
+
+
 def replace_tags(raw: str, tags) -> str:
     """`raw` with its tags set to canonical `tags`. An existing line is replaced on its own,
     keeping the separator before it byte for byte; no tags removes it with that separator.
-    Without a line, compose(raw, tags)."""
+    Without a line, compose(raw, tags).
+
+    Removing every tag never promotes a line of the body: when the body's own last line reads
+    as a tag line, one line break stays after it, so it remains body text (and a secret)."""
     raw = raw or ""
     p = _parts(raw)
     if p is None:
         return compose(raw, tags)
     body, sep, _, _ = p
     if not tags:
-        return body
+        return _hold_open(body)
     return body + sep + line(tags)
+
+
+def _merge(tags, typed) -> list[str] | None:
+    """`tags` then the `typed` ones not already there, or None past MAX_TAGS."""
+    out, seen = list(tags), {fold(t) for t in tags}
+    for t in typed:
+        if fold(t) not in seen:
+            seen.add(fold(t))
+            out.append(t)
+    return out if len(out) <= MAX_TAGS else None
 
 
 def replace_body(raw: str, body: str) -> str:
     """`raw` with its body replaced and its tag line (bytes and separator) kept: a body edit
-    can never drop the tags."""
+    can never drop the tags.
+
+    A new body whose own last line is a tag line is treated the same whether or not `raw` has
+    tags, as create and an Apple device treat it: that line joins the tag line. When the two
+    together would make more than MAX_TAGS tags, the result would not be a tag line either,
+    so the typed line stays body text."""
     raw = raw or ""
     p = _parts(raw)
     if p is None:
         return body
     _, sep, cand, tags = p
+    typed = _parts(body) if body else None
+    if typed is not None:
+        merged = _merge(tags, typed[3])
+        if merged is not None:
+            body, cand, tags = typed[0], line(merged), merged
     if not body:
         return cand
     out = body + sep + cand
