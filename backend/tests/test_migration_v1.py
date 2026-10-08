@@ -336,6 +336,56 @@ class DuplicateItemTests(unittest.TestCase):
         self.assertEqual(legacy.digest(again), legacy.digest(canon))
 
 
+class ImportTagTests(StoreCase):
+    """A 1.x vault's notes keep their tag line in the box, and its tags reach meta."""
+
+    def test_tags_come_through_the_import_and_verify(self):
+        key = os.urandom(32)
+        creds = [{"domain": "a.test", "username": "u", "password": "p1", "mdat": 1,
+                  "notes": "recovery codes\n\nTags: #Work #bank"},
+                 {"domain": "b.test", "username": "u", "password": "p2", "mdat": 1,
+                  "notes": "Tags: #x"}]
+        files = {"vault.enc": nacl.secret.SecretBox(key).encrypt(
+            json.dumps({"credentials": creds}).encode())}
+        s = vstore.UserStore.create(UID)
+        res = s.import_v1(files, key)           # read back, counted and digest-checked
+        self.assertEqual(res["counts"]["credentials"], 2)
+        got = {m.domain: (m.tags, m.has_notes) for m in s.list_meta()}
+        self.assertEqual(got, {"a.test": (["work", "bank"], True), "b.test": (["x"], False)})
+        a = ids.entry_id("a.test", "u")
+        self.assertEqual(s.open_entry(a).notes, "recovery codes\n\nTags: #Work #bank")
+        # And the first sync of the same keychain changes nothing.
+        from icp.octagon import items as oct_items
+        from icp.vault.host import Credential
+        sync = oct_items.to_sync_items([Credential(**c) for c in creds])
+        self.assertEqual(s.apply_sync(sync, set())["unchanged"], 2)
+
+
+class DuplicateTagTests(unittest.TestCase):
+    def test_tag_lines_of_duplicates_merge_into_one_last_line(self):
+        older = {"domain": "e.test", "username": "a", "password": "OLD", "mdat": 100,
+                 "notes": "old body\n\nTags: #old #shared"}
+        newer = {"domain": "e.test", "username": "a", "password": "NEW", "mdat": 200,
+                 "notes": "new body\n\nTags: #Shared #new"}
+        canon = legacy.to_canonical(legacy.V1Vault(credentials=[older, newer]))
+        (_, e), = canon["entries"].items()
+        self.assertEqual(e["secrets"]["notes"],
+                         "new body\n\nold body\n\nTags: #shared #new #old")
+        self.assertEqual(e["meta"]["tags"], ["shared", "new", "old"])
+        again = legacy.to_canonical(legacy.V1Vault(credentials=[newer, older]))
+        self.assertEqual(legacy.digest(again), legacy.digest(canon))
+
+    def test_a_duplicate_that_adds_nothing_keeps_the_raw_notes(self):
+        raw = "body\nTags:\t#Work"          # not canonical: must survive byte for byte
+        older = {"domain": "e.test", "username": "a", "password": "OLD", "mdat": 100,
+                 "notes": "body"}
+        newer = {"domain": "e.test", "username": "a", "password": "NEW", "mdat": 200,
+                 "notes": raw}
+        canon = legacy.to_canonical(legacy.V1Vault(credentials=[older, newer]))
+        (_, e), = canon["entries"].items()
+        self.assertEqual(e["secrets"]["notes"], raw)
+
+
 class LegacySourceTests(StoreCase):
     def test_legacy_reader_never_touches_the_filesystem(self):
         src = (BACKEND / "icp" / "vstore" / "legacy.py").read_text()

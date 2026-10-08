@@ -72,6 +72,8 @@ class PolicyReadmeSyncTests(unittest.TestCase):
             "clip-history-check": (paths.ACTION_MANAGE, "clipboard history"),
             "autofill-enable": (paths.ACTION_MANAGE, "turning browser autofill on"),
             "tpm-move": (paths.ACTION_MANAGE, "moving your keys onto the security chip"),
+            "features": (paths.ACTION_MANAGE, "turning on a category that waits for a check"),
+            "diag-items": (paths.ACTION_MANAGE, "reading the keychain diagnostic"),
             "autofill-fill": (paths.ACTION_AUTOFILL, "Every browser fill"),
         }
         self.assertEqual(set(when), set(protocol.PROMPT_ACTION))

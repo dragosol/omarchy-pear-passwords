@@ -69,6 +69,12 @@ class Meta:
     syncs for the same keychain item. `domain` is the primary site host, `sites` the extra
     sites Apple stores on the entry (s_as). `aliases` are inferred from metadata stubs and are
     for display only: autofill never matches on them. `mdat` is unix seconds, 0 if unknown.
+
+    `tags` come from the final "Tags: #a #b" line of the notes (keychain/tagline.py): list
+    metadata, not a secret. `has_notes` is about the notes body, without that line. `kind` is
+    "passkey" for a row that is only a passkey (`has_password` false), `has_passkey` marks a
+    login that also has one, and `recently_deleted` an item in Apple's Recently Deleted (an
+    access group ending in -recently-deleted): read-only, and never a live entry.
     """
 
     id: str
@@ -83,6 +89,11 @@ class Meta:
     history_count: int
     apple_title: str = ""
     aliases: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    has_passkey: bool = False
+    kind: str = "login"
+    has_password: bool = True
+    recently_deleted: bool = False
 
 
 @dataclass
@@ -705,7 +716,9 @@ class UserStore:
         for it in items:
             fields = _meta.fields_from(it.meta)
             fields["has_totp"] = bool(it.secrets.totp_secret)
-            fields["has_notes"] = bool(it.secrets.notes)
+            # The tag line is read from the plaintext this sync already holds (no SK); the box
+            # keeps the whole raw notes, so the smac and byte fidelity are unchanged.
+            fields.update(_meta.notes_fields(it.secrets.notes))
             rec = entries.get(it.id)
             if rec is None or rec.get("deleted"):
                 if rec is None:
@@ -986,7 +999,7 @@ class UserStore:
         v = int(rec.get("v") or 0) + 1
         files.write(id, _entries.seal(self._pk, _entries.to_payload(id, v, s)))
         rec.update({"v": v, "pwmac": pwm, "smac": sm, "apple_n": len(s.apple_history or []),
-                    "has_totp": bool(s.totp_secret), "has_notes": bool(s.notes)})
+                    "has_totp": bool(s.totp_secret), **_meta.notes_fields(s.notes)})
         return True
 
 

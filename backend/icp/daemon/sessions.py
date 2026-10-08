@@ -128,6 +128,11 @@ class Session:
         self.signin = None                 # the live SocketFrontend
         self.migrating = False             # migrate-begin made a store, import not committed
         self.autofill_enabled = False      # turned on in the window, behind .manage (persisted)
+        self.features: dict = dict(protocol.DEFAULT_FEATURES)   # behind .manage (persisted)
+        # The last full sync's (class, agrp) counts and attribute names, no value; for op
+        # diag-items, and dropped on every lock.
+        self.item_shape: dict | None = None
+        self.copy_texts: deque = deque()  # when each copy-text ticket was issued (clock)
         self.autofill_key: bytes | None = None   # keys autofill handles; only while unlocked
         self.last_ui_request = 0.0
         self.next_sync_at: float | None = None
@@ -164,6 +169,12 @@ def validate_settings(d: dict) -> dict:
         if key in d and setting_ok(key, d[key]):
             out[key] = d[key]
     return out
+
+
+def validate_features(d) -> dict:
+    """The feature flags from state.json: known keys, booleans, the rest off."""
+    d = d if isinstance(d, dict) else {}
+    return {k: d.get(k) is True for k in protocol.FEATURES}
 
 
 def setting_ok(key: str, value) -> bool:
@@ -385,6 +396,7 @@ class Registry:
                 d = {}
             s.settings = validate_settings(d or {})
             s.autofill_enabled = (d or {}).get("autofill_enabled") is True
+            s.features = validate_features((d or {}).get("features"))
             oc = (d or {}).get("old_copy")
             s.old_copy = oc if isinstance(oc, dict) else None
         return s
@@ -437,6 +449,7 @@ class Registry:
         s.tier1 = None
         s.show_all = False
         s.autofill_key = None                       # every handle handed out is void
+        s.item_shape = None
         s.epoch += 1
         s.next_sync_at = None
         self._drop_grant(uid, event=False)

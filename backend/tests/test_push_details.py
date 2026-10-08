@@ -162,3 +162,130 @@ def test_refetch_reads_one_zone_and_decrypts_with_the_held_keys(monkeypatch, zon
     c = push.find(store, "has-meta.example", "alex")
     assert c.password == "pw1" and c.notes == "n"
     assert push.find(store, "has-meta.example", "nobody") is None
+
+
+# --- tags and the notes body (features spec 5b.5) and Recently Deleted copies (4.3) ----------
+
+import plistlib  # noqa: E402
+
+RD = "-recently-deleted"
+
+
+def _meta_notes(site, acct, raw, agrp=up.AGRP_METADATA):
+    """A details record whose notes are exactly `raw` (bytes), as an Apple device left them."""
+    p = up.new_metadata_plist(site, acct)
+    inner = plistlib.loads(p["v_Data"])
+    if raw is None:
+        inner.pop("notes", None)
+    else:
+        inner["notes"] = raw
+    p["v_Data"] = plistlib.dumps(inner, fmt=plistlib.FMT_BINARY)
+    p["agrp"] = agrp
+    return p
+
+
+def _zone(monkeypatch, items):
+    saved = []
+    monkeypatch.setattr(push, "_save", lambda c, rec, fields, create=False, zone="Passwords":
+                        saved.append((rec.record_name, create, up.decrypt_item_record(
+                            CloudKitRecord(rec.record_name, "item", fields), CK))))
+    z = push.Zone(FakeClient(), {"item": [_rec(n, p) for n, p in items]}, {PARENT: CK})
+    z.saved = saved
+    return z
+
+
+def _notes_of(plist):
+    return plistlib.loads(plist["v_Data"]).get("notes")
+
+
+def test_pair_ignores_recently_deleted_copies(monkeypatch):
+    z = _zone(monkeypatch, [
+        ("RD-PW", {**up.new_password_plist("s.example", "u", "old"),
+                   "agrp": up.AGRP_PASSWORD + RD}),
+        ("RD-META", _meta_notes("s.example", "u", b"deleted", up.AGRP_METADATA + RD)),
+        ("PW", up.new_password_plist("s.example", "u", "live")),
+        ("META", _meta_notes("s.example", "u", b"live")),
+    ])
+    assert {a: r.record_name for a, (r, _, _) in
+            push._pair(z.records, z.class_keys, "s.example", "u").items()} == \
+        {up.AGRP_PASSWORD: "PW", up.AGRP_METADATA: "META"}
+    push.push_details(z, "s.example", "u", tags=["x"])
+    push.push_password(z, "s.example", "u", "new")
+    assert [n for n, _, _ in z.saved] == ["META", "PW", "META"]
+
+
+def test_a_tag_edit_splices_the_fetched_notes_byte_for_byte(monkeypatch):
+    raw = "Recovery:\r\nabcd efgh\r\n\r\ntags:\t#Old  ".encode()
+    z = _zone(monkeypatch, [("PW", up.new_password_plist("s.example", "u", "pw")),
+                            ("META", _meta_notes("s.example", "u", raw))])
+    expect = {}
+    push.push_details(z, "s.example", "u", tags=["old", "new"], expect=expect)
+    (_, _, plist), = z.saved
+    written = _notes_of(plist)
+    assert written == b"Recovery:\r\nabcd\xc2\xa0efgh\r\n\r\nTags: #old #new"
+    assert expect["notes"] == written.decode()
+    # Everything but the notes bytes and mdat is what was there.
+    before = up.decrypt_item_record(z.records["item"][1], CK)
+    assert set(up.diff_plists(before, plist)) == {"mdat", "v_Data"}
+    inner_before, inner_after = (plistlib.loads(p["v_Data"]) for p in (before, plist))
+    assert {k: v for k, v in inner_before.items() if k != "notes"} == \
+        {k: v for k, v in inner_after.items() if k != "notes"}
+
+
+def test_removing_every_tag_restores_the_body_exactly(monkeypatch):
+    raw = b"\n  keep my leading newline and spaces  \nTags: #a"
+    z = _zone(monkeypatch, [("PW", up.new_password_plist("s.example", "u", "pw")),
+                            ("META", _meta_notes("s.example", "u", raw))])
+    push.push_details(z, "s.example", "u", tags=[])
+    assert _notes_of(z.saved[0][2]) == b"\n  keep my leading newline and spaces  "
+
+
+def test_a_body_edit_keeps_the_tag_line(monkeypatch):
+    z = _zone(monkeypatch, [("PW", up.new_password_plist("s.example", "u", "pw")),
+                            ("META", _meta_notes("s.example", "u", b"old body\nTAGS: #Keep"))])
+    expect = {}
+    push.push_details(z, "s.example", "u", notes_body="\nnew body\n", expect=expect)
+    assert _notes_of(z.saved[0][2]) == b"new body\nTAGS: #Keep"
+    assert expect["notes"] == "new body\nTAGS: #Keep"
+
+
+def test_tags_on_notes_that_are_not_utf8_are_refused_before_anything_is_written(monkeypatch):
+    raw = b"\xff\xfe not utf-8\n\nTags: #a"
+    z = _zone(monkeypatch, [("PW", up.new_password_plist("s.example", "u", "pw")),
+                            ("META", _meta_notes("s.example", "u", raw))])
+    assert push.notes_editable(z, "s.example", "u") is False
+    with pytest.raises(up.NotesNotUtf8):
+        push.push_details(z, "s.example", "u", tags=["b"])
+    assert z.saved == []
+    # A body edit replaces those bytes with what the person typed (the tag line, valid
+    # UTF-8, stays); that is allowed.
+    push.push_details(z, "s.example", "u", notes_body="fixed")
+    assert _notes_of(z.saved[0][2]) == b"fixed\n\nTags: #a"
+
+
+def test_notes_editable_for_entries_without_details_or_notes(monkeypatch):
+    z = _zone(monkeypatch, [("PW", up.new_password_plist("s.example", "u", "pw")),
+                            ("META", _meta_notes("s.example", "u", None)),
+                            ("B-PW", up.new_password_plist("b.example", "u", "pw"))])
+    assert push.notes_editable(z, "s.example", "u") and push.notes_editable(z, "b.example", "u")
+
+
+def test_tags_on_an_entry_without_a_details_record(monkeypatch):
+    z = _zone(monkeypatch, [("PW", up.new_password_plist("b.example", "u", "pw"))])
+    expect = {}
+    push.push_details(z, "b.example", "u", notes_body="body", tags=["x"], expect=expect)
+    (_, created, plist), = z.saved
+    assert created and _notes_of(plist) == b"body\n\nTags: #x"
+    assert expect["notes"] == "body\n\nTags: #x"
+
+
+def test_whole_notes_and_a_splice_are_not_mixed():
+    with pytest.raises(up.ItemUpdateError):
+        up.edit_details(up.new_metadata_plist("s.example", "u"), notes="x", tags=["a"])
+
+
+def test_details_landed_compares_the_written_notes_exactly():
+    from icp.vault.host import Credential
+    c = Credential("s.example", "u", "pw", notes="\nlead\n\nTags: #a")
+    assert push.details_landed(c, "s.example", notes_raw="\nlead\n\nTags: #a")
+    assert not push.details_landed(c, "s.example", notes_raw="lead\n\nTags: #a")

@@ -45,7 +45,9 @@ class HelloAndUnlockTests(Base):
     async def test_unlock_then_sync_event_after_the_reply(self):
         r = await self.ui.call("unlock")
         self.assertEqual([e["id"] for e in r["entries"]], ["e.0", "e.1"])
-        self.assertEqual(set(r), {"rid", "entries", "synced_at", "needs_login", "tpm_move"})
+        self.assertEqual(set(r), {"rid", "entries", "synced_at", "needs_login", "tpm_move",
+                                  "features"})
+        self.assertEqual(r["features"], {"passkeys": False, "apple_deleted": False})
         e = r["entries"][0]
         for key in ("password", "notes", "totp_secret", "pwmac"):
             self.assertNotIn(key, e)
@@ -565,6 +567,324 @@ class EditTests(Base):
         self.assertEqual((await self.ui.call("settings"))["error"], "bad-request")
         r = await self.ui.call("grant", id="e.0")
         self.assertEqual(r["grant_s"], 60)
+
+
+class NotesBodyTests(Base):
+    """Notes travel as the body; the tag line is list metadata (features spec 4.2, 5b.6)."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.st.secrets["e.0"] = secrets(password="pw-0-fake",
+                                         notes="the body\n\nTags: #work",
+                                         seed=b"12345678901234567890")
+        self.st.metas["e.0"].tags = ["work"]
+        self.st.secrets["e.1"] = secrets(password="pw-1-fake", notes="Tags: #only")
+        self.st.metas["e.1"].tags = ["only"]
+        self.st.metas["e.1"].has_notes = False
+        r = await self.h.unlock(self.ui)
+        self.entries = {e["id"]: e for e in r["entries"]}
+        await self.ui.event("synced")
+
+    async def clip_value(self, ticket):
+        p = self.h.peer(ppid=self.peer.pid)
+        c, _ = await self.h.hello("clip", peer=p, ticket=ticket)
+        return await c.call("redeem")
+
+    async def test_tags_are_on_the_list_without_a_grant(self):
+        self.assertEqual(self.entries["e.0"]["tags"], ["work"])
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK])
+        self.assertNotIn("the body", str(self.ui.raw))
+
+    async def test_reveal_and_copy_give_the_body_only(self):
+        await self.ui.call("grant", id="e.0")
+        r = await self.ui.call("reveal", id="e.0", field="notes")
+        self.assertEqual(r["value"], "the body")
+        r = await self.ui.call("copy", id="e.0", field="notes")
+        self.assertEqual((await self.clip_value(r["ticket"]))["value"], "the body")
+
+    async def test_grant_fields_follow_the_body_and_has_password(self):
+        r = await self.ui.call("grant", id="e.1")
+        self.assertEqual(r["fields"], ["password"])            # only a tag line: no notes
+        self.st.metas["e.1"].has_password = False
+        r = await self.ui.call("grant", id="e.1")
+        self.assertEqual(r["fields"], [])
+        r = await self.ui.call("grant", id="e.0")
+        self.assertEqual(r["fields"], ["password", "notes", "code", "history"])
+
+    async def test_set_tags_needs_a_grant_and_is_validated(self):
+        r = await self.ui.call("set", id="e.0", fields={"tags": ["a"]})
+        self.assertEqual(r["error"], "no-grant")
+        await self.ui.call("grant", id="e.0")
+        for bad in (["a b"], "work", ["#"], [f"t{i}" for i in range(17)], [5]):
+            r = await self.ui.call("set", id="e.0", fields={"tags": bad})
+            self.assertEqual((r["error"], r["field"]), ("invalid", "tags"), bad)
+        r = await self.ui.call("set", id="e.0", fields={"tags": ["#Home", "home", "Finance"]})
+        self.assertEqual(r, {"rid": self.ui.rid, "id": "e.0", "synced": True})
+        self.assertEqual(self.h.apple.last_fields, {"tags": ["home", "finance"]})
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK, paths.ACTION_REVEAL])
+
+    async def test_set_notes_sends_the_body_for_the_daemon_to_splice(self):
+        await self.ui.call("grant", id="e.0")
+        await self.ui.call("set", id="e.0", fields={"notes": "new body"})
+        # Only the body crosses; apple.push_set keeps the stored tag line (test_apple_ctx.py,
+        # test_push_details.py).
+        self.assertEqual(self.h.apple.last_fields, {"notes": "new body"})
+
+    async def test_read_only_rows_refuse_set(self):
+        for flag in ("recently_deleted", "kind"):
+            meta_ = self.st.metas["e.1"]
+            meta_.recently_deleted, meta_.kind = flag == "recently_deleted", (
+                "passkey" if flag == "kind" else "login")
+            await self.ui.call("grant", id="e.1")
+            r = await self.ui.call("set", id="e.1", fields={"notes": "x"})
+            self.assertEqual((r["error"], r["field"]), ("invalid", "id"), flag)
+            # Refused before the grant is used: it still reveals.
+            self.assertIn("value", await self.ui.call("reveal", id="e.1", field="password"))
+        self.assertNotIn("push_set", str(self.h.apple.calls))
+
+
+class CopyTextTests(Base):
+    """op copy-text (features spec 6): Ctrl+C and Copy in secret fields, through pear-clip."""
+
+    async def asyncSetUp(self):
+        from daemon_fakes import FakeClock
+        self.clock = FakeClock()
+        self.h = await Harness(clock=self.clock).start()
+        self.st = self.h.seed()
+        self.ui, self.peer = await self.h.ui()
+        await self.h.unlock(self.ui)
+
+    async def clip(self, ticket):
+        return await self.h.hello("clip", peer=self.h.peer(ppid=self.peer.pid), ticket=ticket)
+
+    async def test_create_sources_need_no_grant_and_raise_no_dialog(self):
+        for source in sorted(protocol.COPY_TEXT_SOURCES_CREATE):
+            r = await self.ui.call("copy-text", source=source, text="sel-" + source)
+            self.assertEqual(set(r), {"rid", "ticket", "ttl"}, source)
+        c, hello = await self.clip(r["ticket"])
+        self.assertEqual(hello["purpose"], "copy")
+        red = await c.call("redeem")
+        self.assertEqual((red["value"], red["sensitive"]), ("sel-create-totp-setup", True))
+        await c.call("clip-result", outcome="pasted")
+        ev = await self.ui.event("clip")
+        self.assertEqual((ev["id"], ev["field"], ev["outcome"]), (None, "text", "pasted"))
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK])
+        self.assertEqual(self.st.unseal_count, 0)
+
+    async def test_grant_sources_need_a_live_grant_and_never_use_it_up(self):
+        for source in sorted(protocol.COPY_TEXT_SOURCES_GRANT):
+            r = await self.ui.call("copy-text", source=source, id="e.0", text="x")
+            self.assertEqual(r["error"], "no-grant", source)
+        await self.ui.call("settings", set={"grant_s": 0})          # single use
+        await self.ui.call("grant", id="e.0")
+        for source in sorted(protocol.COPY_TEXT_SOURCES_GRANT):
+            r = await self.ui.call("copy-text", source=source, id="e.0", text="x")
+            self.assertIn("ticket", r, source)
+        r = await self.ui.call("copy-text", source="notes-edit", id="e.1", text="x")
+        self.assertEqual(r["error"], "no-grant")                    # another entry's grant
+        # The single-use grant is still there: copy-text read nothing from it.
+        self.assertEqual((await self.ui.call("reveal", id="e.0", field="password"))["value"],
+                         "pw-0-fake")
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK, paths.ACTION_REVEAL])
+
+    async def test_bad_source_id_and_text(self):
+        await self.ui.call("grant", id="e.0")
+        cases = [(dict(source="signin-password", text="x"), "source"),
+                 (dict(source="code", text="x"), "source"),
+                 (dict(source="create-password", id="e.0", text="x"), "id"),
+                 (dict(source="create-notes", text=""), "text"),
+                 (dict(source="create-notes", text="a\x00b"), "text"),
+                 (dict(source="create-notes", text="x" * (protocol.COPY_TEXT_MAX + 1)), "text"),
+                 (dict(source="notes-edit", id="e.0", text="x" * (protocol.COPY_TEXT_MAX + 1)),
+                  "text")]
+        for kw, field in cases:
+            r = await self.ui.call("copy-text", **kw)
+            self.assertEqual((r["error"], r.get("field")), ("invalid", field), kw.get("source"))
+        self.assertIn("ticket", await self.ui.call("copy-text", source="create-notes",
+                                                   text="x" * protocol.COPY_TEXT_MAX))
+        self.assertEqual((await self.ui.call("copy-text", source="create-notes"))["error"],
+                         "bad-request")
+        self.assertEqual((await self.ui.call("copy-text", source="notes-edit", text="x"))["error"],
+                         "bad-request")                              # id missing
+        self.assertEqual(self.h.reg.tickets.pending(UID), 1)
+
+    async def test_the_length_is_counted_after_nfc(self):
+        import unicodedata
+        # 18000 characters as sent (NFD), 9000 after NFC: allowed. (9000 pairs still fit one
+        # 64 KiB request line with the test client's \\u escapes.)
+        nfd = unicodedata.normalize("NFD", "é") * 9000
+        self.assertGreater(len(nfd), protocol.COPY_TEXT_MAX)
+        r = await self.ui.call("copy-text", source="create-notes", text=nfd)
+        c, _ = await self.clip(r["ticket"])
+        self.assertEqual((await c.call("redeem"))["value"], "é" * 9000)
+
+    async def test_ten_a_minute(self):
+        for i in range(protocol.COPY_TEXT_PER_MIN):
+            self.assertIn("ticket", await self.ui.call("copy-text", source="create-password",
+                                                       text=f"t{i}"))
+        r = await self.ui.call("copy-text", source="create-password", text="eleventh")
+        self.assertEqual(r["error"], "rate-limited")
+        self.assertTrue(1 <= r["retry_after"] <= 60)
+        # The dialogs' own limit is untouched: a grant still raises its dialog.
+        self.assertIn("fields", await self.ui.call("grant", id="e.0"))
+        self.clock.advance(60)
+        self.assertIn("ticket", await self.ui.call("copy-text", source="create-password",
+                                                   text="later"))
+
+    async def test_one_offer_at_a_time_and_a_lock_revokes_it(self):
+        r1 = await self.ui.call("copy-text", source="create-password", text="first")
+        c, _ = await self.clip(r1["ticket"])
+        r2 = await self.ui.call("copy-text", source="create-password", text="second")
+        self.assertEqual((await c.event("withdraw"))["event"], "withdraw")
+        self.assertEqual(self.h.reg.tickets.pending(UID), 1)
+        await self.ui.call("lock")
+        self.assertEqual(self.h.reg.tickets.pending(UID), 0)
+        _, hello = await self.clip(r2["ticket"])
+        self.assertEqual(hello["error"], "bad-ticket")
+
+    async def test_needs_tier1(self):
+        await self.ui.call("lock")
+        r = await self.ui.call("copy-text", source="create-password", text="x")
+        self.assertEqual(r["error"], "locked")
+
+    async def test_the_text_is_never_logged(self):
+        with self.assertLogs("icp", level="DEBUG") as logs:
+            import logging
+            logging.getLogger("icp").debug("marker")
+            await self.ui.call("copy-text", source="create-password", text="SECRET-SELECTION")
+        self.assertNotIn("SECRET-SELECTION", "\n".join(logs.output))
+
+
+class FeatureFlagTests(Base):
+    """Passkey-only rows and Recently Deleted copies wait for a .manage-gated flag."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.st.metas["pk"] = meta("pk", title="pk.example", domain="pk.example",
+                                   username="kim", kind="passkey", has_password=False,
+                                   has_passkey=True)
+        self.st.metas["rd"] = meta("rd", title="Site 1", domain="site1.example",
+                                   username="user1", recently_deleted=True)
+        self.st.metas["e.1"].has_passkey = True
+
+    async def ids(self):
+        return {e["id"]: e for e in (await self.ui.call("unlock"))["entries"]}
+
+    async def test_off_by_default_and_hidden(self):
+        r = await self.h.unlock(self.ui)
+        self.assertEqual(r["features"], {"passkeys": False, "apple_deleted": False})
+        by = {e["id"]: e for e in r["entries"]}
+        self.assertEqual(set(by), {"e.0", "e.1"})
+        self.assertFalse(by["e.1"]["has_passkey"])
+        ev = await self.ui.event("synced")
+        self.assertEqual({e["id"] for e in ev["entries"]}, {"e.0", "e.1"})
+
+    async def test_turning_one_on_needs_manage_and_is_remembered(self):
+        await self.h.unlock(self.ui)
+        r = await self.ui.call("features", get=True)
+        self.assertEqual(r["features"], {"passkeys": False, "apple_deleted": False})
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK])
+        r = await self.ui.call("features", set={"passkeys": True})
+        self.assertEqual(r["features"], {"passkeys": True, "apple_deleted": False})
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK, paths.ACTION_MANAGE])
+        self.assertEqual(self.st.settings["features"], {"passkeys": True, "apple_deleted": False})
+        by = await self.ids()
+        self.assertEqual(set(by), {"e.0", "e.1", "pk"})
+        self.assertTrue(by["e.1"]["has_passkey"])
+        self.assertEqual((by["pk"]["kind"], by["pk"]["has_password"]), ("passkey", False))
+        # No change, no dialog.
+        await self.ui.call("features", set={"passkeys": True})
+        self.assertEqual(self.dialogs().count(paths.ACTION_MANAGE), 1)
+        await self.ui.call("features", set={"apple_deleted": True})
+        by = await self.ids()
+        self.assertTrue(by["rd"]["recently_deleted"])
+        # A new daemon session reads them back from state.json.
+        self.ui.close()
+        await asyncio.sleep(0.05)
+        self.h.reg.sessions.clear()
+        ui2, _ = await self.h.ui()
+        r = await self.h.unlock(ui2)
+        self.assertEqual(r["features"], {"passkeys": True, "apple_deleted": True})
+
+    async def test_a_refused_dialog_changes_nothing(self):
+        await self.h.unlock(self.ui)
+        self.h.authority.outcome = "dismissed"
+        r = await self.ui.call("features", set={"apple_deleted": True})
+        self.assertEqual(r["error"], "dismissed")
+        self.assertNotIn("features", self.st.settings)
+        self.assertEqual(set(await self.ids()), {"e.0", "e.1"})
+
+    async def test_the_window_alone_cannot_change_them(self):
+        await self.h.unlock(self.ui)
+        for bad in ({"passkeys": 1}, {"other": True}, {"passkeys": "yes"}):
+            r = await self.ui.call("features", set=bad)
+            self.assertEqual(r["error"], "invalid", bad)
+        r = await self.ui.call("settings", set={"features": {"passkeys": True}})
+        self.assertEqual(r["error"], "invalid")
+        self.assertEqual((await self.ui.call("features"))["error"], "bad-request")
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK])
+        self.assertEqual((await self.ui.call("features", get=True))["features"]["passkeys"],
+                         False)
+
+    async def test_hidden_rows_are_never_offered_to_autofill(self):
+        from icp.daemon import autofill
+        for m in (self.st.metas["pk"], self.st.metas["rd"]):
+            self.assertIsNone(autofill.match_rank(m.domain, m))
+        self.assertEqual(autofill.match_rank("site1.example", self.st.metas["e.1"]), 0)
+
+
+class DiagItemsTests(Base):
+    SHAPE = {("keys", "com.apple.webkit.webauthn"):
+             {"count": 3, "keys": {"agrp", "class", "klbl", "labl", "v_Data"},
+              "inner_keys": set()},
+             ("inet", "com.apple.password-manager-recently-deleted"):
+             {"count": 1, "keys": {"acct", "agrp", "srvr", "v_Data"},
+              "inner_keys": {"notes", "title"}}}
+
+    async def test_needs_tier1_and_manage(self):
+        r = await self.ui.call("diag-items")
+        self.assertEqual(r["error"], "locked")
+        self.assertEqual(self.dialogs(), [])
+        await self.h.unlock(self.ui)
+        r = await self.ui.call("diag-items")
+        self.assertEqual(r, {"rid": self.ui.rid, "available": False, "items": []})
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK, paths.ACTION_MANAGE])
+        self.h.authority.outcome = "dismissed"
+        self.assertEqual((await self.ui.call("diag-items"))["error"], "dismissed")
+
+    async def test_names_and_counts_from_the_last_sync_only(self):
+        self.h.apple.shape = self.SHAPE
+        await self.h.unlock(self.ui)
+        r = await self.ui.call("diag-items")
+        self.assertTrue(r["available"])
+        self.assertEqual(r["items"], [
+            {"class": "inet", "agrp": "com.apple.password-manager-recently-deleted",
+             "count": 1, "keys": ["acct", "agrp", "srvr", "v_Data"],
+             "inner_keys": ["notes", "title"]},
+            {"class": "keys", "agrp": "com.apple.webkit.webauthn", "count": 3,
+             "keys": ["agrp", "class", "klbl", "labl", "v_Data"], "inner_keys": []}])
+        for e in r["items"]:
+            self.assertEqual(set(e), {"class", "agrp", "count", "keys", "inner_keys"})
+
+    async def test_a_lock_forgets_it(self):
+        self.h.apple.shape = self.SHAPE
+        await self.h.unlock(self.ui)
+        self.assertIsNotNone(self.h.reg.get(UID).item_shape)
+        await self.ui.call("lock")
+        self.assertIsNone(self.h.reg.get(UID).item_shape)
+        self.h.apple.shape = None
+        await self.h.unlock(self.ui)
+        self.assertFalse((await self.ui.call("diag-items"))["available"])
+
+    def test_a_real_shape_holds_no_value(self):
+        from icp.vault.host import strip_and_shape
+        items = [{"class": "inet", "agrp": "com.apple.cfnetwork", "srvr": "bank.example",
+                  "acct": "me@example.com", "v_Data": b"hunter2-secret"}]
+        shape = strip_and_shape(items)
+        reply = [{"class": c, "agrp": a, "count": v["count"], "keys": sorted(v["keys"]),
+                  "inner_keys": sorted(v["inner_keys"])} for (c, a), v in shape.items()]
+        for value in ("bank.example", "me@example.com", "hunter2"):
+            self.assertNotIn(value, repr(reply))
 
 
 class TpmMoveTests(Base):

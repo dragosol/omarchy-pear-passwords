@@ -73,6 +73,28 @@ class SyncSourcesTlksFromRpcTests(unittest.TestCase):
         self.assertEqual(captured["recs"]["synckey"], ["ZONE-SYNCKEY", "VIEW-SYNCKEY"])  # merged
         self.assertEqual(captured["nicknames"], {"k1-x": "Mine"})
 
+    def test_the_item_shape_travels_with_the_sync_items(self):
+        # op diag-items reads what the last sync decrypted, as names and counts only.
+        from icp.vault.host import CredentialStore
+        decrypted = [{"class": "inet", "agrp": "com.apple.cfnetwork", "srvr": "a.example",
+                      "acct": "me", "v_Data": b"pw"}]
+        orig = octagon.decrypt_credentials
+        octagon.decrypt_credentials = lambda recs, st, tlks=None: CredentialStore.from_items(
+            decrypted)
+        try:
+            client = octagon.OctagonClient.__new__(octagon.OctagonClient)
+            client.record = {"octagon": {"peer_id": "SHA256:me"}}
+            client.fetch_recoverable_tlks = lambda: ({}, [])
+            client.sync_keychain = lambda: {"item": []}
+            items = client.sync_and_decrypt()
+        finally:
+            octagon.decrypt_credentials = orig
+        self.assertEqual(len(items), 1)
+        shape = client.item_shape
+        self.assertIs(shape, items.item_shape)
+        self.assertEqual(shape[("inet", "com.apple.cfnetwork")]["count"], 1)
+        self.assertNotIn("a.example", repr(shape))
+
     def test_a_zone_that_fails_to_load_is_recorded_not_dropped_silently(self):
         client = octagon.OctagonClient.__new__(octagon.OctagonClient)  # bypass __init__/network
         client.user_id = "CKUSER"

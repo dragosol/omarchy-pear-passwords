@@ -290,11 +290,14 @@ class FakeApple:
         self.sync_error = None
         self.login_script = None           # fn(ctx) run by login
         self.apple_named: set = set()      # ids whose rename Apple can hold (a details record)
+        self.shape = None                  # what a sync reports as ctx.item_shape
 
     def sync(self, ctx):
         self.calls.append("sync")
         if self.sync_error:
             raise self.sync_error
+        if self.shape is not None:
+            ctx.item_shape = self.shape
         return {"added": 0, "changed": 1, "deleted": 0, "unchanged": 1, "synced_at": 123.0}
 
     def login(self, ctx):
@@ -308,6 +311,7 @@ class FakeApple:
 
     def push_set(self, ctx, id, fields):
         self.calls.append(("push_set", id, sorted(fields)))
+        self.last_fields = dict(fields)
         if not ctx.store.session:
             from icp.daemon.apple import NotSignedIn
             raise NotSignedIn("not signed in to iCloud")

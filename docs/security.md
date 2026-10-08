@@ -105,6 +105,27 @@ Per user, in `/var/lib/pear-passwords/u<uid>/` (0700 `pear-passwords`; your uid 
 - In memory: nothing while locked; `RK_list`, its subkeys and the metadata after the first
   dialog; one entry's fields for at most the grant (120 s) after the second. Tests:
   `test_grants.py`, `test_logind_lock.py`.
+- **The tag line is tier-1 list metadata.** Whatever is on a note's final `Tags:` line is list
+  metadata, not a secret: it is visible to anyone who passes the first dialog, like titles and
+  usernames. Do not put secrets on that line. The daemon reads it from the plaintext a sync,
+  an edit, a new entry or the 1.x import already holds, without unsealing `SK_secret`, and
+  keeps it in `meta.v2`; the box keeps the whole notes, and `reveal`/`copy` of notes give only
+  the body. A tag edit is an edit: it needs that entry's grant and splices the one line into
+  the notes as iCloud holds them at that moment. Tests: `test_tagline.py`,
+  `test_store_v2.py::TagMetaTests`, `test_pwmac_sync_diff.py::TagSyncTests`,
+  `test_push_details.py`, `test_daemon_handlers.py::NotesBodyTests`.
+- **Passkey key material is never stored.** A passkey is a class `keys` item in the WebAuthn
+  access group; its `v_Data` is its private key. The daemon deletes `v_Data` from every
+  decrypted `keys` item before anything else reads it, so no credential, box, `meta.v2` record
+  or reply ever holds it; what is kept is the site, the account name and the fact that a
+  passkey exists. Pear never creates, uses or deletes a passkey. Items in Apple's Recently
+  Deleted (access groups ending in `-recently-deleted`) are kept apart from the live entry
+  under their own id: never merged into it, never listed as live, never offered to autofill,
+  never edited. Both categories stay hidden until a `.manage`-gated flag turns them on, after
+  `diag-items` (counts and attribute names only, never a value) confirmed the names on a
+  real keychain. Tests: `test_host.py::PasskeyTests`, `test_host.py::RecentlyDeletedTests`,
+  `test_host.py::ShapeTests`, `test_push_details.py`,
+  `test_daemon_handlers.py::FeatureFlagTests`, `test_daemon_handlers.py::DiagItemsTests`.
 - A lock never waits. It runs on the daemon's one event loop, and a store call can sit in
   `systemd-creds` for up to a minute on a slow TPM, so a lock that finds a store call running
   marks the uid locked and asks the store to wipe: the store method in progress wipes the keys
@@ -165,6 +186,16 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
   while handling one of them; one outstanding dialog per bucket (`ui` and `autofill`), and at
   most three refused (dismissed or denied) dialogs per minute per bucket and action; approvals
   are not counted. A polkitd refusal of the call itself is `internal`, never "no agent". Tests: `test_daemon_polkit.py`, `test_protocol_contract.py`.
+- **copy-text: no dialog, text already in the window; fixed sources; 16 KiB; 10/min; one
+  offer at a time.** Ctrl+C and Copy in the window's secret fields send the selection to the
+  daemon, which puts it on the clipboard through pear-clip (one paste or the clipboard
+  timeout, kept out of history) like any copy. It raises no dialog, because the text is
+  already in the window and a prompt would protect nothing; the guard exists so the honest
+  window never puts a secret on the persistent clipboard. Only six named fields may send it;
+  the three edit fields need a live grant on that entry, which the check never uses up. At
+  most 16384 characters, no NUL, 10 per minute per user, and a new one withdraws the last
+  offer. The text lives only in the ticket (the same Python-string residue as `copy`).
+  Tests: `test_daemon_handlers.py::CopyTextTests`, `test_protocol_contract.py`.
 - The scheduler and the Apple pipeline never import or name the polkit module, and no
   `AllowUserInteraction` appears in them. Tests: `test_scheduler_no_prompt.py`,
   `test_repo_guards.py::BackgroundNeverPromptsTests`.

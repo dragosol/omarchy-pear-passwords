@@ -174,8 +174,7 @@ def _read_back(store: UserStore, tmp: Path) -> dict:
         reader.lock()
 
 
-_META_KEYS = ("title", "domain", "sites", "username", "apple_title", "aliases", "has_totp",
-              "has_notes", "mdat")
+_META_KEYS = _meta._META_FIELDS        # every stored Meta field, as the v1 side computes it
 
 
 def _remove_tree(path: Path) -> None:

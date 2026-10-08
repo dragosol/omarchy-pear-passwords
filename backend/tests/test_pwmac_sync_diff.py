@@ -13,7 +13,7 @@ from icp import vstore
 from icp.vstore import entries
 
 
-class SyncDiffTests(StoreCase):
+class _SyncCase(StoreCase):
     def setUp(self):
         super().setUp()
         self.s = vstore.UserStore.create(UID)
@@ -26,6 +26,8 @@ class SyncDiffTests(StoreCase):
     def box(self, id):
         return (self.udir / "entries" / f"{id}.box").read_bytes()
 
+
+class SyncDiffTests(_SyncCase):
     def test_add_then_unchanged(self):
         items = [item(f"s{i}.example.test", "me", f"pw{i}") for i in range(5)]
         self.assertEqual(self.s.apply_sync(items, set()),
@@ -156,3 +158,39 @@ class SyncDiffTests(StoreCase):
         self.assertEqual(got.totp_secret, b"\x00\xffseed")
         self.assertEqual(got.totp_params, {"digits": 6, "period": 30, "algorithm": 0})
         self.assertTrue(self.s.get_meta(it.id).has_totp)
+
+
+class TagSyncTests(_SyncCase):
+    """The tag line is read during sync from the plaintext already in hand: no SK."""
+
+    def test_tags_are_extracted_without_an_unseal(self):
+        it = item("a.example.test", "me", "pw", notes="body\n\nTags: #Work")
+        self.s.apply_sync([it], set())
+        self.assertEqual(self.s.get_meta(it.id).tags, ["work"])
+        self.assertNoUnseal()
+
+    def test_a_tag_only_change_reseals_without_history_and_updates_meta(self):
+        it = item("a.example.test", "me", "pw", notes="body\n\nTags: #a")
+        self.s.apply_sync([it], set())
+        old_box = self.box(it.id)
+        smac = self.s._doc["entries"][it.id]["smac"]
+        counts = self.s.apply_sync([item("a.example.test", "me", "pw",
+                                         notes="body\n\nTags: #a #b")], set())
+        self.assertEqual(counts["changed"], 1)
+        self.assertNotEqual(self.box(it.id), old_box)
+        self.assertNotEqual(self.s._doc["entries"][it.id]["smac"], smac)
+        self.assertFalse((self.udir / "history" / it.id).exists())
+        self.assertEqual(self.s.get_meta(it.id).history_count, 0)
+        self.assertEqual(self.s.get_meta(it.id).tags, ["a", "b"])
+        self.assertNoUnseal()
+        self.assertEqual(self.s.open_entry(it.id).notes, "body\n\nTags: #a #b")
+
+    def test_set_secrets_updates_tags_too(self):
+        it = item("a.example.test", "me", "pw", notes="Tags: #a")
+        self.s.apply_sync([it], set())
+        self.s.set_secrets(it.id, vstore.Secrets(password="pw2", notes="new\nTags: #z",
+                                                 totp_secret=None, apple_history=[]))
+        m = self.s.get_meta(it.id)
+        self.assertEqual((m.tags, m.has_notes), (["z"], True))
+        self.assertNoUnseal()
+

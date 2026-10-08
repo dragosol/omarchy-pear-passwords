@@ -42,11 +42,13 @@ class NotSignedIn(AppleError):
 
 
 class FieldError(ValueError):
-    """A field failed validation. Protocol `invalid`, with `field` naming it."""
+    """A field failed validation. Protocol `invalid`, with `field` naming it (and `detail`,
+    when set: a fixed word such as "not-utf8", never a value)."""
 
-    def __init__(self, field: str, message: str = ""):
+    def __init__(self, field: str, message: str = "", detail: str = ""):
         super().__init__(message or f"invalid {field}")
         self.field = field
+        self.detail = detail
 
 
 # --------------------------------------------------------------------------- shared steps
@@ -130,6 +132,7 @@ def _sync_with(ctx: "UserContext", s: dict, device, anisette, client=None) -> di
     session_store.save(store, s)   # the refreshed cloudKitToken + cloudKitUserId from ckAppInit
     ctx.ui.stage("syncing")
     items = client.sync_and_decrypt(nicknames=store.load_nicknames())
+    ctx.item_shape = getattr(client, "item_shape", None)
     _still_unlocked(ctx)
     deleted = _deleted(store, items, getattr(client, "failed_zones", []))
     counts = dict(store.apply_sync(items, deleted))
@@ -387,16 +390,31 @@ def _landed(ctx: "UserContext", zone, zone_name: str, domain: str, username: str
     return c
 
 
+def _tags(value) -> list:
+    from ..keychain import tagline
+    try:
+        return tagline.canon_list(value)
+    except ValueError:
+        raise FieldError("tags") from None
+
+
 def push_set(ctx: "UserContext", id: str, fields: dict) -> None:
     """Push a change to one entry: any of password, notes, sites, nickname, totp
-    ({"setup": key-or-otpauth} or {"remove": true}), as validated by the handler. Then sync
-    that zone so meta reflects iCloud, and call ctx.store.set_secrets when secrets changed.
+    ({"setup": key-or-otpauth} or {"remove": true}), tags, as validated by the handler. Then
+    sync that zone so meta reflects iCloud, and call ctx.store.set_secrets when secrets
+    changed.
+
+    `notes` is the notes body: the entry's current "Tags:" line is kept under it, and `tags`
+    replaces only that line. Both splice into the notes as iCloud holds them right now
+    (push.push_details), never into a copy the window sent. Tags on notes that are not UTF-8
+    are refused (`invalid`, field notes, detail not-utf8) before anything is written.
 
     A nickname goes to Apple when the entry has a details record (so it reaches every
     device); otherwise it is kept as a local nickname in the store, which is the case the
     reply reports as synced:false. Fields are re-checked here as well, since a wrong type sent
     to iCloud is not something to find out about afterwards."""
     from ..cli import push
+    from ..keychain.update import NotesNotUtf8
     from ..octagon import items as sync_items
     from . import protocol
 
@@ -405,6 +423,8 @@ def push_set(ctx: "UserContext", id: str, fields: dict) -> None:
         raise FieldError(sorted(unknown)[0])
     store = ctx.store
     meta = store.get_meta(id)
+    if getattr(meta, "recently_deleted", False) or getattr(meta, "kind", "login") == "passkey":
+        raise FieldError("id", "a Recently Deleted or passkey-only row is read-only")
     domain, username = meta.domain, meta.username
 
     new_password = None
@@ -414,7 +434,9 @@ def push_set(ctx: "UserContext", id: str, fields: dict) -> None:
             raise FieldError("password")
     details = {}
     if "notes" in fields:
-        details["notes"] = _text(fields, "notes")
+        details["notes_body"] = _text(fields, "notes")
+    if "tags" in fields:
+        details["tags"] = _tags(fields["tags"])
     if "sites" in fields:
         details["sites"] = _sites(fields["sites"])
     if "totp" in fields:
@@ -426,25 +448,36 @@ def push_set(ctx: "UserContext", id: str, fields: dict) -> None:
     # The password, the details and the name can all live in the same metadata record, and
     # each step rewrites that record from the copy it was fetched as. So every step after the
     # first works from a fresh fetch, or it would put back what the step before it changed.
+    expect: dict = {}
     steps = []
     if new_password is not None:
         steps.append(("password", lambda z: push.push_password(z, domain, username, new_password)))
     if details:
-        steps.append(("details", lambda z: push.push_details(z, domain, username, **details)))
+        steps.append(("details", lambda z: push.push_details(z, domain, username,
+                                                             expect=expect, **details)))
     if nickname is not None:
         steps.append(("nickname", lambda z: push.push_nickname(z, domain, username, nickname)))
     zone = _open_zone(ctx)
+    if "tags" in details and not push.notes_editable(zone, domain, username):
+        raise FieldError("notes", "the notes are not UTF-8", detail="not-utf8")
     renamed_in_icloud = False
     for i, (kind, step) in enumerate(steps):
         if i:
             zone = push.open_zone(zone.client)
-        result = step(zone)
+        try:
+            result = step(zone)
+        except NotesNotUtf8:
+            raise FieldError("notes", "the notes are not UTF-8", detail="not-utf8") from None
         if kind == "nickname":
             renamed_in_icloud = result is True
 
+    landed = {k: v for k, v in details.items() if k in ("sites", "totp")}
+    if "notes" in expect:
+        landed["notes_raw"] = expect["notes"]
+
     def check(c):
         return ((new_password is None or c.password == new_password)
-                and (not details or push.details_landed(c, domain, **details))
+                and (not details or push.details_landed(c, domain, **landed))
                 and (not renamed_in_icloud or (c.apple_title or "") == nickname))
 
     c = _landed(ctx, zone, push.ZONE_PASSWORDS, domain, username, check)
@@ -486,6 +519,9 @@ def create(ctx: "UserContext", fields: dict) -> str:
     except push.PushError as e:
         raise FieldError("domain", str(e)) from None
     notes = _text(fields, "notes")
+    if "tags" in fields:
+        from ..keychain import tagline
+        notes = tagline.compose(notes.strip("\n"), _tags(fields["tags"]))
     sites = _sites(fields["sites"]) if "sites" in fields else []
     cfg = _totp_cfg(fields["totp"]) if fields.get("totp") is not None else None
 

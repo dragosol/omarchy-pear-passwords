@@ -33,13 +33,20 @@ PREFIX = "k1-"
 HEX_CHARS = 40          # 160 bits of SHA-256: no accidental collision across one keychain
 
 
-def entry_id(domain: str, username: str) -> str:
+# Salt of a copy in Apple's Recently Deleted: the deleted and the live copy of one account are
+# two entries, and must never collapse into one or take each other's id.
+RECENTLY_DELETED = "rd:"
+
+
+def entry_id(domain: str, username: str, salt: str = "") -> str:
     """The id of the account (domain, username), byte-exact: no case folding, no `www.`
     stripping, because 1.x did none either and two such entries really are two entries.
 
     The pair is hashed as a JSON array, not joined with a separator, so no choice of domain
-    and username can collide with another pair that happens to contain the separator."""
-    pair = json.dumps([str(domain), str(username)], ensure_ascii=False, separators=(",", ":"))
+    and username can collide with another pair that happens to contain the separator. A
+    salted id hashes [salt, domain, username], which no unsalted pair can produce."""
+    parts = [str(salt), str(domain), str(username)] if salt else [str(domain), str(username)]
+    pair = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
     h = hashlib.sha256(b"pear/v2/entry\x00" + pair.encode("utf-8", "surrogatepass"))
     return PREFIX + h.hexdigest()[:HEX_CHARS]
 
