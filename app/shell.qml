@@ -624,6 +624,14 @@ ShellRoot {
 
     // After tpm-cleared or damaged: new keys, then sign in again. The daemon moves the old
     // files aside rather than deleting them.
+    // Ctrl+C / Ctrl+X (and Ctrl+Insert, Shift+Delete) in a field that holds a secret would put
+    // it on the regular clipboard, past pear-clip's one paste or 30 s and into clipboard
+    // history. Every such field swallows those shortcuts here and has no context menu; the
+    // Copy buttons go through the daemon and pear-clip.
+    function guardSecretKeys(event) {
+        if (event.matches(StandardKey.Copy) || event.matches(StandardKey.Cut)) event.accepted = true;
+    }
+
     // An import that never committed, with nothing left to import or "Start fresh instead"
     // chosen: tell the daemon, which otherwise refuses a fresh sign-in (migration-pending).
     // No dialog. If it fails, the migration-pending screen offers Start over (reset).
@@ -2475,6 +2483,10 @@ ShellRoot {
                                     spacing: 8
                                     O.TextField {
                                         id: newPw
+                                        // A secret leaves this window only through pear-clip (one paste or 30 s, never in
+                                        // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                                        Keys.onPressed: (event) => root.guardSecretKeys(event)
+                                        ContextMenu.menu: null
                                         // No IME learning, no prediction (pear-exec also keeps input methods and the
                                         // primary selection away from the window).
                                         inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -2894,6 +2906,10 @@ ShellRoot {
                                 TextArea {
                                     textFormat: TextArea.PlainText
                                     id: edArea
+                                    // A secret leaves this window only through pear-clip (one paste or 30 s, never in
+                                    // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                                    Keys.onPressed: (event) => root.guardSecretKeys(event)
+                                    ContextMenu.menu: null
                                     // No IME learning, no prediction (pear-exec also keeps input methods and the
                                     // primary selection away from the window).
                                     inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -2933,6 +2949,10 @@ ShellRoot {
                             spacing: 10
                             O.TextField {
                                 id: edSetup
+                                // A secret leaves this window only through pear-clip (one paste or 30 s, never in
+                                // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                                Keys.onPressed: (event) => root.guardSecretKeys(event)
+                                ContextMenu.menu: null
                                 // No IME learning, no prediction (pear-exec also keeps input methods and the
                                 // primary selection away from the window).
                                 inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -3044,6 +3064,10 @@ ShellRoot {
                             spacing: 10
                             O.TextField {
                                 id: crPass
+                                // A secret leaves this window only through pear-clip (one paste or 30 s, never in
+                                // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                                Keys.onPressed: (event) => root.guardSecretKeys(event)
+                                ContextMenu.menu: null
                                 Layout.fillWidth: true
                                 visible: !root.createGenerate
                                 password: true
@@ -3085,6 +3109,10 @@ ShellRoot {
                         }
                         O.TextField {
                             id: crNotes
+                            // A secret leaves this window only through pear-clip (one paste or 30 s, never in
+                            // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                            Keys.onPressed: (event) => root.guardSecretKeys(event)
+                            ContextMenu.menu: null
                             // No IME learning, no prediction (pear-exec also keeps input methods and the
                             // primary selection away from the window).
                             inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -3106,6 +3134,10 @@ ShellRoot {
                             spacing: 10
                             O.TextField {
                                 id: crSetup
+                                // A secret leaves this window only through pear-clip (one paste or 30 s, never in
+                                // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                                Keys.onPressed: (event) => root.guardSecretKeys(event)
+                                ContextMenu.menu: null
                                 // No IME learning, no prediction (pear-exec also keeps input methods and the
                                 // primary selection away from the window).
                                 inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -3352,6 +3384,10 @@ ShellRoot {
                         }
                         O.TextField {
                             id: signinField
+                            // A secret leaves this window only through pear-clip (one paste or 30 s, never in
+                            // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                            Keys.onPressed: (event) => root.guardSecretKeys(event)
+                            ContextMenu.menu: null
                             Layout.fillWidth: true
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fBody
@@ -3382,6 +3418,10 @@ ShellRoot {
                         visible: root.signinNeed !== "" && root.signinKind === "code"
                         TextInput {
                             id: codeField
+                            // A secret leaves this window only through pear-clip (one paste or 30 s, never in
+                            // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                            Keys.onPressed: (event) => root.guardSecretKeys(event)
+                            ContextMenu.menu: null
                             width: 1; height: 1; opacity: 0
                             maximumLength: 6
                             inputMethodHints: Qt.ImhDigitsOnly
@@ -3913,6 +3953,10 @@ ShellRoot {
                         }
                         O.TextField {
                             id: oldPass
+                            // A secret leaves this window only through pear-clip (one paste or 30 s, never in
+                            // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                            Keys.onPressed: (event) => root.guardSecretKeys(event)
+                            ContextMenu.menu: null
                             Layout.fillWidth: true
                             password: true
                             font.family: Theme.uiFont

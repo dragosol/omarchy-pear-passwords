@@ -105,7 +105,7 @@ class SecretFieldTests(unittest.TestCase):
         for ident in ("edArea", "edSetup", "crNotes", "crSetup", "newPw"):
             m = re.search(rf"\bid: {ident}\n", CODE)
             self.assertIsNotNone(m, ident)
-            body = CODE[m.end():m.end() + 600]
+            body = CODE[m.end():m.end() + 1200]
             self.assertRegex(body, r"inputMethodHints: Qt\.ImhSensitiveData \| "
                                    r"Qt\.ImhNoPredictiveText", ident)
 

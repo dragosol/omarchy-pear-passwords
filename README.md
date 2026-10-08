@@ -107,7 +107,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "d0bf770591a7cb44e657ba5619b07d683ac4be4be3328ba66cfb9f76da8a9c1a  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "3376f91395e805cc01e3ac36c065fa6c82fa98589f85b238c8571692cffa983e  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -295,6 +295,9 @@ What to know before you turn it on:
   history managers not to keep them.
 - The value never passes through a file: it is held in memory by a small Wayland clipboard
   writer, never `wl-copy`, which stages its input in `/tmp`.
+- The Copy buttons are the only way a secret reaches the clipboard. Ctrl+C, Ctrl+X and the
+  right-click menu do nothing in the fields where you type or edit a password, notes or a
+  setup key.
 - While a copy is on offer, any program that can read your clipboard can read it. If one reads
   it first, your own paste comes up empty, which at least tells you.
 - Settings can check your clipboard history for passwords copied by older versions (it asks

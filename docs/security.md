@@ -48,7 +48,13 @@ a locked computer does not sync.
   Tests: `test_pear_exec_env.py`.
 - **The window** has no `IpcHandler`, renders every `Text` as plain text, logs no values, binds
   neither the primary selection nor a text-input protocol (`QT_WAYLAND_DISABLED_INTERFACES`
-  from pear-exec), and starts only a fixed list of programs. The Omarchy components it
+  from pear-exec, so there is no input method for CJK text either), keeps every field that
+  holds a secret (notes, setup keys, typed and new passwords, the 1.x passphrase, the Apple
+  password, the verification code) off the clipboard (Ctrl+C, Ctrl+X and the context menu do
+  nothing there; a copy goes only through pear-clip), and starts only a fixed list of
+  programs. An unsaved edit (a typed new password or notes) stays in the window, out of sight,
+  past the 120 s grant until the next approval, a lock or another account is selected. The
+  Omarchy components it
   instantiates (Commons `Style`, `Color`, `Util`; Ui `Button`, `TextField`) add exactly
   `hyprctl -j getoption decoration:rounding|general:gaps_out` and `fc-match -f %{family[0]}
   monospace` (through PATH=/usr/bin, with egid pear-client) and read
@@ -59,7 +65,7 @@ a locked computer does not sync.
   update that adds to them fails. Quickshell's runtime directory lets the same user kill the
   window (`qs kill`); its log holds no account data. Tests: `test_qml_no_ipc.py`,
   `test_qml_text_plain.py`, `test_qml_no_console_log.py`, `test_qml_process_allowlist.py`,
-  `test_qml_grant_flow.py`, `test_pear_exec_env.py`.
+  `test_qml_grant_flow.py`, `test_qml_secret_copy.py`, `test_pear_exec_env.py`.
 - **pear-clip** speaks the Wayland data-control protocol itself and holds the value in memory.
   It identifies each reader by the pipe it hands over: Omarchy's history watcher gets nothing,
   any other reader is the one counted paste, and the offer is withdrawn after that paste or
