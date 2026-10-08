@@ -56,8 +56,8 @@ class HelloAndUnlockTests(Base):
         self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK])
 
     async def test_second_unlock_on_the_same_window_does_not_prompt(self):
-        await self.ui.call("unlock")
-        await self.ui.call("unlock")
+        await self.h.unlock(self.ui)
+        await self.h.unlock(self.ui)
         self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK])
 
     async def test_internal_records_hidden_unless_all(self):
@@ -294,7 +294,7 @@ class MigrationTests(Base):
         self.assertEqual(hello["state"], "locked")            # keys exist now
         self.assertTrue(hello["migration_pending"])
         # No fresh iCloud sign-in (and its escrow join) over the half-done import...
-        await self.ui.call("unlock")
+        await self.h.unlock(self.ui)
         r = await self.ui.call("signin", mode="login")
         self.assertEqual(r.get("error"), "migration-pending")
         self.assertNotIn(paths.ACTION_MANAGE, self.dialogs()[1:])
@@ -341,7 +341,7 @@ class MigrationTests(Base):
         self.assertEqual(r, {"rid": self.ui.rid, "migration_pending": False})
         self.assertEqual(len(self.dialogs()), self.dialogs_before)     # no dialog
         self.assertNotIn("migration_pending", self.h.store().settings)
-        await self.ui.call("unlock")
+        await self.h.unlock(self.ui)
         r = await self.ui.call("signin", mode="login")
         self.assertNotEqual(r.get("error"), "migration-pending")
         ui2_hello = self.ui.hello
@@ -422,7 +422,7 @@ class MigrationTests(Base):
 class EditTests(Base):
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        await self.ui.call("unlock")
+        await self.h.unlock(self.ui)
         # Let the sync the unlock started finish: while it runs every edit is busy-sync, and
         # its end clears `busy` (a race that made test_busy_sync flaky under load).
         await self.ui.event("synced")
@@ -575,7 +575,7 @@ class TpmMoveTests(Base):
 
     async def test_the_move_is_its_own_manage_dialog(self):
         self.st.tpm_state = "available"
-        await self.ui.call("unlock")
+        await self.h.unlock(self.ui)
         await self.ui.event("synced")          # the unlock's sync holds `busy` until it ends
         r = await self.ui.call("tpm-move")
         self.assertEqual(r, {"rid": self.ui.rid, "sealed_with": "host+tpm2"})
@@ -584,7 +584,7 @@ class TpmMoveTests(Base):
 
     async def test_a_refused_dialog_moves_nothing(self):
         self.st.tpm_state = "available"
-        await self.ui.call("unlock")
+        await self.h.unlock(self.ui)
         await self.ui.event("synced")
         self.h.authority.outcome = polkit.DENIED
         r = await self.ui.call("tpm-move")
@@ -596,7 +596,7 @@ class TpmMoveTests(Base):
                            ("pcr-policy", "seal-refused")):
             self.st.tpm_state = state
             if not self.h.reg.get(UID).unlocked():
-                await self.ui.call("unlock")
+                await self.h.unlock(self.ui)
             n = len(self.dialogs())
             r = await self.ui.call("tpm-move")
             self.assertEqual(r["error"], err, state)
@@ -613,7 +613,7 @@ class TpmMoveTests(Base):
 class ResetTests(Base):
     async def test_reset_says_pcr_policy_before_the_dialog(self):
         self.st.seal_error = "damaged"
-        await self.ui.call("unlock")
+        await self.h.unlock(self.ui)
         n = len(self.dialogs())
         FakeStore.blocked_reason = "pcr-policy"
         r = await self.ui.call("reset")
@@ -624,7 +624,7 @@ class ResetTests(Base):
     async def test_reset_only_from_a_broken_store(self):
         self.assertEqual((await self.ui.call("reset"))["error"], "not-locked")
         self.st.seal_error = "damaged"
-        await self.ui.call("unlock")
+        await self.h.unlock(self.ui)
         r = await self.ui.call("reset")
         self.assertEqual(r, {"rid": self.ui.rid, "state": "empty"})
         self.assertIn("reset", self.h.store().calls)
@@ -650,7 +650,7 @@ class AutofillDispatchTests(Base):
             r = await af.call("autofill-query", origin="https://github.com")
         self.assertEqual(r, {"rid": af.rid, "state": "locked"})
         self.assertEqual(seen, {"types": (True, True, True), "role": "autofill"})
-        await self.ui.call("unlock")
+        await self.h.unlock(self.ui)
         self.assertEqual((await af.event("state"))["state"], "unlocked")
         for op in ("unlock", "grant", "redeem", "import-file"):
             self.assertEqual((await af.call(op))["error"], "forbidden")

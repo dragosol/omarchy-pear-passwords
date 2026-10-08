@@ -456,6 +456,25 @@ class Harness:
         self.clients.append(c)
         return c
 
+    async def syncs_done(self, timeout=30) -> None:
+        """Wait for every background sync running in the daemon to end. The daemon starts one
+        right after an unlock's reply is queued (the task exists before the client reads the
+        reply); while it runs, create/delete/set/signin/signout/tpm-move are refused
+        busy-sync and raise no dialog."""
+        me = asyncio.current_task()
+        tasks = [t for t in asyncio.all_tasks()
+                 if t is not me and getattr(t.get_coro(), "__qualname__", "") == "background_sync"]
+        if tasks:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout)
+
+    async def unlock(self, c, **fields) -> dict:
+        """`unlock` on window `c`, then wait out the sync it starts (round 2 gate finding 4:
+        an op sent meanwhile was sometimes refused busy-sync, so tests that expected its
+        dialog failed under load)."""
+        r = await c.call("unlock", **fields)
+        await self.syncs_done()
+        return r
+
     async def enable_autofill(self, uid=UID) -> None:
         """What `autofill-enable {enabled:true}` in the window leaves behind."""
         (await self.reg.session_for(uid)).autofill_enabled = True
