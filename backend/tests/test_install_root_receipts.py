@@ -384,6 +384,11 @@ class InstallRootTests(unittest.TestCase):
             f.write("// window, 2.0")
         with open(self.h.r(P["INSTALL_RECEIPT"]) + ".pp-new", "w") as f:
             f.write("# half a receipt")
+        # Gone as soon as the checks pass, before any file is (re)written.
+        proc = self.h.install(stop_at="venv")
+        self.assertEqual(proc.returncode, 99, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(dest + ".pp-new"))
+        self.assertFalse(os.path.exists(self.h.r(P["INSTALL_RECEIPT"]) + ".pp-new"))
         self.ok(self.h.install())
         self.assertFalse(os.path.exists(dest + ".pp-new"))
         self.assertFalse(os.path.exists(self.h.r(P["INSTALL_RECEIPT"]) + ".pp-new"))
