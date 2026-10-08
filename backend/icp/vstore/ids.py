@@ -9,42 +9,58 @@ same id for the same (domain, username). If they did not, the first sync after a
 would add all 554 entries again under new ids and tombstone the imported ones, taking every
 nickname and every local history entry with them.
 
-So the rule for every producer of a SyncItem is: `entry_id(domain, username)`, with
-`assign_ids()` when one batch can hold the same pair twice.
+So every producer of a SyncItem - the importer here, icp.octagon.items for a sync and the
+icp.vault.store adapter - calls `entry_id(domain, username)`, and `collapse()` when one batch
+can hold the same pair twice. A pair seen twice (a site saved over two protocols) keeps the
+newest item, which is also the one an Apple device fills; the importer files the older
+password into the kept entry's history so nothing 1.x showed is lost.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
-from typing import Iterable
+from typing import Callable, Iterable, TypeVar
+
+T = TypeVar("T")
 
 # What vstore.Meta promises callers ([A-Za-z0-9._:-], at most 128), minus a leading dot so an
 # id can never be "." or ".." when it becomes entries/<id>.box or the directory history/<id>/.
 _ID_RE = re.compile(r"^[A-Za-z0-9_:-][A-Za-z0-9._:-]{0,127}$")
 
-PREFIX = "k"
+PREFIX = "k1-"
 HEX_CHARS = 40          # 160 bits of SHA-256: no accidental collision across one keychain
 
 
 def entry_id(domain: str, username: str) -> str:
     """The id of the account (domain, username), byte-exact: no case folding, no `www.`
-    stripping, because 1.x did none either and two such entries really are two entries."""
-    key = f"{domain}\x1f{username}".encode("utf-8", "surrogatepass")
-    return PREFIX + hashlib.sha256(key).hexdigest()[:HEX_CHARS]
+    stripping, because 1.x did none either and two such entries really are two entries.
+
+    The pair is hashed as a JSON array, not joined with a separator, so no choice of domain
+    and username can collide with another pair that happens to contain the separator."""
+    pair = json.dumps([str(domain), str(username)], ensure_ascii=False, separators=(",", ":"))
+    h = hashlib.sha256(b"pear/v2/entry\x00" + pair.encode("utf-8", "surrogatepass"))
+    return PREFIX + h.hexdigest()[:HEX_CHARS]
 
 
-def assign_ids(pairs: Iterable[tuple[str, str]]) -> list[str]:
-    """Ids for a batch, in order. A repeated (domain, username) gets `.2`, `.3`... in the order
-    it appears, so the first occurrence keeps the plain id that history and nicknames use."""
-    seen: dict[str, int] = {}
-    out = []
-    for domain, username in pairs:
-        base = entry_id(domain, username)
-        n = seen.get(base, 0) + 1
-        seen[base] = n
-        out.append(base if n == 1 else f"{base}.{n}")
-    return out
+def collapse(items: Iterable[T], key: Callable[[T], str],
+             mdat: Callable[[T], float]) -> tuple[dict[str, T], list[tuple[str, T]]]:
+    """One item per id: ({id: kept}, [(id, dropped), ...]), both in first-seen order. The kept
+    item is the one with the newest `mdat`; on a tie the first one seen stays."""
+    kept: dict[str, T] = {}
+    dropped: list[tuple[str, T]] = []
+    for it in items:
+        k = key(it)
+        prev = kept.get(k)
+        if prev is None:
+            kept[k] = it
+        elif mdat(it) > mdat(prev):
+            kept[k] = it
+            dropped.append((k, prev))
+        else:
+            dropped.append((k, it))
+    return kept, dropped
 
 
 def valid_id(value) -> bool:

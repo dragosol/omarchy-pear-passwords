@@ -161,6 +161,7 @@ ERRORS: dict[str, str] = {
     "tpm-missing": "seal state, see docs/protocol.md 'States'",
     "tpm-cleared": "seal state",
     "damaged": "seal state",
+    "seal-unavailable": "systemd-creds or the seal service could not run; transient, retry",
     # prompts
     "dismissed": "the user closed the polkit dialog",
     "denied": "polkit said no (wrong password, fingerprint failure, policy)",

@@ -21,7 +21,7 @@ import dataclasses
 
 from ..vstore import Meta, Secrets, SyncItem, UserStore
 from ..vstore import legacy as _legacy
-from ..vstore.ids import assign_ids, entry_id
+from ..vstore.ids import collapse, entry_id
 from .host import Credential, CredentialStore
 
 
@@ -37,13 +37,15 @@ def credential_parts(c: Credential) -> tuple[Meta, Secrets]:
 
 
 def sync_items(creds) -> list[SyncItem]:
-    """SyncItems for every credential in `creds`, ids per vstore.ids.assign_ids (a repeated
-    domain and username gets `.2`, `.3` in order)."""
+    """SyncItems for every credential in `creds`, one per id: a repeated domain and username
+    keeps the newest (vstore.ids.collapse), as a sync from iCloud does."""
     creds = list(creds.all() if isinstance(creds, CredentialStore) else creds)
-    parts = [credential_parts(c) for c in creds]
-    ids = assign_ids((m.domain, m.username) for m, _ in parts)
-    return [SyncItem(id=i, meta=dataclasses.replace(m, id=i), secrets=s)
-            for i, (m, s) in zip(ids, parts)]
+    kept, _ = collapse(creds, key=credential_id, mdat=lambda c: float(c.mdat or 0.0))
+    out = []
+    for i, c in kept.items():
+        m, s = credential_parts(c)
+        out.append(SyncItem(id=i, meta=dataclasses.replace(m, id=i), secrets=s))
+    return out
 
 
 def save_vault(store: UserStore, creds: CredentialStore) -> dict:

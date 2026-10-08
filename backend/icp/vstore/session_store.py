@@ -119,8 +119,18 @@ def save_device(directory: Path, d: dict) -> None:
     fmt.atomic_write(Path(directory) / paths.DEVICE_FILE, fmt.dumps(d))
 
 
+def _state_keys(src: dict, out: dict) -> None:
+    """The daemon's bookkeeping beside the settings: the v1 backup record (old_copy) and the
+    marker of a migrate-begin that has not committed yet (migration_pending, only ever True)."""
+    if isinstance(src.get("old_copy"), dict):
+        out["old_copy"] = src["old_copy"]
+    if src.get("migration_pending") is True:
+        out["migration_pending"] = True
+
+
 def load_settings(directory: Path) -> dict:
-    """DEFAULT_SETTINGS overlaid with what state.json holds for those keys, plus old_copy.
+    """DEFAULT_SETTINGS overlaid with what state.json holds for those keys, plus old_copy and
+    migration_pending.
 
     Unknown keys are dropped on the way out - in particular a `sync_lease_h` left by a
     pre-release build never reaches the daemon. A state.json that is not JSON gives the
@@ -135,8 +145,7 @@ def load_settings(directory: Path) -> dict:
             v = stored.get(k)
             if isinstance(v, int) and not isinstance(v, bool):
                 out[k] = v
-        if isinstance(stored.get("old_copy"), dict):
-            out["old_copy"] = stored["old_copy"]
+        _state_keys(stored, out)
     return out
 
 
@@ -144,6 +153,5 @@ def save_settings(directory: Path, d: dict) -> None:
     if not isinstance(d, dict):
         raise ValueError("settings are a dict")
     keep = {k: d[k] for k in protocol.DEFAULT_SETTINGS if k in d}
-    if isinstance(d.get("old_copy"), dict):
-        keep["old_copy"] = d["old_copy"]
+    _state_keys(d, keep)
     fmt.atomic_write(Path(directory) / paths.STATE_FILE, fmt.dumps(keep))

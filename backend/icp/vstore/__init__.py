@@ -536,7 +536,8 @@ class UserStore:
     def load_settings(self) -> dict:
         """{grant_s, idle_lock_s, clip_timeout_s} merged over protocol.DEFAULT_SETTINGS, plus
         "old_copy": {"dir", "files": [{"name", "sha256"}], "migrated_at"} once a migration
-        recorded one. Works while locked."""
+        recorded one, and "migration_pending": True between migrate-begin and import-commit.
+        Works while locked."""
         return _ss.load_settings(self._dir)
 
     def save_settings(self, d: dict) -> None:

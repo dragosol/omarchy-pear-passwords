@@ -20,8 +20,10 @@ V1_PASSPHRASE = "TEST passphrase - not a real one"
 
 # What the committed fixture holds (see make_v1_fixture.py): 6 credentials (one pair shares a
 # domain and username), 4 local history values (one of them for an account no longer in the
-# vault), 2 nicknames, 2 aliases, 5 session keys.
-V1_COUNTS = {"credentials": 6, "history": 4, "nicknames": 2, "aliases": 2, "session_keys": 5}
+# vault), 2 nicknames, 2 aliases, 5 session keys. The shared pair becomes one entry, the newer
+# item, with the older one's password as local history (vstore.ids.collapse): so 5 entries
+# and 4 + 1 history values.
+V1_COUNTS = {"credentials": 5, "history": 5, "nicknames": 2, "aliases": 2, "session_keys": 5}
 
 
 def v1_files() -> dict:

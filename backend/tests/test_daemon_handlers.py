@@ -302,12 +302,29 @@ class EditTests(Base):
             self.assertEqual((r["error"], r.get("field")), ("invalid", field), fields)
         self.assertEqual([c for c in self.h.apple.calls if c != "sync"], [])
 
-    async def test_nickname_is_local(self):
+    async def test_nickname_apple_cannot_hold_stays_local(self):
+        await self.ui.call("grant", id="e.0")
+        r = await self.ui.call("set", id="e.0", fields={"nickname": "Home"})
+        self.assertEqual(r["synced"], False)
+        self.assertEqual(self.st.nicknames, {"e.0": "Home"})
+        self.assertIn(("push_set", "e.0", ["nickname"]), self.h.apple.calls)
+
+    async def test_nickname_goes_to_icloud_when_it_can(self):
+        self.h.apple.apple_named.add("e.0")
+        await self.ui.call("grant", id="e.0")
+        r = await self.ui.call("set", id="e.0", fields={"nickname": "Home"})
+        self.assertEqual(r["synced"], True)
+        self.assertEqual(self.st.nicknames, {})
+
+    async def test_nickname_without_icloud_is_local_and_offline(self):
+        self.st.session = {}
         await self.ui.call("grant", id="e.0")
         r = await self.ui.call("set", id="e.0", fields={"nickname": "Home"})
         self.assertEqual(r["synced"], False)
         self.assertEqual(self.st.nicknames, {"e.0": "Home"})
         self.assertNotIn("push_set", str(self.h.apple.calls))
+        r = await self.ui.call("set", id="e.0", fields={"notes": "n"})
+        self.assertEqual(r["error"], "not-signed-in")
 
     async def test_set_needs_a_grant(self):
         self.assertEqual((await self.ui.call("set", id="e.0", fields={"notes": "n"}))["error"],
@@ -328,9 +345,17 @@ class EditTests(Base):
 
     async def test_apple_errors(self):
         await self.ui.call("grant", id="e.0")
+        import requests
+        from icp.daemon.apple import FieldError, NotSignedIn
+        from icp.vstore.seal import SealUnavailable
         cases = [(NeedsLogin("pw"), "needs-login"),
                  (AppleError("refused\x1b[2J by iCloud\n"), "apple"),
                  (ConnectionError("down"), "network"),
+                 (requests.exceptions.SSLError("bad cert"), "network"),
+                 (NotSignedIn("not joined"), "not-signed-in"),
+                 (FieldError("device_passcode"), "invalid"),
+                 (vstore.EntryNotFound("x"), "not-found"),
+                 (SealUnavailable("systemd-creds timed out"), "seal-unavailable"),
                  (NotImplementedError(), "internal")]
         for exc, code in cases:
             def boom(ctx, id, fields, exc=exc):
@@ -340,6 +365,8 @@ class EditTests(Base):
             self.assertEqual(r["error"], code, exc)
             if code == "apple":
                 self.assertEqual(r["detail"], "refused [2J by iCloud")
+            if code == "invalid":
+                self.assertEqual(r["field"], "device_passcode")
         self.assertTrue(self.st.needs_login)
 
     async def test_busy_sync(self):

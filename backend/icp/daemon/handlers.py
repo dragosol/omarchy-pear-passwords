@@ -112,6 +112,11 @@ def _store_error(e: BaseException) -> OpError | None:
         return OpError("not-found")
     if isinstance(e, vstore.SealError):
         return OpError(e.kind)
+    from ..vstore.seal import SealUnavailable
+    if isinstance(e, SealUnavailable):
+        # systemd-creds (or the seal service) could not run at all: says nothing about the
+        # blobs, so it is never reported as a seal state. Try again later.
+        return OpError("seal-unavailable")
     return None
 
 
@@ -134,6 +139,11 @@ def apple_error(e: BaseException) -> OpError:
     if isinstance(e, NeedsLogin):
         return OpError("needs-login")
     from ..errors import AppleError
+    from .apple import FieldError, NotSignedIn
+    if isinstance(e, NotSignedIn):
+        return OpError("not-signed-in")
+    if isinstance(e, FieldError):
+        return OpError("invalid", field=_detail(e.field)[:64])
     try:
         from ..auth.anisette import AnisetteError
         if isinstance(e, AnisetteError):
@@ -142,7 +152,7 @@ def apple_error(e: BaseException) -> OpError:
         pass
     try:
         import requests
-        if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+        if isinstance(e, requests.RequestException):
             return OpError("network")
     except ImportError:                             # pragma: no cover
         pass
@@ -523,9 +533,16 @@ async def op_history(reg, conn, req):
     epoch = s.epoch
     items = await _store(reg, conn.uid, s.store.history, id)
     _still(s, conn, epoch)
-    return {"id": id, "items": [{"date": d, "value": v,
-                                 "source": "apple" if (d, v) in apple else "local"}
-                                for d, v in items]}
+    # The store labels each item (vstore.entries.HistoryItem.source); a store that returns
+    # plain (date, value) tuples falls back to matching the grant's copy of Apple's history.
+    out = []
+    for item in items:
+        d, v = item
+        src = getattr(item, "source", None)
+        if src not in ("apple", "local"):
+            src = "apple" if (d, v) in apple else "local"
+        out.append({"date": d, "value": v, "source": src})
+    return {"id": id, "items": out}
 
 
 async def op_copy(reg, conn, req):
@@ -572,31 +589,43 @@ async def op_set(reg, conn, req):
         raise OpError("busy-sync")
     g, ended = _use_grant(reg, s, id)
     epoch = s.epoch
-    push = {k: v for k, v in clean.items() if k != "nickname"}
+    # A rename goes to iCloud like any other field: apple.push_set writes it to the entry's
+    # details record when it has one (so it reaches every device) and keeps it as a local
+    # nickname otherwise, as 1.x did. Without an iCloud session a rename alone stays local.
+    push = dict(clean)
+    synced = True
     s.busy = "edit"
     try:
-        if "nickname" in clean:
+        signed_in = bool((await _store(reg, conn.uid, s.store.status) or {}).get("signed_in"))
+        if set(clean) == {"nickname"} and not signed_in:
+            push = {}
             names = dict(await _store(reg, conn.uid, s.store.load_nicknames) or {})
             if clean["nickname"]:
                 names[id] = clean["nickname"]
             else:
                 names.pop(id, None)
             await _store(reg, conn.uid, s.store.save_nicknames, names)
+            synced = False
         if push:
             ctx = UserContext(conn.uid, s.store, reg.anisette_url, None)
             await _apple_call(reg, s, reg.apple.push_set, ctx, id, push)
+            if set(clean) == {"nickname"} and clean["nickname"]:
+                # push_set keeps the name locally when Apple had nowhere to put it.
+                names = await _store(reg, conn.uid, s.store.load_nicknames) or {}
+                synced = id not in names
     finally:
         s.busy = None
     if ended:
         reg.end_grant(conn.uid)
-    elif push and s.epoch == epoch and reg.grants.current(conn.uid) is g:
+    elif push and set(push) != {"nickname"} and s.epoch == epoch \
+            and reg.grants.current(conn.uid) is g:
         # The grant stays on this entry; its buffer now holds what iCloud has.
         fresh = await _store(reg, conn.uid, s.store.open_entry, id)
         if reg.grants.current(conn.uid) is g and s.epoch == epoch:
             fresh, g.secrets = g.secrets, fresh
         wipe_secrets(fresh)
     _notify_list_after(reg, s)
-    return {"id": id, "synced": bool(push)}
+    return {"id": id, "synced": synced}
 
 
 async def op_create(reg, conn, req):

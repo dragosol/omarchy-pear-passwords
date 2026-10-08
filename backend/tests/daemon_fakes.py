@@ -258,6 +258,7 @@ class FakeApple:
         self.calls: list[str] = []
         self.sync_error = None
         self.login_script = None           # fn(ctx) run by login
+        self.apple_named: set = set()      # ids whose rename Apple can hold (a details record)
 
     def sync(self, ctx):
         self.calls.append("sync")
@@ -276,8 +277,16 @@ class FakeApple:
 
     def push_set(self, ctx, id, fields):
         self.calls.append(("push_set", id, sorted(fields)))
+        if not ctx.store.session:
+            from icp.daemon.apple import NotSignedIn
+            raise NotSignedIn("not signed in to iCloud")
         if "password" in fields:
             ctx.store.secrets[id] = replace(ctx.store.secrets[id], password=fields["password"])
+        if "nickname" in fields:           # apple.push_set's rule: iCloud if it can, else local
+            if id in self.apple_named or not fields["nickname"]:
+                ctx.store.nicknames.pop(id, None)
+            else:
+                ctx.store.nicknames[id] = fields["nickname"]
 
     def create(self, ctx, fields):
         self.calls.append(("create", sorted(fields)))

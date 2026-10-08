@@ -141,11 +141,13 @@ class ImportTests(StoreCase):
         self.assertEqual(s.open_entry(bank.id).notes, "PIN hint: TEST only")
         self.assertEqual([v for _, v in s.history(bank.id)], ["bank-TEST-old"])
 
-        shop = sorted((m for m in got.values() if m.domain == "shop.example.test"),
-                      key=lambda m: m.id)
+        shop = [m for m in got.values() if m.domain == "shop.example.test"]
         base = ids.entry_id("shop.example.test", "sam")
-        self.assertEqual([m.id for m in shop], [base, base + ".2"])
-        self.assertEqual(s.open_entry(base + ".2").password, "shop-TEST-pw-b")
+        self.assertEqual([m.id for m in shop], [base])
+        self.assertEqual(shop[0].title, "Shop (second item)")             # the newer item
+        self.assertEqual(s.open_entry(base).password, "shop-TEST-pw-b")
+        self.assertEqual([(v, h.source) for v, h in ((h[1], h) for h in s.history(base))],
+                         [("shop-TEST-pw-a", "local")])
 
         self.assertEqual(s.load_session()["dsid"], "0000TEST")
         self.assertEqual(len(s.load_session()), 5)
@@ -174,8 +176,27 @@ class ImportTests(StoreCase):
                  for c in legacy.read(self.files, v1_key()).credentials]
         before = self.s.unseal_count
         counts = vault_store.save_vault(self.s, CredentialStore(creds))
-        self.assertEqual(counts, {"added": 0, "changed": 0, "deleted": 0, "unchanged": 6})
+        self.assertEqual(counts, {"added": 0, "changed": 0, "deleted": 0, "unchanged": 5})
         self.assertEqual(self.s.unseal_count, before)
+
+    def test_first_apple_sync_after_import_changes_nothing(self):
+        """The same, through the code a real sync runs (icp.octagon.items, as daemon.apple
+        calls it): no entry is added, re-sealed or tombstoned, so nicknames and history stay."""
+        from icp.octagon import items as oct_items
+        from icp.vault.host import Credential
+        self.s.import_v1(self.files, v1_key())
+        before_meta = {m.id: m for m in self.s.list_meta()}
+        creds = [Credential(**{k: v for k, v in c.items() if k != "totp"},
+                            totp=c.get("totp"))
+                 for c in legacy.read(self.files, v1_key()).credentials]
+        sync = oct_items.to_sync_items(creds, self.s.load_nicknames())
+        self.assertEqual(sorted(i.id for i in sync), sorted(before_meta))
+        before = self.s.unseal_count
+        counts = self.s.apply_sync(sync, set(before_meta) - {i.id for i in sync})
+        self.assertEqual(counts, {"added": 0, "changed": 0, "deleted": 0, "unchanged": 5})
+        self.assertEqual(self.s.unseal_count, before)
+        after = {m.id: m for m in self.s.list_meta()}
+        self.assertEqual(after, before_meta)
 
     def test_wrong_key_changes_nothing(self):
         wrong = vstore.v1_key_from_passphrase(self.files["kdf.json"], "not it")
@@ -235,7 +256,7 @@ class ImportTests(StoreCase):
     def test_optional_files_may_be_absent(self):
         minimal = {k: self.files[k] for k in ("vault.enc", "kdf.json", "check.enc")}
         res = self.s.import_v1(minimal, v1_key())
-        self.assertEqual(res["counts"], {"credentials": 6, "history": 0, "nicknames": 0,
+        self.assertEqual(res["counts"], {"credentials": 5, "history": 1, "nicknames": 0,
                                          "aliases": 0, "session_keys": 0})
         self.assertFalse(self.s.status()["signed_in"])
 

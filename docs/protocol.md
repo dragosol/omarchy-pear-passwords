@@ -660,6 +660,7 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
 | `tpm-missing` | see section 4.1 |
 | `tpm-cleared` | see section 4.1 |
 | `damaged` | see section 4.1 |
+| `seal-unavailable` | `systemd-creds` (or the G1 seal service) could not run at all; transient, never a seal state; try again |
 | `dismissed` | the user closed the dialog |
 | `denied` | polkit refused (wrong password, failed fingerprint, policy) |
 | `no-agent` | no polkit agent; not counted against the rate limit |

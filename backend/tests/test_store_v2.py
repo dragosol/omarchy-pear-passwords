@@ -130,10 +130,20 @@ class IdTests(unittest.TestCase):
         self.assertTrue(ids.valid_id(a))
         self.assertLessEqual(len(a), 128)
 
-    def test_duplicates_get_suffixes_in_order(self):
-        got = ids.assign_ids([("a", "x"), ("b", "y"), ("a", "x"), ("a", "x")])
+    def test_duplicates_collapse_to_the_newest(self):
+        rows = [("a", "x", 1.0, "first"), ("b", "y", 1.0, "b"), ("a", "x", 3.0, "newest"),
+                ("a", "x", 2.0, "middle"), ("a", "x", 3.0, "tie")]
+        kept, dropped = ids.collapse(rows, key=lambda r: ids.entry_id(r[0], r[1]),
+                                     mdat=lambda r: r[2])
         base = ids.entry_id("a", "x")
-        self.assertEqual(got, [base, ids.entry_id("b", "y"), base + ".2", base + ".3"])
+        self.assertEqual(list(kept), [base, ids.entry_id("b", "y")])     # first-seen order
+        self.assertEqual(kept[base][3], "newest")                       # a tie keeps the first
+        self.assertEqual(sorted(r[3] for _, r in dropped), ["first", "middle", "tie"])
+
+    def test_the_pair_is_not_joined_with_a_separator(self):
+        # Hashing "a\x1fb" + "c" and "a" + "b\x1fc" the 1.x way would give one id for two.
+        self.assertNotEqual(ids.entry_id("a\x1fb", "c"), ids.entry_id("a", "b\x1fc"))
+        self.assertNotEqual(ids.entry_id("a,", "b"), ids.entry_id("a", ",b"))
 
     def test_path_shaped_ids_are_refused(self):
         for bad in ("", ".", "..", ".hidden", "a/b", "../x", "a" * 129, "a\x00", "é", None, 5):
@@ -376,6 +386,19 @@ class SettingsTests(StoreCase):
         del settings["old_copy"]
         s.save_settings(settings)
         self.assertNotIn("old_copy", s.load_settings())
+
+    def test_migration_pending_round_trip(self):
+        # The daemon marks a migrate-begin that has not committed, so a retry after a lock,
+        # a crash or a mismatch starts over instead of finding a non-empty store forever.
+        s = vstore.UserStore.open(UID)
+        s.save_settings({**s.load_settings(), "migration_pending": True})
+        self.assertIs(s.load_settings()["migration_pending"], True)
+        settings = s.load_settings()
+        del settings["migration_pending"]
+        s.save_settings(settings)
+        self.assertNotIn("migration_pending", s.load_settings())
+        s.save_settings({**s.load_settings(), "migration_pending": "yes"})   # only True counts
+        self.assertNotIn("migration_pending", s.load_settings())
 
     def test_garbage_state_file_gives_defaults_and_is_kept(self):
         s = vstore.UserStore.open(UID)

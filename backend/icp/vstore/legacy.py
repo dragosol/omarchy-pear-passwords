@@ -40,7 +40,7 @@ from . import ImportMismatch, Meta, Secrets
 from . import entries as _entries
 from . import format as fmt
 from . import meta as _meta
-from .ids import assign_ids, entry_id
+from .ids import collapse, entry_id
 
 KEY_BYTES = nacl.secret.SecretBox.KEY_SIZE
 CHECK_PLAINTEXT = b"icp-lockbox-v1"
@@ -231,13 +231,25 @@ def to_canonical(v1: V1Vault) -> dict:
          "nicknames": {id: name}, "aliases": [...], "session": {...}, "device": {...}}
 
     History for an account that is no longer in the vault is kept on a tombstoned entry, so
-    nothing 1.x remembered is dropped; it reappears if the account comes back."""
+    nothing 1.x remembered is dropped; it reappears if the account comes back.
+
+    1.x could list one (domain, username) twice. 2.0 keeps one entry per pair, as a sync does
+    (ids.collapse: the newest wins), and files each older item's different password into
+    that entry's history with the item's own date."""
     parts = [credential_parts(c) for c in v1.credentials]
-    ids = assign_ids((m.domain, m.username) for m, _ in parts)
+    kept, dropped = collapse(parts, key=lambda p: entry_id(p[0].domain, p[0].username),
+                             mdat=lambda p: p[0].mdat)
     out_entries: dict = {}
-    for id, (m, s) in zip(ids, parts):
+    for id, (m, s) in kept.items():
         out_entries[id] = {"meta": _meta.fields_from(m), "secrets": canonical_secrets(s),
                            "deleted": False, "history": []}
+    for id, (m, s) in dropped:
+        current = kept[id][1].password
+        hist = out_entries[id]["history"]
+        if s.password and s.password != current and s.password not in (h[2] for h in hist):
+            hist.append([m.mdat, SOURCE_LOCAL, s.password])
+            hist.sort(key=lambda h: h[0])
+            del hist[:-_entries.MAX_HISTORY]
 
     for account, items in v1.history.items():
         if not isinstance(account, str) or not isinstance(items, list):
@@ -248,15 +260,15 @@ def to_canonical(v1: V1Vault) -> dict:
                 if isinstance(e, dict) and isinstance(e.get("old"), str)]
         if not hist:
             continue
-        hist.sort(key=lambda h: h[0])                       # 1.x kept newest first
-        hist = hist[-_entries.MAX_HISTORY:]
         if id not in out_entries:
             stub = Meta(id=id, title="", domain=domain, sites=[], username=username,
                         nickname="", has_totp=False, has_notes=False, mdat=0.0,
                         history_count=0)
             out_entries[id] = {"meta": _meta.fields_from(stub), "secrets": None,
                                "deleted": True, "history": []}
-        out_entries[id]["history"] = hist
+        hist = out_entries[id]["history"] + hist
+        hist.sort(key=lambda h: h[0])                       # 1.x kept newest first
+        out_entries[id]["history"] = hist[-_entries.MAX_HISTORY:]
 
     nicknames = {}
     for account, name in v1.nicknames.items():

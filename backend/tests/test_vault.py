@@ -49,9 +49,12 @@ class VaultAdapterTests(StoreCase):
         self.assertEqual([c.domain for c in vault.load_vault(self.s).all()], ["b.test"])
         self.assertEqual(self.s.unseal_count, 0)
 
-    def test_duplicate_accounts_get_distinct_ids(self):
-        items = vault.sync_items([Credential("a.test", "u", "1"), Credential("a.test", "u", "2")])
-        self.assertEqual(items[1].id, items[0].id + ".2")
+    def test_duplicate_accounts_collapse_to_the_newest(self):
+        items = vault.sync_items([Credential("a.test", "u", "1", mdat=5.0),
+                                  Credential("a.test", "u", "2", mdat=9.0),
+                                  Credential("b.test", "u", "3")])
+        self.assertEqual([i.meta.domain for i in items], ["a.test", "b.test"])
+        self.assertEqual(items[0].secrets.password, "2")
         self.assertEqual([i.meta.id for i in items], [i.id for i in items])
 
     def test_history_adapter(self):

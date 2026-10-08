@@ -853,6 +853,7 @@ ShellRoot {
         case "network": return "iCloud couldn't be reached";
         case "apple": return "iCloud refused it" + (d.detail ? ": " + d.detail : "");
         case "busy-sync": return "a sync is running — try again in a moment";
+        case "seal-unavailable": return "the system key service didn't answer — try again in a moment";
         case "invalid": return "that " + (d.field || "value") + " isn't valid";
         case "dismissed": case "cancelled": return "cancelled";
         case "denied": return "not approved";
