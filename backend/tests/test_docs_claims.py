@@ -127,8 +127,7 @@ class ClaimsHaveTestsTests(unittest.TestCase):
         planned = self._check([c or b for c, b in zip(claims, bullets)], "README")
         for c, b in zip(claims, bullets):
             self.assertTrue(c, f"README bullet has no <!-- tests: --> marker: {b[:60]}")
-        if planned:
-            self.skipTest(f"named, not on this branch yet: {sorted(planned)}")
+        self.assertEqual(sorted(planned), [], "README names tests that do not exist")
 
     def test_security_md_claims(self):
         doc = _read("docs", "security.md")
@@ -148,8 +147,7 @@ class ClaimsHaveTestsTests(unittest.TestCase):
         for c in claims:
             self.assertIn("Tests:", c, f"security.md claim without Tests: {c[:70]}")
         planned = self._check(claims, "security.md")
-        if planned:
-            self.skipTest(f"named, not on this branch yet: {sorted(planned)}")
+        self.assertEqual(sorted(planned), [], "security.md names tests that do not exist")
 
 
 class OwnerDecisionsInDocsTests(unittest.TestCase):

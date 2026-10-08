@@ -78,8 +78,7 @@ class PolicyReadmeSyncTests(unittest.TestCase):
             self.assertIn(words, rows[action], f"README does not say {op} raises {action}")
 
     def test_policy_messages_match_readme(self):
-        if not os.path.exists(POLICY):
-            self.skipTest("polkit/io.github.dragosol.pearpasswords.policy is WP1's, not on this branch")
+        self.assertTrue(os.path.exists(POLICY), POLICY)
         root = ET.fromstring(_read("polkit", f"{paths.POLKIT_ACTION_PREFIX}.policy"))
         policy = {a.get("id"): (a.findtext("message") or "").strip() for a in root.findall("action")}
         self.assertEqual(policy, readme_actions())

@@ -411,12 +411,31 @@ class InstallRootTests(unittest.TestCase):
     def test_every_repo_revision_of_the_legacy_policy_is_released(self):
         self.assertEqual(sha(LEGACY_RELEASED_SAMPLE),
                          "e52090fecadf25f26061ecd08b7cae0f2aa5c870cffcb91afd92038e5aa050cf")
-        if not os.path.exists(LEGACY_SRC):
-            self.skipTest("polkit/org.icp.unlock.policy is gone from the tree (WP1 deletes it)")
-        with open(LEGACY_SRC, "rb") as f:
-            digest = sha(f.read())
-        proc = self.h.files_sh(f'pp_released "{LEGACY}" "{digest}" && echo yes')
-        self.assertEqual(proc.stdout.strip(), "yes", proc.stderr)
+        # 2.0 deletes polkit/org.icp.unlock.policy, so every revision is read from git
+        # history instead; a checkout without history falls back to the working tree.
+        blobs = []
+        try:
+            revs = subprocess.run(
+                ["git", "-C", ROOT, "log", "--all", "--format=%H", "--",
+                 "polkit/org.icp.unlock.policy"],
+                capture_output=True, text=True, check=True).stdout.split()
+            for rev in revs:
+                show = subprocess.run(["git", "-C", ROOT, "show",
+                                       f"{rev}:polkit/org.icp.unlock.policy"],
+                                      capture_output=True)
+                if show.returncode == 0 and show.stdout:  # absent in the deleting commit
+                    blobs.append(show.stdout)
+        except (OSError, subprocess.CalledProcessError):
+            pass
+        if not blobs and os.path.exists(LEGACY_SRC):
+            with open(LEGACY_SRC, "rb") as f:
+                blobs.append(f.read())
+        if not blobs:
+            self.skipTest("no revision of polkit/org.icp.unlock.policy is reachable")
+        for blob in blobs:
+            digest = sha(blob)
+            proc = self.h.files_sh(f'pp_released "{LEGACY}" "{digest}" && echo yes')
+            self.assertEqual(proc.stdout.strip(), "yes", f"{digest} {proc.stderr}")
 
     # --- ours(), directly -------------------------------------------------------------------
     def test_ours_rule(self):

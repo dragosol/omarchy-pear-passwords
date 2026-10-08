@@ -365,9 +365,7 @@ class BackgroundNeverPromptsTests(GuardCase):
         present = [f for f in self.FILES if os.path.exists(os.path.join(ROOT, f))]
         self.assertIn("backend/icp/daemon/apple.py", present)
         self.check(("polkit", "AllowUserInteraction"), present)
-        missing = sorted(set(self.FILES) - set(present))
-        if missing:
-            self.skipTest(f"not yet on this branch (WP1): {missing}")
+        self.assertEqual(sorted(set(self.FILES) - set(present)), [])
 
     def test_imports_by_ast(self):
         for rel in self.FILES:
@@ -416,8 +414,6 @@ class PolicyGuardTests(unittest.TestCase):
     POLICY = os.path.join(ROOT, "polkit", "io.github.dragosol.pearpasswords.policy")
 
     def setUp(self):
-        if not os.path.exists(self.POLICY):
-            self.skipTest("polkit/io.github.dragosol.pearpasswords.policy is WP1's, not on this branch")
         with open(self.POLICY, encoding="utf-8") as f:
             self.text = f.read()
 

@@ -4111,7 +4111,7 @@ ShellRoot {
         case "connecting": return "Connecting…";
         case "not-installed":
             return "Pear Passwords 2 keeps your passwords in a small system service, which needs a one-time "
-                 + "step with sudo. Run ./install.sh from the plugin folder, then paste the command it prints.";
+                 + "step as an administrator. Run ./install.sh from the plugin folder, then paste the command it prints.";
         case "launcher":
             return "This window was started directly, so it can't prove it's the real app. Close it and "
                  + "open Pear Passwords from the app launcher.";

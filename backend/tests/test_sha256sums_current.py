@@ -108,8 +108,7 @@ class Sha256SumsTests(unittest.TestCase):
             self.assertIn(needed, self.listed)
 
     def test_stage_has_every_source_the_root_step_installs(self):
-        """What system/lib/files.sh's table reads from the stage. Most of these are other
-        packages' files; until they are on the branch the check is reported, not failed."""
+        """What system/lib/files.sh's table reads from the stage."""
         from icp.daemon import paths
         needed = ["native/pear-exec.c", "app/fonts.conf", f"app/{paths.APP_ID}.desktop",
                   f"polkit/{paths.POLKIT_ACTION_PREFIX}.policy",
@@ -118,8 +117,7 @@ class Sha256SumsTests(unittest.TestCase):
                   "system/libexec/pear-passwordsd", "system/libexec/pear-autofill-host",
                   "system/bin/pear-passwords-autofill"]
         missing = [p for p in needed if p not in self.listed]
-        if missing:
-            self.skipTest(f"not yet on this branch: {missing}")
+        self.assertEqual(missing, [], "the root step reads these from the stage")
 
     def test_readme_pins_this_hash(self):
         with open(SUMS, "rb") as f:
