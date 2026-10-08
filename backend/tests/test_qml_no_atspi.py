@@ -30,11 +30,13 @@ SECRET_FIELDS = ("edArea", "edSetup", "crSetup", "crNotes", "newPw", "crPass", "
 # Labels that show a secret once revealed: the detail rows (password, TOTP code, notes) and
 # the password history.
 SECRET_LABELS = ("fieldValue", "historyValue")
-# Inputs that never hold a secret: the search box, a nickname, a new entry's name, site and
-# username, and read-only shell commands to copy (one has no id). Only the session-bus layer
-# keeps these off AT-SPI, which is enough: they hold nothing the unlocked list does not show.
-NOT_SECRET = ("search", "nickField", "crName", "crSite", "crUser", "cmdText", "regText",
-              "setReg", None)
+# Inputs that never hold a secret: the search box (catSearch is its root inside
+# CategorySearch.qml), a nickname, a new entry's name, site and username, a tag being typed
+# (tags are list metadata), and read-only shell commands to copy (one has no id). Only the
+# session-bus layer keeps these off AT-SPI, which is enough: they hold nothing the unlocked
+# list does not show.
+NOT_SECRET = ("search", "catSearch", "nickField", "crName", "crSite", "crUser", "tagInput",
+              "cmdText", "regText", "setReg", None)
 
 
 def element_of(ident: str) -> str:
@@ -78,18 +80,27 @@ class SecretItemsAreIgnoredTests(unittest.TestCase):
         self.assertNotRegex(CODE, r"\bAccessible\.ignored:\s*(false|!)")
 
     def test_every_text_input_in_the_window_is_a_known_secret_field_or_ignored(self):
-        # A new field that can hold a secret must join the list (or be marked ignored).
-        for m in re.finditer(r"^\s*(?:O\.)?(TextField|TextArea|TextInput|TextEdit)\s*\{",
-                             CODE, re.M):
-            body = qmlscan.element_body(CODE, CODE.index("{", m.start()))
-            props = own_properties(body)
-            idm = re.search(r"\bid:\s*(\w+)", props)
-            if re.search(r"\bAccessible\.ignored:\s*true\b", props):
-                continue
-            if (idm.group(1) if idm else None) in NOT_SECRET:
-                continue
-            self.fail(f"{m.group(1)} {idm.group(1) if idm else '(no id)'} is on the "
-                      "accessibility tree; mark it Accessible.ignored or say why not")
+        # A new field that can hold a secret must join the list (or be marked ignored). Every
+        # QML file of the window, not only shell.qml.
+        found = 0
+        for path in qmlscan.app_files((".qml",)):
+            code = qmlscan.strip_comments(qmlscan.read(path))
+            for m in re.finditer(r"^\s*(?:O\.)?(TextField|TextArea|TextInput|TextEdit)\s*\{",
+                                 code, re.M):
+                found += 1
+                self.check_input(code, m)
+        self.assertGreater(found, 15)
+
+    def check_input(self, code, m):
+        body = qmlscan.element_body(code, code.index("{", m.start()))
+        props = own_properties(body)
+        idm = re.search(r"\bid:\s*(\w+)", props)
+        if re.search(r"\bAccessible\.ignored:\s*true\b", props):
+            return
+        if (idm.group(1) if idm else None) in NOT_SECRET:
+            return
+        self.fail(f"{m.group(1)} {idm.group(1) if idm else '(no id)'} is on the "
+                  "accessibility tree; mark it Accessible.ignored or say why not")
 
 
 class NoSessionBusTests(unittest.TestCase):
