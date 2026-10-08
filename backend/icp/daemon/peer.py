@@ -11,7 +11,9 @@ connection the filesystem should never have let through.
 3. /proc/<pid>/status: real gid is the user's own, effective gid is pear-client (the set-gid
    exec of pear-exec and nothing else produces that pair), and real = effective uid.
    /proc/<pid>/stat gives the start time for PPid binding and the polkit fallback subject.
-   Last, a signal 0 down the pidfd proves the pid read from /proc was still that process.
+   Last, the pidfd is polled: a pidfd turns readable when its process exits, so a pidfd that
+   is not readable proves the pid read from /proc was still that process. (Not a signal 0:
+   the peer is another uid's process, and signalling it from uid pear-passwords is EPERM.)
 
 Nothing here trusts a value the client sent; a client sends nothing until all of it passed.
 """
@@ -20,7 +22,7 @@ from __future__ import annotations
 
 import os
 import pwd
-import signal
+import select
 import socket
 import struct
 from dataclasses import dataclass
@@ -156,10 +158,8 @@ def verify(sock, *, client_gid: int,
         fd_pid = _pidfd_pid(pidfd, self_proc)
         if fd_pid is not None and fd_pid != pid:
             raise PeerError("pidfd no longer refers to the peer")
-        try:
-            signal.pidfd_send_signal(pidfd, 0)
-        except OSError as e:
-            raise PeerError(f"peer exited during checks: {e}") from None
+        if not alive(pidfd):
+            raise PeerError("peer exited during checks")
         return PeerInfo(pid=pid, uid=uid, gid=gid, pidfd=pidfd, start_time=start_time,
                         ppid=status["PPid"])
     except BaseException:
@@ -168,8 +168,18 @@ def verify(sock, *, client_gid: int,
 
 
 def alive(pidfd: int) -> bool:
+    """True while the process behind the pidfd has not exited.
+
+    A pidfd polls readable once its process exits. Signal 0 is not used: every peer runs as
+    another uid, so pidfd_send_signal() answers EPERM for a live process, and only ESRCH
+    means gone."""
     try:
-        signal.pidfd_send_signal(pidfd, 0)
-        return True
-    except OSError:
+        p = select.poll()
+        p.register(pidfd, select.POLLIN)
+        events = p.poll(0)
+    except (OSError, ValueError):
         return False
+    for _, ev in events:
+        if ev & (select.POLLIN | select.POLLHUP | select.POLLERR | select.POLLNVAL):
+            return False
+    return True

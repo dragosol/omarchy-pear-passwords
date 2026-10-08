@@ -149,6 +149,36 @@ class VerifyTests(unittest.TestCase):
         with self.assertRaises(peer.PeerError):
             self.verify(user_gid_of=missing)
 
+    def test_peer_of_another_uid_is_alive_despite_eperm(self):
+        # Gate bug 1: every real client is another uid's process, and pidfd_send_signal(pidfd, 0)
+        # from uid pear-passwords answers EPERM for it. That must not read as "exited".
+        import signal as _signal
+        from unittest import mock
+        self.write("status", _status(os.getuid(), USER_GID, self.client_gid))
+
+        def eperm(fd, sig, *a):
+            raise PermissionError(1, "Operation not permitted")
+        with mock.patch.object(_signal, "pidfd_send_signal", eperm):
+            info = self.verify()
+            try:
+                self.assertTrue(peer.alive(info.pidfd))
+            finally:
+                os.close(info.pidfd)
+
+
+class AliveTests(unittest.TestCase):
+    def test_exited_process_is_not_alive(self):
+        import subprocess
+        child = subprocess.Popen(["/bin/sleep", "30"])
+        fd = os.pidfd_open(child.pid)
+        try:
+            self.assertTrue(peer.alive(fd))
+            child.kill()
+            child.wait()
+            self.assertFalse(peer.alive(fd))
+        finally:
+            os.close(fd)
+
 
 if __name__ == "__main__":
     unittest.main()
