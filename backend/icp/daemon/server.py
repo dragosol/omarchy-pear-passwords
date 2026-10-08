@@ -20,6 +20,7 @@ import contextvars
 import json
 import logging
 import os
+import sys
 from typing import Callable
 
 from . import handlers as _handlers
@@ -148,8 +149,12 @@ class Server:
     async def start(self, sock):
         # The stream limit makes readuntil() refuse a line longer than MAX_REQUEST_LINE before
         # buffering much more than that; _read_line checks the exact boundary.
+        # cleanup_socket=False: the socket file is systemd's (socket activation, in a root-owned
+        # /run/pear-passwords). Python 3.13+ would otherwise unlink it when the server closes,
+        # which fails with EACCES there and would break activation if it ever succeeded.
+        kw = {"cleanup_socket": False} if sys.version_info >= (3, 13) else {}
         return await asyncio.start_unix_server(self.handle_client, sock=sock,
-                                               limit=protocol.MAX_REQUEST_LINE)
+                                               limit=protocol.MAX_REQUEST_LINE, **kw)
 
     async def handle_client(self, reader, writer) -> None:
         sock = writer.get_extra_info("socket")

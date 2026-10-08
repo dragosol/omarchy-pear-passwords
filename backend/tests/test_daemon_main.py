@@ -67,3 +67,23 @@ class StartupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServerSocketTests(unittest.TestCase):
+    def test_closing_the_server_leaves_systemds_socket_file(self):
+        # Gate bug 4: on Python 3.13+ start_unix_server(sock=...) unlinks the path on close.
+        # The file is systemd's (socket activation); the daemon must never remove it.
+        import asyncio
+        from icp.daemon.server import Server
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "client.sock")
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(path)
+            sock.listen()
+
+            async def run():
+                srv = await Server(object(), verify_peer=lambda s: None).start(sock)
+                srv.close()
+                await srv.wait_closed()
+            asyncio.run(run())
+            self.assertTrue(os.path.exists(path), "the server unlinked the activation socket")
