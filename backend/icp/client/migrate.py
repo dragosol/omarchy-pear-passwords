@@ -17,9 +17,11 @@ import
        collection. 1.x's default vault (no passphrase) is keyed by exactly that item. The
        daemon checks every candidate against check.enc, or against vault.enc itself when
        there is no check.enc;
-     - a keyring vault whose keyring is locked: the window says "Unlock your login keyring"
-       and, on that click, the keyring's own unlock dialog is asked for (the desktop's
-       standard prompt, not Pear's);
+     - a keyring vault whose keyring is locked: the window says the keyring is locked and to
+       unlock it the way the user usually does, and offers "Check again", which only reads
+       again. Pear never asks the keyring to unlock (no Service.Unlock, no Prompt): that
+       would be a second password dialog, and the one-time old passphrase in the window is
+       the only password Pear asks for besides polkit;
      - a passphrase vault with neither: the window asks for the old passphrase, once (the one
        in-window exception); it goes to the daemon in memory, which runs Argon2id itself.
   3. import-commit. Only after the daemon has verified the converted store against counts and
@@ -257,14 +259,13 @@ class SecretServiceKeyring:
     reads DBUS_SESSION_BUS_ADDRESS itself; pear-exec has checked it is the user's own bus).
 
     keys() never unlocks anything and never shows a prompt: it reads only unlocked items, and
-    reports whether locked ones exist. unlock() is called only after the user clicked "Unlock
-    your login keyring" in the window: it asks the keyring for its own unlock dialog
-    (Service.Unlock, then Prompt.Prompt) and waits for the answer. The service is never
-    started by us: if it is not running there is simply no key."""
+    reports whether locked ones exist. There is deliberately no unlock: Service.Unlock would
+    put up the keyring's own password dialog, a password prompt outside the window that Pear
+    started (requirement 2 allows only polkit and the one-time old passphrase). The service
+    is never started by us: if it is not running there is simply no key."""
 
-    def __init__(self, open_bus=None, prompt_timeout: float = 300.0):
+    def __init__(self, open_bus=None):
         self._open_bus = open_bus
-        self.prompt_timeout = prompt_timeout
 
     def _connect(self):
         if self._open_bus is not None:
@@ -337,44 +338,6 @@ class SecretServiceKeyring:
                 conn.close()
             except Exception:
                 pass
-
-    def unlock(self) -> bool:
-        """Ask the keyring to unlock the locked 1.x items with its own dialog. True when the
-        user unlocked it (or nothing was locked)."""
-        try:
-            conn = self._connect()
-        except Exception:
-            return False
-        try:
-            if not self._running(conn):
-                return False
-            _, locked = self._search(conn)
-            if not locked:
-                return True
-            _, prompt = self._call(conn, "/org/freedesktop/secrets",
-                                   "org.freedesktop.Secret.Service", "Unlock", "ao", (locked,))
-            if prompt in ("/", "", None):
-                return True
-            return self._prompt(conn, prompt)
-        except Exception:
-            return False
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _prompt(self, conn, prompt: str) -> bool:
-        from jeepney import MatchRule
-        from jeepney.bus_messages import message_bus
-        rule = MatchRule(type="signal", interface="org.freedesktop.Secret.Prompt",
-                         member="Completed", path=prompt)
-        conn.send_and_get_reply(message_bus.AddMatch(rule), timeout=10)
-        with conn.filter(rule) as queue:
-            self._call(conn, prompt, "org.freedesktop.Secret.Prompt", "Prompt", "s", ("",))
-            msg = conn.recv_until_filtered(queue, timeout=self.prompt_timeout)
-        dismissed = bool(msg.body[0]) if msg.body else True
-        return not dismissed
 
 
 def _try_keyring(daemon: "Channel", keyring) -> tuple[bool, bool]:
@@ -714,16 +677,17 @@ def do_import(daemon: Channel, stdin, out: Out, home: str, runtime: str,
         # 1.x's default vault: its key is only in the login keyring. No passphrase exists.
         if not locked:
             raise MigrateError("no-key", "the 1.x vault's key is not in your login keyring")
-        out(need="keyring-unlock", retry=asked)
+        # Locked: the user unlocks it the way they usually do, outside Pear, and clicks
+        # "Check again". Nothing here asks the keyring to unlock or shows a prompt.
+        out(need="keyring-locked", retry=asked)
         try:
             line = stdin_line(stdin)
             msg = json.loads(line) if line is not None else {"cancel": True}
         except ValueError:
             msg = {"cancel": True}
-        if not isinstance(msg, dict) or msg.get("unlock_keyring") is not True:
+        if not isinstance(msg, dict) or msg.get("check_keyring") is not True:
             return 4                      # the window cancelled; nothing has changed
         asked = True
-        keyring.unlock()                  # the keyring's own dialog, after the user's click
         accepted, locked = _try_keyring(daemon, keyring)
     retry = False
     while not accepted:

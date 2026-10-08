@@ -107,7 +107,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "4f7185479ac804cf51029b3390d6c5bbc8f3548f11a1f11197fee6443aa31be6  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "2b7a85207e91c93b0a5e7a005a0a309cb3cf69a409d91452492a6089797a9509  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -190,11 +190,13 @@ history and nicknames, and it does not sign this computer in again.
 > **If 1.x never asked you for a passphrase**, its key is in your login keyring (1.x's
 > default). There is then nothing to type: Pear reads the key from the keyring (the item
 > 1.x saved, `application=icp`), checks it against the vault itself, and moves it. If the
-> keyring is locked, the window says **Unlock your login keyring**; clicking **Unlock
-> keyring** brings up the keyring's own unlock dialog (the desktop's, not Pear's). If the
-> key is not in the keyring at all, the window says so and nothing changes; **Start fresh
-> instead** signs this computer in to iCloud again, without the 1.x history and nicknames,
-> and leaves `~/.config/icp` where it is. No terminal step either way.
+> keyring is locked, the window says **Your login keyring is locked**: unlock it the way you
+> usually do (for example in Passwords and Keys), then click **Check again**. Pear never asks
+> for the keyring's password itself; besides the polkit dialog, the old 1.x passphrase below
+> is the only password Pear ever asks for. If the key is not in the keyring at all, the
+> window says so and nothing changes; **Start fresh instead** signs this computer in to
+> iCloud again, without the 1.x history and nicknames, and leaves `~/.config/icp` where it
+> is. No terminal step either way.
 
 > **For the smoothest move, open and unlock Pear Passwords 1.3.2 within 15 minutes before this
 > step.** 2.0 then asks 1.3.2's background agent for the key, and you type nothing.

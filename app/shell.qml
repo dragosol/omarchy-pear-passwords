@@ -1139,9 +1139,10 @@ ShellRoot {
     function onMigrateLine(m) {
         if (!m) return;
         if (m.stage) { root.migrateStage = m.stage; root.migrateStep = "running"; return; }
-        if (m.need === "keyring-unlock") {
-            // A keyring-keyed 1.x vault and a locked login keyring: the keyring's own unlock
-            // dialog is asked for only when the user clicks "Unlock keyring" here.
+        if (m.need === "keyring-locked") {
+            // A keyring-keyed 1.x vault and a locked login keyring. Pear never asks the
+            // keyring to unlock (that would be a second password dialog): the user unlocks it
+            // the usual way and clicks "Check again", which only reads again.
             root.migrateRetry = !!m.retry;
             root.migrateStep = "keyring";
             return;
@@ -1179,8 +1180,8 @@ ShellRoot {
         root.migrateStep = "running";
     }
 
-    function migrateUnlockKeyring() {
-        migrateProc.write(JSON.stringify({ unlock_keyring: true }) + "\n");
+    function migrateCheckKeyring() {
+        migrateProc.write(JSON.stringify({ check_keyring: true }) + "\n");
         root.migrateStep = "running";
         root.migrateStage = "keyring";
     }
@@ -3862,7 +3863,7 @@ ShellRoot {
                         Layout.fillWidth: true
                         text: root.migrateStep === "running" ? "Moving your passwords…"
                             : root.migrateStep === "passphrase" ? "Your old Pear Passwords passphrase"
-                            : root.migrateStep === "keyring" ? "Unlock your login keyring"
+                            : root.migrateStep === "keyring" ? "Your login keyring is locked"
                             : root.migrateStep === "done" ? "Your passwords are here"
                             : root.migrateStep === "error" ? "The move didn't finish"
                             : "Move your passwords into Pear Passwords 2"
@@ -3897,7 +3898,7 @@ ShellRoot {
                             Layout.fillWidth: true
                             text: root.v1KeyringOnly
                                 ? "Your 1.x vault's key is in your login keyring, so there's no passphrase to type: Pear "
-                                  + "reads it from the keyring. If the keyring is locked, you'll be asked to unlock it."
+                                  + "reads it from the keyring, which needs to be unlocked."
                                 : "For the smoothest move, open and unlock Pear Passwords 1.3.2 within 15 minutes "
                                   + "before this step. Otherwise you'll be asked for your old passphrase, this one last time."
                             color: Theme.fg
@@ -4008,8 +4009,9 @@ ShellRoot {
                         Layout.topMargin: 12
                         visible: root.migrateStep === "keyring"
                         text: (root.migrateRetry ? "The keyring is still locked. " : "")
-                            + "Your 1.x vault's key is in your login keyring, which is locked. Unlock it with the "
-                            + "keyring's own dialog and the move carries on; there is no Pear passphrase to type."
+                            + "Your 1.x vault's key is in your login keyring, which is locked. Unlock it the way "
+                            + "you usually do (for example in Passwords and Keys), then choose Check again. "
+                            + "Pear never asks for the keyring's password, and there is no Pear passphrase to type."
                         color: root.migrateRetry ? Theme.danger : Theme.dim
                         font.family: Theme.uiFont
                         font.pixelSize: Theme.fBody
@@ -4184,10 +4186,10 @@ ShellRoot {
                             enabled: root.migrateStep !== "passphrase" || oldPass.text.length > 0
                             text: root.migrateStep === "done" ? "Done"
                                 : root.migrateStep === "error" ? "Back"
-                                : root.migrateStep === "keyring" ? "Unlock keyring" : "Continue"
+                                : root.migrateStep === "keyring" ? "Check again" : "Continue"
                             onClicked: {
                                 if (root.migrateStep === "done") root.migrateFinish();
-                                else if (root.migrateStep === "keyring") root.migrateUnlockKeyring();
+                                else if (root.migrateStep === "keyring") root.migrateCheckKeyring();
                                 else if (root.migrateStep === "error") { root.migrateStep = "intro"; }
                                 else if (root.migrateStep === "passphrase") root.migratePassphrase();
                                 else root.migrateBegin();

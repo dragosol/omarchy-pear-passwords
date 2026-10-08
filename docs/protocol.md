@@ -625,13 +625,13 @@ processes of the same user.
 
 - stdin, line 1: the ticket. Line 2 (purpose `import` only): options
   `{"move_manifests":true|false}`. Later lines, only when asked:
-  `{"passphrase":"..."}`, `{"unlock_keyring":true}` or `{"cancel":true}`.
+  `{"passphrase":"..."}`, `{"check_keyring":true}` or `{"cancel":true}`.
 - stdout: one JSON object per line:
 
 ```json
 {"stage":"reading"|"peek"|"keyring"|"converting"|"cleanup"|"purging"}
 {"need":"passphrase","retry":false}
-{"need":"keyring-unlock","retry":false}
+{"need":"keyring-locked","retry":false}
 {"done":true,"counts":{...},"digest":"<hex>","backup_dir":"<abs path>","kept_manifests":["..."]}
 {"done":true,"removed":["..."],"kept":["..."]}
 {"error":"wrong-passphrase"|"mismatch"|"unsafe-file"|"no-v1"|"no-key"|"daemon","detail":"..."}
@@ -647,11 +647,13 @@ processes of the same user.
   session bus, from unlocked items only (`SearchItems`, `OpenSession("plain")`, `GetSecrets`;
   never `Unlock`, never a prompt, and a service that is not running is not started), and sends
   each as `import-key{key_b64}`; the daemon checks it against `vault.enc`. If only locked
-  items exist it prints `{"need":"keyring-unlock"}`; on the user's click the window writes
-  `{"unlock_keyring":true}` and only then does the importer call `Service.Unlock` and
-  `Prompt.Prompt`, which show the keyring's own unlock dialog. Still locked afterwards:
-  `{"need":"keyring-unlock","retry":true}`. No key anywhere: the `no-key` error line, and
-  nothing changed.
+  items exist it prints `{"need":"keyring-locked"}`, and the window says the login keyring
+  is locked and to unlock it the way you usually do. Pear never asks the keyring to unlock
+  (no `Service.Unlock`, no `Prompt`): its password dialog would be a second password prompt,
+  and the one-time old passphrase is the only one besides polkit. On "Check again" the
+  window writes `{"check_keyring":true}` and the importer reads the unlocked items again.
+  Still locked: `{"need":"keyring-locked","retry":true}`. No key anywhere: the `no-key`
+  error line, and nothing changed.
 - `{"cancel":true}` (or EOF on stdin while asked) ends the importer with exit status 4 and no
   further output; nothing was changed. In purge mode a recorded file that is already gone is
   listed under `removed`.

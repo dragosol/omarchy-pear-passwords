@@ -170,8 +170,9 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
   one-time in-window field for the old 1.x passphrase, and only for a passphrase vault whose
   key neither the 1.3.2 agent nor the login keyring still has. A 1.x vault keyed by the login
   keyring is moved with its key read from the unlocked keyring over D-Bus and checked against
-  `vault.enc`; if the keyring is locked, its own unlock dialog (the desktop's, not Pear's) is
-  asked for only after the user clicks **Unlock keyring**. Tests:
+  `vault.enc`; if the keyring is locked, Pear never asks it to unlock (its password dialog
+  would be a second password prompt): the window says so, you unlock it the way you usually
+  do, and **Check again** only reads again. Tests:
   `test_no_secret_prompts.py`, `test_apple_ctx.py`,
   `test_migrate_client.py::KeyringVaultTests`, `test_migrate_client.py::SecretServiceKeyringTests`.
 

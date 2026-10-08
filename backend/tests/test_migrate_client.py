@@ -117,28 +117,26 @@ class FakeAgent:
 
 
 class FakeKeyring:
-    """The Secret Service as the importer sees it: keys from unlocked items, whether locked
-    ones exist, and unlock() for after the user's click."""
+    """The Secret Service as the importer sees it: keys from unlocked items and whether
+    locked ones exist. It has no unlock: the importer must never ask for one. `unlocked_after`
+    reads stand in for the user unlocking the keyring outside Pear."""
 
-    def __init__(self, keys=(), locked=False, unlock_works=True, locked_keys=(KEY,)):
+    def __init__(self, keys=(), locked=False, locked_keys=(KEY,), unlocked_after=None):
         self._keys = [bytes(k) for k in keys]
         self.locked = locked
-        self.unlock_works = unlock_works
         self.locked_keys = [bytes(k) for k in locked_keys]
-        self.unlock_calls = 0
+        self.unlocked_after = unlocked_after
+        self.reads = 0
         self.handed = []
 
     def keys(self):
+        self.reads += 1
+        if self.locked and self.unlocked_after is not None and self.reads > self.unlocked_after:
+            self.locked = False
+            self._keys += self.locked_keys
         out = [bytearray(k) for k in self._keys]
         self.handed += out
         return out, self.locked
-
-    def unlock(self):
-        self.unlock_calls += 1
-        if self.locked and self.unlock_works:
-            self.locked = False
-            self._keys += self.locked_keys
-        return not self.locked
 
 
 class Scratch:
@@ -359,40 +357,52 @@ class KeyringVaultTests(unittest.TestCase):
         self.assertEqual(rc, 0, msgs)
         self.assertEqual(len([r for r in d.seen if r["op"] == "import-key"]), 2)
 
-    def test_a_locked_keyring_asks_for_its_own_unlock_after_a_click(self):
+    def test_a_locked_keyring_is_never_asked_to_unlock(self):
+        # Round 2 audit, problem 4: Service.Unlock put up the keyring's own password dialog,
+        # a second password prompt started by Pear. The window says the keyring is locked;
+        # "Check again" (after the user unlocked it their usual way) only reads again.
         s = Scratch(self)
         s.keyring_vault()
         d = FakeDaemon(self, s.root)
-        kr = FakeKeyring(locked=True)
-        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"unlock_keyring": True})], keyring=kr)
+        kr = FakeKeyring(locked=True, unlocked_after=1)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"check_keyring": True})], keyring=kr)
         self.assertEqual(rc, 0, msgs)
         self.assertEqual([m for m in msgs if "need" in m],
-                         [{"need": "keyring-unlock", "retry": False}])
-        self.assertEqual(kr.unlock_calls, 1)
+                         [{"need": "keyring-locked", "retry": False}])
+        self.assertEqual(kr.reads, 2)
         self.assertTrue(msgs[-1]["done"])
 
-    def test_the_keyring_is_never_unlocked_without_the_click(self):
+    def test_nothing_is_read_again_without_the_click(self):
         s = Scratch(self)
         s.keyring_vault()
         d = FakeDaemon(self, s.root)
-        kr = FakeKeyring(locked=True)
+        kr = FakeKeyring(locked=True, unlocked_after=1)
         rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"cancel": True})], keyring=kr)
         self.assertEqual(rc, 4)
-        self.assertEqual(kr.unlock_calls, 0)
+        self.assertEqual(kr.reads, 1)
         self.assertNotIn("import-commit", d.ops())
         self.assertTrue(os.path.isdir(s.config))
 
-    def test_a_dismissed_keyring_dialog_asks_again(self):
+    def test_an_old_unlock_request_is_not_a_check(self):
         s = Scratch(self)
         s.keyring_vault()
         d = FakeDaemon(self, s.root)
-        kr = FakeKeyring(locked=True, unlock_works=False)
-        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"unlock_keyring": True}),
+        kr = FakeKeyring(locked=True, unlocked_after=1)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"unlock_keyring": True})], keyring=kr)
+        self.assertEqual(rc, 4)
+        self.assertEqual(kr.reads, 1)
+
+    def test_still_locked_asks_again(self):
+        s = Scratch(self)
+        s.keyring_vault()
+        d = FakeDaemon(self, s.root)
+        kr = FakeKeyring(locked=True)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"check_keyring": True}),
                              json.dumps({"cancel": True})], keyring=kr)
         self.assertEqual(rc, 4)
         self.assertEqual([m for m in msgs if "need" in m],
-                         [{"need": "keyring-unlock", "retry": False},
-                          {"need": "keyring-unlock", "retry": True}])
+                         [{"need": "keyring-locked", "retry": False},
+                          {"need": "keyring-locked", "retry": True}])
 
     def test_no_key_anywhere_is_a_clear_error_never_a_passphrase(self):
         s = Scratch(self)
@@ -500,15 +510,17 @@ class SecretServiceKeyringTests(unittest.TestCase):
         self.assertEqual((keys, locked), ([], False))
         self.assertEqual([m for m, _ in bus.calls], ["NameHasOwner"])
 
-    def test_unlock_uses_the_keyrings_own_prompt(self):
-        bus = FakeSecretsBus(locked=[self.MK], prompt="/org/freedesktop/secrets/prompt/p1")
-        self.assertTrue(migrate.SecretServiceKeyring(open_bus=lambda: bus).unlock())
-        members = [m for m, _ in bus.calls]
-        self.assertIn("Unlock", members)
-        self.assertIn("Prompt", members)
-        bus = FakeSecretsBus(locked=[self.MK], prompt="/org/freedesktop/secrets/prompt/p1",
-                      dismissed=True)
-        self.assertFalse(migrate.SecretServiceKeyring(open_bus=lambda: bus).unlock())
+    def test_there_is_no_way_to_ask_the_keyring_to_unlock(self):
+        # Round 2 audit, problem 4: requirement 2 allows no password prompt besides polkit
+        # and the one-time old passphrase in the window; the keyring's unlock dialog was one.
+        self.assertFalse(hasattr(migrate.SecretServiceKeyring, "unlock"))
+        with open(migrate.__file__) as f:
+            src = f.read()
+        code = "\n".join(l.split("#")[0] for l in src.splitlines()
+                         if not l.lstrip().startswith(("#", '"', "'")))
+        for gone in ('"Unlock"', '"Prompt"', "org.freedesktop.Secret.Prompt",
+                     '"unlock_keyring"', "unlock_keyring"):
+            self.assertNotIn(gone, code, gone)
 
 
 class FileHygieneTests(unittest.TestCase):

@@ -137,21 +137,26 @@ class MigrationScreenTests(unittest.TestCase):
 
     def test_a_keyring_vault_moves_with_no_terminal_step_and_no_pear_prompt(self):
         # audit: the keyring-vault screen sent users to 1.3.2's terminal passphrase prompt.
-        # Now the importer reads the key from the keyring; a locked keyring gets its own
-        # unlock dialog, and only after a click here.
+        # Now the importer reads the key from the keyring. A locked keyring is never asked
+        # to unlock (round 2 audit, problem 4: that dialog was a second password prompt);
+        # the window says so and "Check again" only reads again.
         self.assertIn('vaultFile.path = root.v1Dir + "/vault.enc"', CODE)
         self.assertIn("root.v1Present = vault;", CODE)
         self.assertIn("root.v1KeyringOnly = vault && !(kdf && check_)", CODE)
         for gone in ("icp passphrase", "migrate-keyring", "keyringStartFresh"):
             self.assertNotIn(gone, CODE, gone)
         line = function_body("onMigrateLine")
-        branch = line[line.index('if (m.need === "keyring-unlock")'):]
+        branch = line[line.index('if (m.need === "keyring-locked")'):]
         branch = branch[:branch.index("return;")]
         self.assertIn('root.migrateStep = "keyring"', branch)
-        self.assertNotIn("write(", branch)                    # nothing unlocks on its own
-        self.assertIn('unlock_keyring: true', function_body("migrateUnlockKeyring"))
-        self.assertEqual(CODE.count("root.migrateUnlockKeyring()"), 1)
-        self.assertIn('else if (root.migrateStep === "keyring") root.migrateUnlockKeyring();', CODE)
+        self.assertNotIn("write(", branch)                    # nothing is sent on its own
+        self.assertIn('check_keyring: true', function_body("migrateCheckKeyring"))
+        self.assertEqual(CODE.count("root.migrateCheckKeyring()"), 1)
+        self.assertIn('else if (root.migrateStep === "keyring") root.migrateCheckKeyring();', CODE)
+        self.assertIn('root.migrateStep === "keyring" ? "Check again"', CODE)
+        for gone in ("unlock_keyring", "keyring-unlock", "Unlock keyring",
+                     "Unlock your login keyring", "keyring's own dialog"):
+            self.assertNotIn(gone, CODE, gone)
         self.assertIn('m.error === "no-key"', line)
 
     def test_only_a_confirmed_missing_vault_abandons_the_import(self):
