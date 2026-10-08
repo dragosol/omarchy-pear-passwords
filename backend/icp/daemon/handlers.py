@@ -1084,6 +1084,11 @@ async def op_reset(reg, conn, req):
     # Only a store that opens normally (an import never committed, or one that keeps nothing)
     # may be deleted when it keeps nothing; after tpm-cleared or damaged it is always kept.
     discard = await _store(reg, conn.uid, s.store.state) in OPENS
+    # A lock that landed during the reads above (sleep, logind Lock, the Lock button) ends the
+    # op here: the lock below would bump the epoch again and _replace_store would never see it
+    # (round 3 audit, problem 1).
+    if conn.closed or s.ui is not conn or s.epoch != epoch:
+        raise OpError("cancelled")
     reg.lock(conn.uid, None, notify=False)
     reg.withdraw(conn.uid, roles=("migrate",))
     s.migrating = False

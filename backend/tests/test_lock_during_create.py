@@ -128,6 +128,46 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.h.store().keys)
         self.assertEqual(self.h.reg.tickets.pending(UID), 0)
 
+    async def _lock_during_reset_reads(self, nth, lock):
+        # reset re-reads the store state after its dialog (_resettable, then the discard
+        # check) before it locks the old store itself; that lock bumps the epoch, so a lock
+        # that lands during those reads was lost and tier 1 opened on the new store
+        # (round 3 audit, problem 1).
+        st = self.h.store()
+        st.exists, st.keys, st.recorded_state = True, False, "tpm-cleared"
+        started, proceed = threading.Event(), threading.Event()
+        orig = FakeStore.state
+        seen = {"n": 0}
+        authority = self.h.authority
+
+        def slow_state(store):
+            if authority.calls:
+                seen["n"] += 1
+                if seen["n"] == nth:
+                    started.set()
+                    proceed.wait(10)
+            return orig(store)
+        with mock.patch.object(FakeStore, "state", slow_state):
+            fut = self.ui.send("reset")
+            self.assertTrue(await asyncio.to_thread(started.wait, 10))
+            lock()
+            proceed.set()
+            r = await asyncio.wait_for(fut, 30)
+        s = self.h.reg.get(UID)
+        self.assertEqual(r.get("error"), "cancelled", r)
+        self.assertFalse(s.unlocked())
+        self.assertIsNone(s.tier1)
+        self.assertEqual(FakeStore.resets, [])          # the old store is left as it was
+
+    async def test_reset_sleep_during_the_resettable_check(self):
+        await self._lock_during_reset_reads(1, self._sleep)
+
+    async def test_reset_sleep_during_the_discard_check(self):
+        await self._lock_during_reset_reads(2, self._sleep)
+
+    async def test_reset_lock_button_during_the_resettable_check(self):
+        await self._lock_during_reset_reads(1, lambda: self.h.reg.lock(UID, "user"))
+
     async def test_without_a_lock_nothing_changes(self):
         gate = _Gate()
         gate.proceed.set()
