@@ -183,6 +183,35 @@ class RealStoreTests(unittest.IsolatedAsyncioTestCase):
         vstore.UserStore.create(UID).lock()
         await self._slow_make(vstore.UserStore.reset)
 
+    async def test_a_cancelled_create_wipes_what_it_made(self):
+        # The handler that would have held the new store is gone (its task was cancelled):
+        # nobody can lock that object later, so run_store wipes it as the worker returns.
+        made = []
+        real_create = vstore.UserStore.create.__func__
+
+        def create(cls, uid):
+            made.append(real_create(cls, uid))
+            return made[-1]
+        started, proceed = threading.Event(), threading.Event()
+        real = self.seal.encrypt
+
+        def slow_encrypt(name, plaintext):
+            started.set()
+            proceed.wait(10)
+            return real(name, plaintext)
+        with mock.patch.object(vstore.UserStore, "create", classmethod(create)), \
+                mock.patch.object(self.seal, "encrypt", slow_encrypt):
+            call = asyncio.ensure_future(self.reg.run_store(
+                UID, vstore.UserStore.create, UID, replaces=True))
+            self.assertTrue(await asyncio.to_thread(started.wait, 10))
+            call.cancel()
+            proceed.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(call, 30)
+        self.assertEqual(len(made), 1)
+        self.assertEqual(made[0].state(), "locked")
+        self.assertFalse(self.reg.wipes_pending())
+
     async def test_no_lock_leaves_it_unlocked(self):
         new = await self.reg.run_store(UID, vstore.UserStore.create, UID, replaces=True)
         self.assertEqual(new.state(), "unlocked")

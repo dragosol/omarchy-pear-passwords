@@ -308,20 +308,29 @@ class Registry:
             if s.wipe_after:
                 raise OpError("locked")
             epoch = s.epoch
-            new = None
+            made: list = []
+            returned = False
             s.replacing = replaces
+            if replaces:
+                make = fn
+
+                def fn(*a):                 # keep the new store even if this call is cancelled
+                    made.append(make(*a))
+                    return made[0]
             try:
-                new = await self._in_pool(self._store_pool, fn, *args)
-                return new
+                result = await self._in_pool(self._store_pool, fn, *args)
+                returned = True
+                return result
             finally:
                 # replaces: fn is create()/reset() and returns the new store, unlocked. A lock
                 # that landed meanwhile wiped only the old object (and left wipe_after set, so
-                # sleep was held back and nothing else ran): wipe the new one too. The
-                # caller sees the epoch change and does not open tier 1 on it.
+                # sleep was held back and nothing else ran): wipe the new one too, and so if
+                # this call was cancelled and nobody will ever hold it. The caller sees the
+                # epoch change and does not open tier 1 on it.
                 s.replacing = False
-                if replaces and new is not None and s.epoch != epoch:
+                if made and (s.epoch != epoch or not returned):
                     try:
-                        new.lock()
+                        made[0].lock()
                     except Exception:
                         logger.exception("uid %d: wiping the new store failed", uid)
                 if s.wipe_after or (s.epoch != epoch and not s.unlocked()):
