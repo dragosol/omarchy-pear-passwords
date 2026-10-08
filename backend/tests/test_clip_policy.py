@@ -244,6 +244,22 @@ class ClipHarness:
             raise AssertionError("pear-clip did not finish")
         return self.result
 
+    def request_with_no_reader(self, pids, mime="text/plain;charset=utf-8"):
+        """A request whose reader is already gone: the read end closed before pear-clip sees
+        it (a history watcher's capture.sh that exited without reading)."""
+        r, w = os.pipe()
+        self.holders.set(r, pids)
+        os.close(r)
+        n = len(self.offer.log)
+        self.fc._event(self.fc.source, 0, _string(mime), fd=w)
+        os.close(w)
+        deadline = time.monotonic() + 5
+        while len(self.offer.log) == n:
+            if time.monotonic() > deadline:
+                raise AssertionError("the request was never handled")
+            time.sleep(0.01)
+        return self.offer.log[-1][1]
+
     def paste(self, pids, watchers_=(), mime="text/plain;charset=utf-8"):
         r, w = os.pipe()
         self.holders.set(r, pids, watchers_)
@@ -296,6 +312,33 @@ class ReaderRuleTests(unittest.TestCase):
         self.assertEqual(h.paste(set()), b"hunter2-secret")
         self.assertEqual(h.finish(), "pasted")
         self.assertIsNotNone(h.offer.pasted_at)
+
+    def test_a_request_with_no_reader_left_is_not_the_paste(self):
+        # clipboard_ui-1: the watcher's child exited before the /proc scan found it.
+        h = ClipHarness(self)
+        self.assertEqual(h.request_with_no_reader(set()), "gone")
+        self.assertIsNone(h.offer.pasted_at)
+        self.assertEqual(h.offer.served, 0)
+        self.assertEqual(h.paste({200}), b"hunter2-secret")      # the real paste still works
+        self.assertEqual(h.finish(), "pasted")
+
+    def test_an_undelivered_write_is_not_the_paste(self):
+        # A holder was seen, but its read end was closed by the time of the write (EPIPE).
+        h = ClipHarness(self)
+        self.assertEqual(h.request_with_no_reader({300}), "undelivered")
+        self.assertIsNone(h.offer.pasted_at)
+        self.assertEqual(h.paste({200}), b"hunter2-secret")
+        self.assertEqual(h.finish(), "pasted")
+        self.assertEqual(h.offer.served, 1)
+
+    def test_a_vanished_holder_is_dropped_by_the_identifier(self):
+        ident = clip.make_identifier(set(), describe=lambda pid: None)
+        r, w = os.pipe()
+        try:
+            self.assertEqual(ident(w).pids, frozenset())     # held by us, but "gone" to describe
+        finally:
+            os.close(r)
+            os.close(w)
 
     def test_unknown_mime_gets_nothing(self):
         h = ClipHarness(self)

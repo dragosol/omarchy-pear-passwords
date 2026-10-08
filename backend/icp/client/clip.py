@@ -12,8 +12,10 @@ The rules, in the order a request meets them:
 2. Every other request hands over a pipe. The process(es) at the other end are found in /proc.
    If every one of them is a known clipboard-history watcher (watchers.py), the pipe is closed
    unwritten and the request does not count.
-3. Anything else, including a reader that cannot be identified, gets the value and is the one
-   paste. For CLIP_REREQUEST_GRACE_S afterwards the same set of holder processes may ask again
+3. Anything else, including a live reader that cannot be identified, gets the value and is
+   the one paste - but only once the value was actually delivered. A pipe nobody holds any
+   more (a history watcher's child that exited without reading, faster than the /proc scan)
+   is not a paste, and neither is a write that hit EPIPE: the offer stays up for the real one. For CLIP_REREQUEST_GRACE_S afterwards the same set of holder processes may ask again
    (XWayland and some toolkits read twice); nobody else gets anything. Then the source is
    destroyed.
 4. With no paste by `timeout` seconds the source is destroyed. Destroying a source clears the
@@ -119,10 +121,19 @@ def pipe_holders(fd: int, exclude: set, proc: str = "/proc") -> set:
 
 def make_identifier(exclude: set, describe=watchers.describe_proc) -> Callable[[int], Readers]:
     def identify(fd: int) -> Readers:
-        pids = frozenset(pipe_holders(fd, exclude))
+        # A holder that is already gone again says nothing about who reads: dropped, so a
+        # vanished watcher child cannot make a watcher's request look like a paste.
+        pids = frozenset(p for p in pipe_holders(fd, exclude) if describe(p) is not None)
         found = frozenset(p for p in pids if watchers.is_watcher(p, describe))
         return Readers(pids, found)
     return identify
+
+
+def _reader_gone(fd: int) -> bool:
+    """True once no read end of the pipe is open anywhere (POLLERR on the write end)."""
+    p = select.poll()
+    p.register(fd, select.POLLOUT)
+    return any(ev & (select.POLLERR | select.POLLHUP) for _, ev in p.poll(0))
 
 
 def identify_nobody(fd: int) -> Readers:
@@ -179,13 +190,23 @@ class Offer:
                 self.log.append((mime, "refused"))
                 return
             readers = self.identify(fd)
+            if not readers.pids and self.watcher_window == 0.0:
+                # Nobody seen: maybe a reader forked after the scan listed /proc. Look again;
+                # if the pipe has no reader left at all, this was no paste.
+                readers = self.identify(fd)
+                if not readers.pids and _reader_gone(fd):
+                    self.refused_watchers += 1
+                    self.log.append((mime, "gone"))
+                    return
             if self.pasted_at is not None:
                 # Only the paste that already happened may ask again, and only briefly.
                 if (readers.pids == self.paste_holders
                         and self.now() - self.pasted_at <= self.grace):
-                    _write_all(fd, self.value)
-                    self.served += 1
-                    self.log.append((mime, "re-served"))
+                    if _write_all(fd, self.value):
+                        self.served += 1
+                        self.log.append((mime, "re-served"))
+                    else:
+                        self.log.append((mime, "undelivered"))
                 else:
                     self.refused_others += 1
                     self.log.append((mime, "refused"))
@@ -194,7 +215,10 @@ class Offer:
                 self.refused_watchers += 1
                 self.log.append((mime, "watcher"))
                 return
-            _write_all(fd, self.value)
+            if not _write_all(fd, self.value):
+                # The reader went away (EPIPE) or never read: nothing was pasted.
+                self.log.append((mime, "undelivered"))
+                return
             self.served += 1
             self.pasted_at = self.now()
             self.paste_holders = readers.pids
@@ -232,8 +256,9 @@ class Offer:
             self.value[i] = 0
 
 
-def _write_all(fd: int, data) -> None:
-    """Write without ever blocking the loop for long: a reader that never reads loses."""
+def _write_all(fd: int, data) -> bool:
+    """Write without ever blocking the loop for long: a reader that never reads loses.
+    True only when every byte went into the pipe."""
     os.set_blocking(fd, False)
     view = memoryview(data)
     deadline = time.monotonic() + WRITE_DEADLINE_S
@@ -241,16 +266,19 @@ def _write_all(fd: int, data) -> None:
         while view:
             try:
                 n = os.write(fd, view)
+                if n <= 0:
+                    return False
                 view = view[n:]
             except BlockingIOError:
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    return
+                    return False
                 select.select([], [fd], [], left)
             except OSError as e:
                 if e.errno in (errno.EPIPE, errno.EBADF):
-                    return
+                    return False
                 raise
+        return True
     finally:
         view.release()
 
