@@ -79,17 +79,24 @@ a locked computer does not sync.
   `test_pear_exec_env.py`.
 - **pear-clip** speaks the Wayland data-control protocol itself and holds the value in memory.
   It identifies each reader by the pipe it hands over, looking for it among your processes
-  whose `/proc/<pid>/fd` it can read: Omarchy's history watcher gets nothing, any other
-  reader it finds is the one counted paste (as soon as one byte of the value reaches its
-  pipe, so a reader that stalls part-way has used it up; a write that takes no byte is not a
-  paste), and the offer is withdrawn after that paste or 30 s. A reader it cannot find gets
-  nothing and does not count: a pipe with no reader left, and any non-dumpable process,
-  whose fds it cannot list. Pear's own window is one (set-gid, non-dumpable), and Qt reads
-  the clipboard text the moment the selection changes to decide whether Paste is possible;
-  before this rule that read used up the one paste. The cost: **a copied secret cannot be
-  pasted into a non-dumpable program, Pear's own window included**, and an unidentifiable
-  reader gets nothing. It never uses `wl-copy` (which stages its input in `/tmp`). Tests:
-  `test_clip_policy.py` (including real non-dumpable readers), `test_repo_guards.py::ClipboardGuardTests`.
+  whose `/proc/<pid>/fd` it can read. Served: any such same-uid reader, and the compositor's
+  X11 bridge, i.e. the compositor itself (the peer pear-exec verified) when it holds the
+  pipe's read end, matched by inode and by an `O_RDONLY`/`O_RDWR` access mode in
+  `/proc/<pid>/fdinfo`. Hyprland's XWM (and wlroots' xwm in sway) reads the value there for an
+  X11 app; which X11 app asked is not visible, so the bridge is one reader. The compositor
+  holding only the write end is not a reader, and a compositor whose fds cannot be read is
+  refused. Omarchy's history watcher gets nothing; the first served reader is the one counted
+  paste (as soon as one byte of the value reaches its pipe, so a reader that stalls part-way
+  has used it up; a write that takes no byte is not a paste), and the offer is withdrawn
+  after that paste or 30 s. Refused, without counting: watchers, a reader nobody can
+  identify (a pipe with no reader left, a compositor whose fds cannot be read), and any
+  non-dumpable process, whose fds it cannot list. Pear's own window is one (set-gid,
+  non-dumpable), and Qt reads the clipboard text the moment the selection changes to decide
+  whether Paste is possible; before this rule that read used up the one paste. The cost: **a
+  copied secret cannot be pasted into a non-dumpable program, Pear's own window included**,
+  and an unidentifiable reader gets nothing. It never uses `wl-copy` (which stages its input
+  in `/tmp`). Tests: `test_clip_policy.py` (including real non-dumpable readers and the
+  XWayland bridge), `test_repo_guards.py::ClipboardGuardTests`.
 
 ## 2. Key hierarchy
 

@@ -782,6 +782,126 @@ class NonDumpableReaderTests(unittest.TestCase):
         self.assertEqual(out["second_got"], "")
 
 
+class XWaylandBridgeTests(unittest.TestCase):
+    """s-audit #1: Hyprland's XWM (and wlroots' xwm in sway) bridges the clipboard to X11 apps
+    inside the compositor: pipe(p), p[1] goes to our source, the compositor reads p[0]. The
+    compositor is excluded from the general scan, so it is identified by holding the READ end
+    (inode plus an O_RDONLY/O_RDWR access mode in fdinfo)."""
+
+    def test_compositor_holding_the_read_end_is_the_paste(self):
+        # The audit's xwl_sim.py: this process stands in for the compositor.
+        comp = os.getpid()
+        offer = clip.Offer(bytearray(b"dummy-value"), True, 30.0,
+                           clip.make_identifier({comp}, compositor=comp))
+        offer.start()
+        r, w = os.pipe()                      # XWM.cpp: pipe(p); wlFD = p[0]; send(mime, p[1])
+        offer.on_send("text/plain;charset=utf-8", w)              # closes w
+        self.assertEqual(offer.log[-1][1], "pasted")
+        self.assertIsNotNone(offer.pasted_at)
+        self.assertEqual(offer.paste_holders, frozenset({comp}))
+        self.assertEqual(offer.served, 1)
+        self.assertEqual(read_all(r), b"dummy-value")             # delivered once, then EOF
+        # Another reader that is not the bridge gets nothing afterwards.
+        r2, w2 = os.pipe()
+        child = subprocess.Popen([sys.executable, "-c", ECHO_READER], stdin=r2,
+                                 stdout=subprocess.PIPE)
+        os.close(r2)
+        offer.identify = clip.make_identifier({comp}, compositor=None)
+        offer.pasted_at -= 10                                     # past the grace window
+        offer.on_send("text/plain;charset=utf-8", w2)
+        self.assertEqual(offer.log[-1][1], "refused")
+        self.assertEqual(child.communicate(timeout=10)[0], b"")
+        self.assertEqual(offer.served, 1)
+
+    def test_compositor_holding_only_the_write_end_is_not_served(self):
+        # An ordinary Wayland paste passes through the compositor as the WRITE end only.
+        r, w = os.pipe()
+        comp = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                pass_fds=[w])
+        self.addCleanup(lambda: comp.poll() is None and comp.kill())
+        offer = clip.Offer(bytearray(b"hunter2-secret"), True, 30.0,
+                           clip.make_identifier({os.getpid(), comp.pid}, compositor=comp.pid))
+        offer.start()
+        try:
+            self.assertFalse(clip.holds_read_end(comp.pid, w))
+            offer.on_send("text/plain;charset=utf-8", w)          # closes our w
+            self.assertEqual(offer.log[-1][1], "unidentified")
+            self.assertIsNone(offer.pasted_at)
+            self.assertEqual(offer.served, 0)
+        finally:
+            comp.kill()
+            comp.wait(5)
+        self.assertEqual(read_all(r), b"")                        # closes r
+
+    def test_compositor_whose_fds_cannot_be_read_is_refused(self):
+        # A non-dumpable compositor holding the read end: its fds cannot be listed, so the
+        # reader is not identified and the refusal stays.
+        r, w = os.pipe()
+        comp = subprocess.Popen([sys.executable, "-c", NON_DUMPABLE_READER], stdin=r,
+                                stdout=subprocess.PIPE)
+        os.close(r)
+        self.addCleanup(lambda: comp.poll() is None and comp.kill())
+        self.assertEqual(comp.stdout.readline().strip(), b"ready")
+        offer = clip.Offer(bytearray(b"hunter2-secret"), True, 30.0,
+                           clip.make_identifier({os.getpid(), comp.pid}, compositor=comp.pid))
+        offer.start()
+        self.assertFalse(clip.holds_read_end(comp.pid, w))
+        offer.on_send("text/plain;charset=utf-8", w)
+        self.assertEqual(offer.log[-1][1], "unidentified")
+        self.assertEqual(comp.communicate(timeout=10)[0].strip(), b"0")
+        self.assertIsNone(offer.pasted_at)
+        self.assertEqual(offer.served, 0)
+        self.assertEqual(offer.refused_unknown, 1)
+
+    def test_access_mode_comes_from_fdinfo_flags(self):
+        # A fake /proc: same inode on three fds, told apart only by their fdinfo flags.
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        link = f"pipe:[{os.fstat(w).st_ino}]"
+        with tempfile.TemporaryDirectory() as proc:
+            for pid, flags in ((10, "01"), (11, "02000000"), (12, "0102"), (13, None)):
+                os.makedirs(f"{proc}/{pid}/fd")
+                os.makedirs(f"{proc}/{pid}/fdinfo")
+                os.symlink(link, f"{proc}/{pid}/fd/7")
+                if flags is not None:
+                    with open(f"{proc}/{pid}/fdinfo/7", "w") as f:
+                        f.write(f"pos:\t0\nflags:\t{flags}\nmnt_id:\t15\n")
+            self.assertFalse(clip.holds_read_end(10, w, proc))    # O_WRONLY
+            self.assertTrue(clip.holds_read_end(11, w, proc))     # O_RDONLY|O_CLOEXEC
+            self.assertTrue(clip.holds_read_end(12, w, proc))     # O_RDWR
+            self.assertFalse(clip.holds_read_end(13, w, proc))    # no fdinfo: unreadable
+            self.assertFalse(clip.holds_read_end(99, w, proc))    # gone
+            self.assertFalse(clip.holds_read_end(None, w, proc))
+            ident = clip.make_identifier({10, 11}, describe=lambda p: None, compositor=11,
+                                         proc=proc)
+            self.assertEqual(ident(w), Readers(frozenset({11}), frozenset()))
+            ident = clip.make_identifier({10, 11}, describe=lambda p: None, compositor=10,
+                                         proc=proc)
+            self.assertEqual(ident(w).pids, frozenset())
+
+    def test_run_names_the_compositor(self):
+        seen = {}
+
+        def factory(exclude, describe=None, compositor=None):
+            seen.update(exclude=exclude, compositor=compositor)
+            return HolderTable()
+        policy = clip.policy
+        with mock.patch.object(clip, "policy", lambda: (factory, policy()[1])):
+            import io
+            d = FakeDaemon(self, timeout=5)
+            fc = FakeCompositor()
+            self.addCleanup(fc.close)
+            t, result = RunTests.start_run(self, d, fc, io.StringIO(), identify=None)
+            fc.wait_selected()
+            self.assertEqual(read_all(fc.paste()), b"hunter2-secret")
+            t.join(10)
+        self.assertEqual(result.get("rc"), 0)
+        # The fake compositor is this process (the peer of the socket run() connected to).
+        self.assertEqual(seen["compositor"], os.getpid())
+        self.assertIn(os.getpid(), seen["exclude"])
+
+
 class FakeDaemon:
     """A daemon socket for one clip connection: hello, redeem, clip-result."""
 
@@ -818,7 +938,7 @@ class FakeDaemon:
 
 
 class RunTests(unittest.TestCase):
-    def start_run(self, d, fc, out, ticket="A" * 43):
+    def start_run(self, d, fc, out, ticket="A" * 43, identify="table"):
         """clip.run() against FakeDaemon `d` and FakeCompositor `fc`, in a thread."""
         import io
         wl_path = os.path.join(d.dir.name, "wayland-9")
@@ -837,7 +957,8 @@ class RunTests(unittest.TestCase):
         threading.Thread(target=bridge, daemon=True).start()
         result = {}
         t = threading.Thread(target=lambda: result.setdefault(
-            "rc", clip.run(io.StringIO(ticket + "\n"), d.path, wl_path, identify=HolderTable(),
+            "rc", clip.run(io.StringIO(ticket + "\n"), d.path, wl_path,
+                           identify=HolderTable() if identify == "table" else identify,
                            out=out)))
         t.start()
         return t, result

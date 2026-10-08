@@ -116,7 +116,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "bf9ec2afae3d32cd52f90570261442b621c80dc4d7120964b53a65c3766983bd  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "fb3e62facd2b7d499732f0e3a360e170a34cf7b21a3edef6750c568e69affa98  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -314,10 +314,13 @@ What to know before you turn it on:
   or a setup key, which goes to the same writer with the same one paste or 30 seconds. Cut
   does nothing there, and the Apple ID password, Apple's code and the 1.x passphrase fields
   copy nothing at all.
-- Pear gives the copy only to a program it can identify as your own: one whose open files
-  it can see. A program that hides them (a non-dumpable one, as some security-minded apps
-  are, and Pear's own window) gets nothing, and that does not use up the paste. So a
-  copied password cannot be pasted back into Pear itself, or into such a program.
+- Pear gives the copy only to a reader it can identify: a program of yours whose open files
+  it can see, or the compositor's X11 bridge, which reads for X11 (XWayland) apps such as
+  Steam, JetBrains IDEs or Wine, so pasting into those works too. Pear cannot tell which X11
+  app asked, so the bridge counts as one reader. Refused, without using up the paste:
+  clipboard-history watchers, a reader nobody can identify, and non-dumpable programs (as
+  some security-minded apps are), Pear's own window included. So a copied password cannot
+  be pasted back into Pear itself, or into such a program.
 - While a copy is on offer, any other program that can read your clipboard can read it. If
   one reads it first, your own paste comes up empty, which at least tells you.
 - Settings can check your clipboard history for passwords copied by older versions (it asks

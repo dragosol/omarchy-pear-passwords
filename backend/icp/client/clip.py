@@ -10,23 +10,33 @@ The rules, in the order a request meets them:
 1. `x-kde-passwordManagerHint` (offered only for a sensitive value) is always served the word
    `secret`, which asks history managers not to keep the entry.
 2. Every other request hands over a pipe. The process(es) at the other end are found in /proc,
-   among this user's processes whose /proc/<pid>/fd can be read.
-   - If none is found there, the request is refused: the pipe is closed unwritten, it does not
-     count, and the offer stays up. That covers a pipe nobody holds any more (a history
-     watcher's child that exited without reading, faster than the scan) and a reader that
-     cannot be inspected: a non-dumpable process, Pear's own window first of all. The window
-     is set-gid and non-dumpable, and Qt Quick reads the clipboard text itself the moment the
-     selection changes (every editable TextField re-checks "can paste"); counting that read
-     took the one paste before the user pasted anything. So a copied secret cannot be pasted
-     into a non-dumpable program, Pear's window included, and an unidentifiable reader gets
-     nothing.
+   among this user's processes whose /proc/<pid>/fd can be read. Two kinds of reader are
+   identified:
+   - an ordinary process of this user that holds the pipe (wl-paste, a Wayland app, a
+     Flatpak app in its own pid namespace);
+   - the compositor itself (the peer of our Wayland socket, the process pear-exec verified)
+     when it holds the pipe's READ end, by inode and by an O_RDONLY/O_RDWR access mode in
+     /proc/<pid>/fdinfo/<fd>. That is the XWayland clipboard bridge: Hyprland's XWM, like
+     wlroots' xwm in sway, runs in the compositor and reads the value for an X11 app. Which
+     X11 app asked cannot be seen from here; the bridge counts as one reader. The compositor
+     holding only the WRITE end (it passes an ordinary Wayland paste on to us) is not a reader.
+   If no reader is identified, the request is refused: the pipe is closed unwritten, it does
+   not count, and the offer stays up. That covers a pipe nobody holds any more (a history
+   watcher's child that exited without reading, faster than the scan), a compositor whose fds
+   cannot be read, and a reader that cannot be inspected: a non-dumpable process, Pear's own
+   window first of all. The window is set-gid and non-dumpable, and Qt Quick reads the
+   clipboard text itself the moment the selection changes (every editable TextField re-checks
+   "can paste"); counting that read took the one paste before the user pasted anything. So a
+   copied secret cannot be pasted into a non-dumpable program, Pear's window included, and an
+   unidentifiable reader gets nothing.
    - If every holder is a known clipboard-history watcher (watchers.py), the request is
      refused the same way and does not count.
-3. Any other identified reader gets the value and is the one paste - but only once the value
-   was actually delivered: a write that hit EPIPE, or took no byte, is not a paste and the
-   offer stays up for the real one. For CLIP_REREQUEST_GRACE_S afterwards the same set of
-   holder processes may ask again (XWayland and some toolkits read twice); nobody else gets
-   anything. Then the source is destroyed.
+3. Any other identified reader (a same-uid process, or the compositor's X11 bridge) gets the
+   value and is the one paste - but only once the value was actually delivered: a write that
+   hit EPIPE, or took no byte, is not a paste and the offer stays up for the real one. For
+   CLIP_REREQUEST_GRACE_S afterwards the same set of holder processes may ask again (the
+   XWayland bridge and some toolkits read twice); nobody else gets anything. Then the source
+   is destroyed.
 4. With no paste by `timeout` seconds the source is destroyed. Destroying a source clears the
    clipboard only if it is still the selection: a copy you made since is never touched, and
    set_selection(null) is never sent.
@@ -138,12 +148,58 @@ def pipe_holders(fd: int, exclude: set, proc: str = "/proc") -> set:
     return holders
 
 
-def make_identifier(exclude: set, describe=watchers.describe_proc) -> Callable[[int], Readers]:
+def holds_read_end(pid: int | None, fd: int, proc: str = "/proc") -> bool:
+    """True if process `pid` (one of our uid's) has the read end of the pipe behind `fd` open:
+    an fd that links to the pipe's inode and whose /proc/<pid>/fdinfo `flags` give an
+    O_RDONLY or O_RDWR access mode. The write end (O_WRONLY), which a compositor holds for a
+    moment while it forwards an ordinary Wayland paste to us, does not count. Anything that
+    cannot be read (non-dumpable, gone, another uid) answers False."""
+    if not pid or pid <= 0:
+        return False
+    target = f"pipe:[{os.fstat(fd).st_ino}]"
+    egid = os.getegid()
+    _set_fsgid(os.getgid())
+    try:
+        try:
+            if os.stat(f"{proc}/{pid}").st_uid != os.getuid():
+                return False
+            fds = os.listdir(f"{proc}/{pid}/fd")
+        except OSError:
+            return False
+        for f in fds:
+            try:
+                if os.readlink(f"{proc}/{pid}/fd/{f}") != target:
+                    continue
+                flags = None
+                with open(f"{proc}/{pid}/fdinfo/{f}") as info:
+                    for line in info:
+                        if line.startswith("flags:"):
+                            flags = int(line.split()[1], 8)
+                            break
+            except (OSError, ValueError, IndexError):
+                continue
+            if flags is not None and (flags & os.O_ACCMODE) in (os.O_RDONLY, os.O_RDWR):
+                return True
+        return False
+    finally:
+        _set_fsgid(egid)
+
+
+def make_identifier(exclude: set, describe=watchers.describe_proc, compositor: int | None = None,
+                    proc: str = "/proc") -> Callable[[int], Readers]:
+    """The "proc" policy's identifier. `compositor` is the pid at the other end of our Wayland
+    socket (the process pear-exec verified); it is in `exclude`, so it is never found by the
+    general scan, but when it holds the pipe's read end itself it is the XWayland clipboard
+    bridge (Hyprland's XWM, wlroots' xwm in sway) reading for an X11 app, and is a reader."""
     def identify(fd: int) -> Readers:
         # A holder that is already gone again says nothing about who reads: dropped, so a
         # vanished watcher child cannot make a watcher's request look like a paste.
-        pids = frozenset(p for p in pipe_holders(fd, exclude) if describe(p) is not None)
-        found = frozenset(p for p in pids if watchers.is_watcher(p, describe))
+        pids = {p for p in pipe_holders(fd, exclude, proc) if describe(p) is not None}
+        if compositor and holds_read_end(compositor, fd, proc):
+            pids.add(compositor)
+        pids = frozenset(pids)
+        found = frozenset(p for p in pids
+                          if p != compositor and watchers.is_watcher(p, describe))
         return Readers(pids, found)
     return identify
 
@@ -166,7 +222,7 @@ def policy(name: str = None) -> tuple[Callable[[set], Callable[[int], Readers]],
     if name == "proc":
         return make_identifier, 0.0
     if name == "timing":
-        return (lambda exclude: identify_nobody), WATCHER_WINDOW_S
+        return (lambda exclude, compositor=None: identify_nobody), WATCHER_WINDOW_S
     raise ValueError(f"unknown reader policy {name!r}")
 
 
@@ -466,7 +522,8 @@ def run(stdin, socket_path: str, wayland_path: str, identify=None, out=None) -> 
         else:
             factory, window = policy()
             if identify is None:
-                identify = factory({os.getpid(), conn.peer_pid or -1})
+                identify = factory({os.getpid(), conn.peer_pid or -1},
+                                   compositor=conn.peer_pid)
             offer = Offer(value, sensitive, float(timeout), identify, watcher_window=window)
             outcome = serve(dc, offer, daemon, on_offered=lambda: report(out, "offered"))
             reason = (NOT_OFFERED.get(outcome) or offer.error
