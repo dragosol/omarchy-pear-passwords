@@ -114,8 +114,11 @@ Per user, in `/var/lib/pear-passwords/u<uid>/` (0700 `pear-passwords`; your uid 
   PrepareForSleep holds the suspend back for one second at the most.
   **Sleep while a store call runs** (residual): if a store call is still running when that
   second is up (an unseal on a hung TPM, a sync), the machine sleeps with that call's keys
-  in RAM, and they are wiped when that one store method returns after resume. Tests:
-  `test_lock_never_waits.py`.
+  in RAM, and they are wiped when that one store method returns after resume. This holds
+  for a call that makes a new store too (`create`/`reset`, in `migrate-begin`, `reset` and
+  the first sign-in): the wipe stays pending until it returns, the new store's keys are then
+  wiped, and the op ends `cancelled` without opening tier 1, so the window is locked after
+  resume. Tests: `test_lock_never_waits.py`, `test_lock_during_create.py`.
 - Moving to host+TPM2 is never automatic. With a usable TPM and host-sealed keys the unlock
   reply says `tpm_move`, and Settings offers **Move your keys onto the security chip**, which
   raises its own `.manage` dialog (op `tpm-move`). It is a key rotation, not a re-wrap: a new

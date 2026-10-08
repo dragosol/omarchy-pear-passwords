@@ -74,12 +74,19 @@ class FakeStore:
 
     @classmethod
     def create(cls, uid):
-        st = cls.open(uid)
-        if st.exists:
+        # Like UserStore.create, the result is a NEW object: locking the one the session held
+        # before does not reach it (round 2 audit, problem 2). It keeps whatever a test set on
+        # the empty store, and shares its call log.
+        old = cls.open(uid)
+        if old.exists:
             raise vstore.StoreError("exists")
+        st = cls(uid)
+        st.__dict__.update({k: v for k, v in old.__dict__.items()
+                            if k not in ("exists", "keys", "lock_calls")})
         st.exists = True
         st.keys = True
         st.recorded_state = None
+        cls.instances[uid] = st
         st.calls.append("create")
         return st
 

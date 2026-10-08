@@ -135,6 +135,9 @@ class Session:
         # A lock landed while a store call held the store's mutex: the keys are wiped as soon
         # as that call returns, and no other store call for this uid starts before then.
         self.wipe_after = False
+        # A create()/reset() is running: it builds a new store object that comes back
+        # unlocked, which a lock cannot reach through self.store (round 2 audit, problem 2).
+        self.replacing = False
 
     def unlocked(self) -> bool:
         t = self.tier1
@@ -286,7 +289,7 @@ class Registry:
             return NO_AGENT
 
     async def run_store(self, uid: int, fn: Callable[..., Any], *args: Any,
-                        keyless: bool = False) -> Any:
+                        keyless: bool = False, replaces: bool = False) -> Any:
         s = self.sessions.get(uid)
         if s is None:
             raise OpError("internal")
@@ -305,9 +308,22 @@ class Registry:
             if s.wipe_after:
                 raise OpError("locked")
             epoch = s.epoch
+            new = None
+            s.replacing = replaces
             try:
-                return await self._in_pool(self._store_pool, fn, *args)
+                new = await self._in_pool(self._store_pool, fn, *args)
+                return new
             finally:
+                # replaces: fn is create()/reset() and returns the new store, unlocked. A lock
+                # that landed meanwhile wiped only the old object (and left wipe_after set, so
+                # sleep was held back and nothing else ran): wipe the new one too. The
+                # caller sees the epoch change and does not open tier 1 on it.
+                s.replacing = False
+                if replaces and new is not None and s.epoch != epoch:
+                    try:
+                        new.lock()
+                    except Exception:
+                        logger.exception("uid %d: wiping the new store failed", uid)
                 if s.wipe_after or (s.epoch != epoch and not s.unlocked()):
                     self._wipe_store(s)
 
@@ -435,7 +451,8 @@ class Registry:
     def _wipe_store(self, s: Session) -> None:
         """Wipe the store's keys without ever waiting on the event loop. If a store call holds
         the store right now, flag wipe-after: run_store wipes when that call returns and
-        refuses new calls until then."""
+        refuses new calls until then. While a create()/reset() runs (s.replacing) the wipe
+        stays pending even when the old object was wiped: the new one is still being built."""
         try:
             try_lock = getattr(s.store, "try_lock", None)
             if try_lock is None:
@@ -446,7 +463,7 @@ class Registry:
         except Exception:
             logger.exception("uid %d: store.lock() failed", s.uid)
             return
-        if done:
+        if done and not s.replacing:
             s.wipe_after = False
         elif not s.wipe_after:
             s.wipe_after = True

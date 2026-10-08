@@ -124,8 +124,10 @@ def _store_error(e: BaseException) -> OpError | None:
     return None
 
 
-async def _store(reg, uid: int, fn, *args, keyless: bool = False):
+async def _store(reg, uid: int, fn, *args, keyless: bool = False, replaces: bool = False):
     try:
+        if replaces:
+            return await reg.run_store(uid, fn, *args, replaces=True)
         return await reg.run_store(uid, fn, *args, keyless=keyless)
     except Exception as e:
         err = _store_error(e)
@@ -133,6 +135,27 @@ async def _store(reg, uid: int, fn, *args, keyless: bool = False):
             logger.exception("uid %d: store call %s failed", uid, getattr(fn, "__name__", fn))
             raise OpError("internal") from None
         raise err from None
+
+
+async def _replace_store(reg, s, conn, make) -> int:
+    """s.store = make(uid), where make is create() or reset(): a new store object that comes
+    back unlocked. A lock that lands while it runs (sleep, logind Lock, the Lock button, the
+    window closing) cannot reach that object through s.store; run_store wipes it, and here the
+    op ends instead of opening tier 1 on it (round 2 audit, problem 2). Returns the epoch the
+    caller checks again (_not_locked_since) before it opens tier 1 after further awaits."""
+    epoch = s.epoch
+    new = await _store(reg, conn.uid, make, conn.uid, replaces=True)
+    s.store = new                      # the store on disk now, whatever happens next
+    _not_locked_since(reg, s, conn, epoch)
+    return epoch
+
+
+def _not_locked_since(reg, s, conn, epoch: int) -> None:
+    """Before opening tier 1 on a store this op made: nothing locked the uid since `epoch`
+    and this is still its window. Otherwise wipe the store and end the op."""
+    if s.epoch != epoch or conn.closed or s.ui is not conn:
+        reg._wipe_store(s)
+        raise OpError("cancelled")
 
 
 def apple_error(e: BaseException) -> OpError:
@@ -794,9 +817,11 @@ async def op_signin(reg, conn, req):
         if fresh:
             if await _store(reg, conn.uid, s.store.state) != "empty":
                 raise OpError("not-locked")
-            s.store = await _store(reg, conn.uid, reg.store_cls.create, conn.uid)
+            if s.epoch != epoch:
+                raise OpError("cancelled")
+            await _replace_store(reg, s, conn, reg.store_cls.create)
+            # open_tier1 does not move the epoch: a lock from here on still ends the op.
             reg.open_tier1(s, conn)
-            epoch = s.epoch
         _still(s, conn, epoch)
         s.signin = fe
         ctx = UserContext(conn.uid, s.store, reg.anisette_url, fe)
@@ -939,15 +964,13 @@ async def op_migrate_begin(reg, conn, req):
     if s.unlocked():
         reg.lock(conn.uid, None, notify=False)
     make = reg.store_cls.reset if retry else reg.store_cls.create
-    s.store = await _store(reg, conn.uid, make, conn.uid)
-    if conn.closed or s.ui is not conn:
-        reg._wipe_store(s)
-        raise OpError("cancelled")
+    epoch = await _replace_store(reg, s, conn, make)
     s.migrating = True
     try:
         await _save_setting_keys(reg, s, migration_pending=True)
     except OpError:
         logger.warning("uid %d: could not record the pending migration", conn.uid)
+    _not_locked_since(reg, s, conn, epoch)
     reg.open_tier1(s, conn)
     token = reg.tickets.issue(uid=conn.uid, role="migrate", purpose="import", ui_conn=conn)
     return {"ticket": token, "ttl": protocol.TICKET_TTL_S}
@@ -1052,14 +1075,12 @@ async def op_reset(reg, conn, req):
     reg.lock(conn.uid, None, notify=False)
     reg.withdraw(conn.uid, roles=("migrate",))
     s.migrating = False
-    s.store = await _store(reg, conn.uid, reg.store_cls.reset, conn.uid)
-    if conn.closed or s.ui is not conn:
-        reg._wipe_store(s)
-        raise OpError("cancelled")
+    epoch = await _replace_store(reg, s, conn, reg.store_cls.reset)
     try:
         await _save_setting_keys(reg, s, migration_pending=None)
     except OpError:
         logger.warning("uid %d: could not clear the pending migration record", conn.uid)
+    _not_locked_since(reg, s, conn, epoch)
     # The old keys are gone and the fresh store holds nothing; tier 1 stays open on it so the
     # sign-in that follows needs only its own dialog.
     reg.open_tier1(s, conn)
