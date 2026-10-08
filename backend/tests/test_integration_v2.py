@@ -10,6 +10,7 @@ CloudKit fetch (the fixture's own credentials) are stand-ins. Everything is fake
 import asyncio
 import base64
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -49,6 +50,85 @@ class VersionTests(unittest.TestCase):
         with open(os.path.join(root, "backend", "pyproject.toml"), encoding="utf-8") as f:
             pyproject = re.search(r'^version = "([^"]+)"', f.read(), re.M).group(1)
         self.assertEqual({handlers.VERSION, manifest, pyproject}, {"2.0.0"})
+
+
+class NoLeaseCodeTests(unittest.TestCase):
+    """Owner decision (spec 16.5): no sync lease, and no code path for one. Two matchers over
+    every code file: Python's AST (names, attributes, arguments, keys and non-docstring
+    strings) and Python's tokenizer, plus comment-stripped text for QML, shell and units.
+    Comments and docstrings may say that there is no lease."""
+
+    WORD = re.compile(r"(?i)(?<!re)lease")
+    DIRS = ("backend/icp", "app", "plugin", "native", "system")
+    ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+
+    def files(self, exts):
+        for d in self.DIRS:
+            for dirpath, _, names in os.walk(os.path.join(self.ROOT, d)):
+                for n in names:
+                    if n.endswith(exts) or (not exts and "." not in n):
+                        yield os.path.join(dirpath, n)
+
+    def ast_hits(self, src):
+        import ast
+        tree = ast.parse(src)
+        docs = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                body = getattr(node, "body", [])
+                if body and isinstance(body[0], ast.Expr) and isinstance(
+                        getattr(body[0], "value", None), ast.Constant):
+                    docs.add(id(body[0].value))
+        hits = []
+        for node in ast.walk(tree):
+            for text in (getattr(node, "id", None), getattr(node, "attr", None),
+                         getattr(node, "arg", None),
+                         node.name if isinstance(node, (ast.FunctionDef, ast.ClassDef,
+                                                        ast.AsyncFunctionDef)) else None,
+                         node.value if isinstance(node, ast.Constant) and isinstance(
+                             node.value, str) and id(node) not in docs else None):
+                if isinstance(text, str) and self.WORD.search(text):
+                    hits.append(text)
+        return hits
+
+    def token_hits(self, src):
+        import io as _io
+        import tokenize
+        hits, prev = [], None
+        for tok in tokenize.generate_tokens(_io.StringIO(src).readline):
+            if tok.type == tokenize.NAME and self.WORD.search(tok.string):
+                hits.append(tok.string)
+            # A string statement right after a newline/indent is a docstring: skipped.
+            if tok.type == tokenize.STRING and self.WORD.search(tok.string) and prev not in (
+                    tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, None, tokenize.NL):
+                hits.append(tok.string)
+            if tok.type not in (tokenize.COMMENT,):
+                prev = tok.type
+        return hits
+
+    def test_no_lease_in_python(self):
+        n = 0
+        for path in self.files((".py",)):
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+            n += 1
+            self.assertEqual(self.ast_hits(src), [], path)
+            self.assertEqual(self.token_hits(src), [], path)
+        self.assertGreater(n, 50)
+
+    def test_no_lease_elsewhere(self):
+        for path in self.files((".qml", ".sh", ".c", ".service", ".socket", ".policy", ".js")):
+            with open(path, encoding="utf-8") as f:
+                for i, line in enumerate(f, 1):
+                    code = re.split(r"(^|\s)(#|//)", line, maxsplit=1)[0]
+                    self.assertIsNone(self.WORD.search(code), f"{path}:{i}: {line.strip()}")
+
+    def test_the_matchers_see_a_lease(self):
+        src = 'SYNC_LEASE_H = 0\ndef f(lease_h):\n    return {"sync_lease_h": lease_h}\n'
+        self.assertEqual(len(self.ast_hits(src)), 4)
+        self.assertGreaterEqual(len(self.token_hits(src)), 4)
+        self.assertEqual(self.ast_hits('"""no sync lease"""\n# no lease\nrelease = 1\n'), [])
+        self.assertEqual(self.token_hits('"""no sync lease"""\n# no lease\nrelease = 1\n'), [])
 
 
 class RealStoreHarness(Harness):
