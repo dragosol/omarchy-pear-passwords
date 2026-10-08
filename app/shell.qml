@@ -7,257 +7,444 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui as O
 
+// Pear Passwords 2: the window.
+//
+// It runs as `pear-exec ui` from the root-owned copy in /usr/local/lib/pear-passwords/app, with
+// effective gid pear-client, non-dumpable, and an environment pear-exec built from scratch. It
+// holds no key and reads no vault file. Everything comes from pear-passwordsd over one socket
+// (docs/protocol.md), and that one connection is the unlocked session: close the window and
+// the daemon locks.
+//
+// Rules this file keeps (backend/tests/test_qml_*.py check them):
+//   - no Quickshell IPC handler element, here or in any Omarchy Ui component it instantiates
+//     (Ui/Panel has one, so Panel is never used);
+//   - every Text and TextArea is PlainText, so nothing from Apple or a site is ever markup;
+//   - no console.log, of anything;
+//   - child processes only from the fixed list below: hyprctl (window rules, focus, opening a
+//     link through Hyprland so the browser does not inherit our group), pear-exec clip and
+//     migrate, the touchpad watcher and `systemctl show` for diagnostics.
+// A secret (password, notes, history, code) enters this process only after an explicit
+// action inside that account's grant, is shown for at most `hide_after` seconds or until the
+// window loses focus, then the property is overwritten. QML strings cannot be zeroed; that
+// residue is the documented limit of a QML window.
 ShellRoot {
     id: root
 
+    // ---------------------------------------------------------------- fixed paths and commands
+    readonly property string socketPath: "/run/pear-passwords/client.sock"
+    readonly property string pearExec: "/usr/local/lib/pear-passwords/libexec/pear-exec"
+    readonly property string touchWatchPath: decodeURIComponent(
+        Qt.resolvedUrl("touch_watch.py").toString().replace(/^file:\/\//, ""))
+    readonly property string home: Quickshell.env("HOME")
+    // pear-exec points XDG_CONFIG_HOME and XDG_STATE_HOME at an empty directory, so the two
+    // files of yours this window looks at are named from HOME, exactly where 1.x and Omarchy
+    // keep them.
+    readonly property string v1Dir: home + "/.config/icp"
+    readonly property string clipHistoryPath: home + "/.local/state/omarchy/clipboard-history.json"
+    // Registered once per Hyprland session, before the window maps (it stays hidden until
+    // this has run). no_screen_share keeps the window out of screen sharing and most capture
+    // tools; it is best effort, a revealed password can still be photographed.
+    readonly property string windowRulesLua: "if not _G.__pear_passwords_rules_v2 then "
+        + "local m = { class = [[^org\\.quickshell$]], title = [[^Pear Passwords$]] } "
+        + "hl.window_rule({ match = m, tag = [[-default-opacity]] }) "
+        + "hl.window_rule({ match = m, opacity = [[1 override 1 override]] }) "
+        + "hl.window_rule({ match = m, float = true }) "
+        + "hl.window_rule({ match = m, size = [[960 640]] }) "
+        + "hl.window_rule({ match = m, center = true }) "
+        + "hl.window_rule({ match = m, no_screen_share = true }) "
+        + "_G.__pear_passwords_rules_v2 = true end"
+    readonly property string focusLua: "hl.dsp.focus({ window = \"title:^Pear Passwords$\" })"
+    // What a site may look like before it is handed to Hyprland to open: a lowercase host of
+    // two or more labels, an optional port and a plain path. Nothing that could end the Lua
+    // string or reach a shell (no quotes, spaces, $, backslashes or semicolons).
+    readonly property var urlPattern: /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/%-]*)?$/
+    readonly property string registerCommand:
+        "pear-passwords-autofill register --browser zen --extension-id <your extension's id>"
+    readonly property var legacyUnits: ["icp-host.service", "icp-sync.timer", "icp-sync.service",
+                                        "pear-passwords-sync.timer", "pear-passwords-sync.service"]
+
+    // ---------------------------------------------------------------- what the daemon said
+    // phase: can we talk to the daemon at all. vaultState: what it said about the store.
+    property string phase: "connecting"        // connecting ready not-installed launcher daemon-failed abi-mismatch
+    property string daemonDetail: ""
+    property string vaultState: ""             // empty locked unlocked tpm-missing tpm-cleared damaged
+    property string lockReason: ""             // why the last unlock did not open the list
+    property bool signedIn: false
+    property string sealedWith: ""
+    property var settings: ({ grant_s: 120, idle_lock_s: 0, clip_timeout_s: 30 })
+    property var oldCopy: null
+    property real syncedAt: 0
+    property bool syncing: false
+    property bool v1Present: false
+    property bool v1Checked: false
+    property bool everConnected: false
+
+    // The screen follows from the above; nothing else decides it.
+    readonly property string screen: {
+        if (root.phase !== "ready") return root.phase;
+        if (root.migrateStep !== "") return "migrate";
+        if (root.appUnlocked) return "list";
+        switch (root.vaultState) {
+        case "empty": return !root.v1Checked ? "connecting" : (root.v1Present ? "migrate" : "empty");
+        case "tpm-missing": case "tpm-cleared": case "damaged": return root.vaultState;
+        }
+        if (root.lockReason === "no-agent" || root.lockReason === "busy") return "no-agent";
+        return "locked";
+    }
+
+    // ---------------------------------------------------------------- the list
     property var entries: []
     property var filtered: []
     property int cursor: -1
     property var selected: null
     property string selectedId: ""
+    property bool appUnlocked: false
+    property bool autoAuthTried: false
+    property bool authing: false
+    property int authRid: -1
+    property bool authRetry: false
+    property bool startOverConfirm: false
+    property bool needsLogin: false
 
-    // Two clocks, both restarted by a fingerprint and both app-wide (the backend owns them;
-    // these are only what the window counts down). `unlocked` = the scan still counts, so
-    // revealing, copying and editing work. When it lapses the list stays readable and the next
-    // such action asks again. When `sessionLeft` runs out the whole window locks.
-    property real fullUntil: 0
-    property real sessionUntil: 0
-    property int unlockLeft: 0
-    property int sessionLeft: 0
-    readonly property bool unlocked: unlockLeft > 0
+    // ---------------------------------------------------------------- the one account grant
+    // At most one account is open at a time, for settings.grant_s seconds (0 = one use).
+    property string grantId: ""
+    property real grantExpires: 0              // 0 with a single-use grant
+    property bool grantSingleUse: false
+    property int grantLeft: 0
+    property bool granting: false
+    property int grantRid: -1
+    readonly property bool unlocked: root.grantId !== "" && root.grantId === root.selectedId
+                                     && (root.grantSingleUse || root.grantLeft > 0)
 
+    // ---------------------------------------------------------------- secrets on screen
     property string revealed: ""
     property var historyRows: []
     property var revealedHistory: ({})
+    property bool historyLoaded: false
     property string totpCode: ""
     property int totpLeft: 0
+    property string notesText: ""
+    property bool notesLoaded: false
+    property int hideAfter: 20
+
     property string status: ""
     property string flash: ""
     property bool busy: false
     property bool confirming: false
-    property bool generated: false
+    property bool generateNew: false
     property bool renaming: false
-    property bool historyLoaded: false
     property bool changing: false
-    // Notes are read only under the per-entry unlock (people keep recovery answers there).
-    property string notesText: ""
-    property bool notesLoaded: false
     // ---- editor sheet: websites / notes / verification code / new entry
     property bool editorOpen: false
     property string editorMode: ""               // sites | notes | totp | create
     property bool editorBusy: false
-    property bool editorScanning: false
     property string editorError: ""
     property var totpPreview: ({})
     property bool createMore: false
-    // Two keyboard zones: the list (search field has focus) and the detail panel (detailKeys has
-    // focus). Tab crosses between them; inside the panel the arrows walk the rows.
+    property bool createGenerate: false
     property bool panelFocus: false
     property int detailIndex: 0
     readonly property int fieldCount: root.fieldRows().length
-    // The app opens locked. Until the fingerprint/password check passes the backend sends no
-    // names at all - these are only the window's view of that.
-    property bool appUnlocked: false
-    property bool autoAuthTried: false
-    property bool needsLogin: false
-    property bool signedIn: true
     property bool firstRunShown: false
-    // ---- sign-in sheet. It draws only what the backend says it is doing (stage events) and
-    // asking for (typed prompts); it holds no idea of Apple's sequence of its own.
+    // ---- sign-in sheet: draws only what the daemon's sign-in stream says
     property bool signinOpen: false
-    property string signinMode: "login"          // login | sync
+    property string signinMode: "login"          // login | relogin
     property bool signinRunning: false
-    property string signinStage: ""              // account signing_in verify finding_devices joining syncing synced
+    property int signinRid: -1
+    property int signinAskId: -1
+    property string signinStage: ""
     property string signinNeed: ""               // text | secret | confirm | choice - "" while working
-    property string signinKind: ""               // apple_id password code device join_confirm device_passcode
+    property string signinKind: ""
     property string signinDefault: ""
     property string signinDetail: ""
     property var signinOptions: []
     property var signinDetails: []
-    property var signinDevice: ({})            // {name, model, secret} once a device is picked
+    property var signinDevice: ({})
     property int signinChoice: -1
     property string signinVia: "trusted"
     property int signinCount: -1
-    property bool signinVerified: false          // a code was asked for and accepted
+    property bool signinVerified: false
     property string signinError: ""
     property var signinWarnings: []
-    property var signinLog: []                   // raw lines, shown only under "Details" on failure
+    property var signinLog: []
     property bool signinShowDetails: false
     property string signinOutcome: ""            // "" | ok | error | cancelled
+    // ---- migration sheet
+    property string migrateStep: ""              // "" intro running passphrase done error
+    property bool migrateManifests: true
+    property string migrateStage: ""
+    property bool migrateRetry: false
+    property var migrateResult: ({})
+    property string migrateError: ""
+    // ---- settings sheet
+    property bool settingsOpen: false
+    property string historyCheck: ""             // result line of the clipboard-history check
+    property bool historyChecking: false
+    property bool purging: false
+    property bool windowReady: false
+    property bool connectGrace: false
 
-    // The backend CLI, where install.sh puts it. PEAR_PASSWORDS_ICP overrides it for development.
-    readonly property string icp: Quickshell.env("PEAR_PASSWORDS_ICP")
-        || (Quickshell.env("HOME") + "/.local/share/pear-passwords/venv/bin/icp")
-    readonly property bool debugWheel: Quickshell.env("PEAR_PASSWORDS_DEBUG_WHEEL") === "1"
-
-    // ---- setup gate
-    // `omarchy plugin add` installs this window and its launcher but deliberately not the
-    // backend: building it downloads pinned wheels, which should be a decision rather than a
-    // side effect of enabling a plugin. So the window opens either way and asks here. Nothing
-    // below this is reachable until the backend exists - there is nothing to show without it.
-    property bool backendReady: true          // assumed until the check below says otherwise
-    property bool setupRunning: false
-    property string setupLog: ""
-    property string setupError: ""
-    property string setupSource: ""
-    property string setupTail: ""
-    // install.sh colours its own output for a terminal; a Text renders the escape codes as
-    // visible junk. Strip them rather than asking the installer to stop being readable.
-    function plain(s) {
-        return (s || "").replace(/\u001b\[[0-9;]*m/g, "").replace(/\u001b\][^\u0007]*\u0007/g, "").trim();
-    }
-    // install.sh --app-only wrote this when the plugin laid the window down.
-    readonly property string sourceDir: Quickshell.env("PEAR_PASSWORDS_SOURCE")
-        || (Quickshell.env("HOME") + "/.local/share/pear-passwords/app/.source")
-
-    // Development only. With PEAR_PASSWORDS_SNAPSHOT set, the window renders itself to that PNG
-    // and quits - run under QT_QPA_PLATFORM=offscreen and nothing ever appears on screen, so
-    // a visual change can be checked without a window landing on top of whatever you're doing.
+    readonly property bool debugWheel: false
+    // Development only (pear-exec drops every variable, so the installed window never sees
+    // these): PEAR_PASSWORDS_SNAPSHOT renders the window to a PNG and quits;
+    // PEAR_PASSWORDS_PREVIEW=<screen> fills it with made-up data and never connects.
     readonly property string snapshotPath: Quickshell.env("PEAR_PASSWORDS_SNAPSHOT") || ""
-    readonly property string snapshotQuery: Quickshell.env("PEAR_PASSWORDS_SNAPSHOT_QUERY") || ""
+    readonly property string previewMode: Quickshell.env("PEAR_PASSWORDS_PREVIEW") || ""
+    readonly property bool headless: Quickshell.env("QT_QPA_PLATFORM") === "offscreen"
 
-    // ---------------------------------------------------------------- process plumbing
-    property var queue: []
+    // ---------------------------------------------------------------- the daemon socket
+    property int nextRid: 1
+    property var pending: ({})                   // rid -> function(reply)
 
-    function run(args, stdinText, done) {
-        if (proc.running) {
-            root.queue = root.queue.concat([{ args: args, stdinText: stdinText, done: done }]);
-            return;
+    Socket {
+        id: daemon
+        path: root.socketPath
+        parser: SplitParser {
+            splitMarker: "\n"
+            onRead: function (line) { root.onLine(line); }
         }
-        proc.handler = done;
-        // Newline-terminated: the backend reads exactly one line. It used to read to EOF,
-        // and since this pipe stays open the process waited in read() forever.
-        proc.pending = stdinText && stdinText.length ? stdinText + "\n" : "";
-        proc.command = [root.icp].concat(args);
-        root.busy = true;
-        proc.running = true;
-    }
-
-    function drain() {
-        if (!root.queue.length || proc.running) return;
-        const q = root.queue[0];
-        root.queue = root.queue.slice(1);
-        root.run(q.args, q.stdinText, q.done);
-    }
-
-    Process {
-        id: proc
-        property var handler: null
-        property string pending: ""
-        running: false
-        stdinEnabled: true
-        onStarted: { if (pending.length) write(pending); stdinEnabled = false; }
-        stdout: StdioCollector {
-            onStreamFinished: {
-                root.busy = false;
-                let d = null;
-                try { d = JSON.parse(this.text); } catch (e) {}
-                if (!d) { root.status = "no reply from icp"; return; }
-                if (d.ok === false) { root.status = d.error || "failed"; return; }
-                root.status = "";
-                if (proc.handler) proc.handler(d);
+        onConnectionStateChanged: {
+            if (daemon.connected) {
+                root.everConnected = true;
+                root.pending = ({});
+                root.nextRid = 1;
+                daemon.write(JSON.stringify({ op: "hello", rid: 0, role: "ui", proto: 2 }) + "\n");
+                daemon.flush();
+            } else if (root.phase === "ready") {
+                // The daemon went away (restart, crash, uninstall). Whatever was open is gone
+                // with it; say so instead of showing a list that can no longer do anything.
+                root.lockApp("");
+                root.phase = "daemon-failed";
+                root.daemonDetail = "The connection to Pear's background service was lost.";
+                diagnose.running = true;
             }
         }
-        onExited: { root.busy = false; Qt.callLater(root.drain); }
+        onError: function (error) {
+            if (root.phase === "ready") return;
+            // 1 = not found (no socket: not installed, or the socket unit is off),
+            // 2 = refused, 0/3 = access (started without pear-exec)
+            if (error === 3 || error === 0) { root.phase = "launcher"; return; }
+            diagnose.running = true;
+        }
     }
 
+    function send(op, fields, done) {
+        if (!daemon.connected) { if (done) done({ error: "daemon" }); return -1; }
+        const rid = root.nextRid++;
+        if (done) {
+            const p = root.pending;
+            p[rid] = done;
+            root.pending = p;
+        }
+        daemon.write(JSON.stringify(Object.assign({ op: op, rid: rid }, fields || {})) + "\n");
+        daemon.flush();
+        return rid;
+    }
+
+    function onLine(line) {
+        if (!line || !line.length) return;
+        let m = null;
+        try { m = JSON.parse(line); } catch (e) { return; }
+        if (!m || typeof m !== "object") return;
+        if (m.event !== undefined) { root.onEvent(m); return; }
+        if (m.rid === 0 && root.phase !== "ready") { root.onHello(m); return; }
+        const cb = root.pending[m.rid];
+        if (cb) {
+            const p = root.pending;
+            delete p[m.rid];
+            root.pending = p;
+            cb(m);
+        }
+    }
+
+    function onHello(m) {
+        if (m.error === "already-running") { Qt.quit(); return; }    // the other window raises itself
+        if (m.error) {
+            root.phase = "daemon-failed";
+            root.daemonDetail = "The background service refused this window (" + m.error + ").";
+            return;
+        }
+        root.phase = "ready";
+        root.vaultState = m.state || "";
+        root.signedIn = !!m.signed_in;
+        root.sealedWith = m.sealed_with || "";
+        if (m.settings) root.settings = m.settings;
+        root.oldCopy = m.old_copy || null;
+        if (root.vaultState === "empty") { v1Check.check(); return; }
+        // Opening the window is the request to see it: ask once, straight away. Never for a
+        // window nobody can see (an offscreen load), and never again on our own after that.
+        if (root.vaultState === "locked" && !root.autoAuthTried && !root.headless) {
+            root.autoAuthTried = true;
+            root.authenticate();
+        }
+        if (root.snapshotPath) snapshotTimer.start();
+    }
+
+    function onEvent(m) {
+        switch (m.event) {
+        case "locked":
+            root.lockApp(m.reason || "");
+            return;
+        case "synced":
+            root.syncing = false;
+            root.syncedAt = m.synced_at || 0;
+            root.needsLogin = false;
+            root.setEntries(m.entries || []);
+            return;
+        case "sync-failed":
+            root.syncing = false;
+            if (m.reason === "needs-login") root.needsLogin = true;
+            root.showFlash(m.reason === "anisette-unavailable" ? "Sync failed — the local sign-in helper isn't running"
+                         : m.reason === "network" ? "Sync failed — iCloud couldn't be reached"
+                         : m.reason === "needs-login" ? "Sync paused — iCloud wants you to sign in again"
+                         : "Sync failed");
+            return;
+        case "needs-login":
+            root.needsLogin = true;
+            return;
+        case "grant-expired":
+            if (m.id === root.grantId) root.endGrant();
+            return;
+        case "clip":
+            root.showFlash(root.clipWords(m.field) + (m.outcome === "pasted" ? " pasted — now cleared"
+                         : m.outcome === "expired" ? " cleared from the clipboard"
+                         : m.outcome === "replaced" ? " replaced by something you copied"
+                         : m.outcome === "withdrawn" ? " taken back off the clipboard"
+                         : " couldn't be put on the clipboard"));
+            return;
+        case "autofill":
+            root.showFlash(m.outcome === "filled" ? "Filled a password on " + (m.origin || "a site")
+                         : m.outcome === "failed" ? "A browser fill failed"
+                         : "A browser fill was not approved");
+            return;
+        case "migrated":
+            root.migrateResult = Object.assign({}, root.migrateResult, { counts: m.counts || {} });
+            return;
+        case "focus":
+            focusProc.running = true;
+            return;
+        case "stage": case "out": case "ask":
+            if (m.rid === root.signinRid) root.onSigninEvent(m);
+            return;
+        }
+    }
+
+    // Couldn't connect: work out which of the error screens it is.
+    Process {
+        id: diagnose
+        running: false
+        command: ["/usr/bin/systemctl", "show", "-p", "LoadState,ActiveState,Result,ExecMainStatus", "pear-passwordsd.service"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                const v = {};
+                for (const line of this.text.split("\n")) {
+                    const i = line.indexOf("=");
+                    if (i > 0) v[line.slice(0, i)] = line.slice(i + 1);
+                }
+                if (root.snapshotPath) snapshotTimer.start();
+                if (v.LoadState === "not-found") { root.phase = "not-installed"; return; }
+                if (v.ExecMainStatus === "78") { root.phase = "abi-mismatch"; return; }
+                root.phase = "daemon-failed";
+                if (!root.daemonDetail)
+                    root.daemonDetail = v.Result && v.Result !== "success"
+                        ? "It stopped with \"" + v.Result + "\"." : "";
+            }
+        }
+    }
+
+    function reconnect() {
+        root.phase = "connecting";
+        root.daemonDetail = "";
+        daemon.connected = false;
+        daemon.connected = true;
+    }
+
+    // ---------------------------------------------------------------- is there a 1.x vault?
+    // Only whether kdf.json and check.enc exist matters (both are non-secret or ciphertext);
+    // the importer, not this window, reads the vault.
+    QtObject {
+        id: v1Check
+        property int pendingChecks: 0
+        property bool kdf: false
+        property bool check_: false
+        function check() {
+            kdf = false; check_ = false; pendingChecks = 2;
+            kdfFile.path = ""; kdfFile.path = root.v1Dir + "/kdf.json";
+            checkFile.path = ""; checkFile.path = root.v1Dir + "/check.enc";
+        }
+        function settle() {
+            if (--pendingChecks > 0) return;
+            root.v1Present = kdf && check_;
+            root.v1Checked = true;
+            if (root.v1Present && root.migrateStep === "") root.migrateStep = "intro";
+            if (root.snapshotPath) snapshotTimer.start();
+        }
+    }
+    FileView {
+        id: kdfFile
+        printErrors: false
+        onLoaded: { v1Check.kdf = true; v1Check.settle(); }
+        onLoadFailed: v1Check.settle()
+    }
+    FileView {
+        id: checkFile
+        printErrors: false
+        onLoaded: { v1Check.check_ = true; v1Check.settle(); }
+        onLoadFailed: v1Check.settle()
+    }
+
+    // ---------------------------------------------------------------- Hyprland
+    Process {
+        id: rulesProc
+        running: !root.previewMode
+        command: ["/usr/bin/hyprctl", "eval", root.windowRulesLua]
+        onExited: root.windowReady = true
+    }
+    Timer {
+        // Without Hyprland (or a hung hyprctl) the window must still appear.
+        interval: 1500; running: !root.windowReady; onTriggered: root.windowReady = true
+    }
+    Timer { interval: 800; running: true; onTriggered: root.connectGrace = true }
+    Process {
+        id: focusProc
+        running: false
+        command: ["/usr/bin/hyprctl", "dispatch", root.focusLua]
+    }
+    // A link opens through Hyprland, so the browser is Hyprland's child, not ours: a child of
+    // this window would inherit the pear-client group and could talk to the daemon.
+    Process {
+        id: opener
+        property string lua: ""
+        running: false
+        command: ["/usr/bin/hyprctl", "dispatch", opener.lua]
+    }
+
+    // ---------------------------------------------------------------- clocks
     Timer {
         interval: 1000; running: true; repeat: true
         onTriggered: {
             const now = Date.now() / 1000;
-            const wasUnlocked = root.unlockLeft > 0;
-            root.unlockLeft = Math.max(0, Math.ceil(root.fullUntil - now));
-            root.sessionLeft = Math.max(0, Math.ceil(root.sessionUntil - now));
-            // The scan stopped counting: put the secrets away, keep the list.
-            if (wasUnlocked && root.unlockLeft === 0 && !root.busy && root.queue.length === 0)
-                root.forgetSecrets();
-            // And when the session runs out, the window locks and the backend stops sending.
-            if (root.appUnlocked && root.sessionUntil > 0 && root.sessionLeft === 0
-                && !root.busy && root.queue.length === 0) root.lockApp();
-            if (root.totpLeft > 0) root.totpLeft -= 1;
-        }
-    }
-
-    Timer { id: flashTimer; interval: 2600; onTriggered: root.flash = "" }
-
-    Process {
-        id: edProc
-        property var handler: null
-        property string pending: ""
-        running: false
-        stdinEnabled: true
-        onStarted: { if (pending.length) write(pending); }
-        stdout: StdioCollector {
-            onStreamFinished: {
-                let d = null;
-                try { d = JSON.parse(this.text); } catch (e) {}
-                if (edProc.handler) edProc.handler(d || { ok: false, error: "no reply from the backend" });
+            if (root.grantId !== "" && !root.grantSingleUse) {
+                root.grantLeft = Math.max(0, Math.ceil(root.grantExpires - now));
+                if (root.grantLeft === 0) root.endGrant();
+            }
+            if (root.totpLeft > 0) {
+                root.totpLeft -= 1;
+                if (root.totpLeft === 0) root.totpCode = "";
             }
         }
     }
-    // ---- setup gate plumbing
-    Process {
-        id: backendCheck
-        running: true
-        command: ["test", "-x", root.icp]
-        onExited: function (code) {
-            root.backendReady = (code === 0);
-            // The usual snapshot hooks all hang off a reply from the backend, which is the one
-            // thing missing when the gate is showing. Without this the gate is the only screen
-            // in the app that cannot be captured, which is exactly the screen worth checking.
-            if (!root.backendReady && root.snapshotPath) snapshotTimer.start();
+    Timer { id: flashTimer; interval: 3200; onTriggered: root.flash = "" }
+    // Whatever secret is on screen goes after hide_after seconds.
+    Timer { id: hideTimer; interval: root.hideAfter * 1000; onTriggered: root.hideSecrets() }
+    // ...or as soon as the window is not the one you are looking at.
+    Connections {
+        target: Qt.application
+        function onStateChanged() {
+            if (Qt.application.state !== Qt.ApplicationActive) root.hideSecrets();
         }
     }
-
-    Process {
-        id: sourceRead
-        running: true
-        command: ["cat", root.sourceDir]
-        stdout: StdioCollector {
-            onStreamFinished: root.setupSource = this.text.trim();
-        }
-    }
-
-    // The repository's own installer, run on an explicit click. User-level: it never uses sudo
-    // and refuses to run as root, and every wheel it installs is pinned to a committed hash.
-    Process {
-        id: setupProc
-        running: false
-        command: root.setupSource ? [root.setupSource + "/install.sh"] : []
-        onRunningChanged: root.setupRunning = running
-        stdout: SplitParser {
-            splitMarker: "\n"
-            onRead: function (line) { root.setupLog = root.plain(line); }
-        }
-        // Not every line on stderr is a failure. The install compiles the anisette server and
-        // podman writes its build progress to stderr, so treating that as an error showed two
-        // minutes of red text while everything was fine. Keep the last few lines and only
-        // call them an error if the process actually exits non-zero.
-        stderr: SplitParser {
-            splitMarker: "\n"
-            onRead: function (line) {
-                var t = root.plain(line);
-                if (!t)
-                    return;
-                root.setupLog = t;
-                root.setupTail = (root.setupTail + "\n" + t).split("\n").slice(-4).join("\n").trim();
-            }
-        }
-        onExited: function (code) {
-            if (code !== 0) {
-                root.setupError = root.setupTail || ("Setup stopped with code " + code);
-                return;
-            }
-            root.setupError = "";
-            root.setupLog = "";
-            // The backend exists now. Hiding the gate is not enough: the app's first app-list
-            // ran before it was there and failed, so nothing would ever ask again. Start the
-            // normal load, which is what would have happened had the backend been present.
-            root.backendReady = true;
-            root.refresh();
-        }
-    }
-
     Timer {
         id: previewDebounce
         interval: 300
@@ -269,235 +456,248 @@ ShellRoot {
     // delivers (see touch_watch.py). Runs only while unlocked, prints only "touch".
     Process {
         id: touchWatch
-        running: root.appUnlocked
-        command: ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("touch_watch.py").toString().replace(/^file:\/\//, ""))]
+        running: root.appUnlocked && !root.previewMode
+        command: ["/usr/bin/python3", "-I", root.touchWatchPath]
         stdout: SplitParser {
             splitMarker: "\n"
             onRead: function (line) { if (line === "touch") list.catchCoast(); }
         }
     }
 
+    // ---------------------------------------------------------------- pear-exec children
+    // Copy: the value never comes here. The daemon puts it in a ticket; pear-clip redeems it
+    // and owns the clipboard. A component, because a second copy may start while the first
+    // clip process is still being told to withdraw.
+    Component {
+        id: clipComponent
+        Process {
+            property string ticket: ""
+            running: false
+            stdinEnabled: true
+            command: [root.pearExec, "clip"]
+            onStarted: { write(ticket + "\n"); ticket = ""; stdinEnabled = false; }
+            onExited: destroy()
+        }
+    }
+
+    // The importer: line 1 the ticket, line 2 the options, later only an answer it asks for.
     Process {
-        id: authProc
-        property bool restartAfterExit: false
-        running: false
-        command: [root.icp, "app-auth"]
-        stdout: StdioCollector {
-            onStreamFinished: {
-                let d = null;
-                try { d = JSON.parse(this.text); } catch (e) {}
-                if (!d) return;                // killed for a retry - no verdict to act on
-                if (d.authed) {
-                    root.appUnlocked = true; root.status = ""; root.readClocks(d); root.refresh();
-                }
-                else if (d.ok === false) root.status = d.error || "authentication failed";
-                else if (d.reason === "error")
-                    root.status = "couldn't reach the authentication prompt - press Unlock to retry";
-                else root.status = "cancelled";
-            }
-        }
-        onExited: {
-            root.authing = false;
-            if (restartAfterExit) {
-                restartAfterExit = false;
-                root.authing = true;
-                running = true;
-            }
-        }
-    }
-
-    Timer {
-        id: snapshotTimer
-        interval: 1500
-        onTriggered: scope.grabToImage(function (r) {
-            r.saveToFile(root.snapshotPath);
-            Qt.quit();
-        })
-    }
-
-    // Development only: PEAR_PASSWORDS_SIGNIN_PREVIEW=detail | editor_<mode> | search_2fa draws
-    // the unlocked window with made-up entries. Nothing is read from or written to the vault.
-    Timer {
-        id: detailPreview
-        interval: 700
-        property string mode: ""
-        onTriggered: {
-            const now = Date.now() / 1000;
-            const mk = function (n, user, sites, totp, notes, noSite, domain) {
-                return { id: "demo" + n, domain: domain || ("EXAMPLE-" + n), username: user,
-                         primary: "Example Account " + n, real_title: "Example Account " + n,
-                         nickname: "Example Account " + n, apple_title: "Example Account " + n,
-                         synced_name: true, secondary: user, no_site: !!noSite, mdat: now - n * 86400 * 3,
-                         has_totp: totp, aliases: [], sites: sites, has_notes: notes, ambiguous: false };
-            };
-            root.entries = [mk(1, "dummyuser1", ["example.com", "login.example.com"], true, true, true),
-                            mk(2, "dummyuser2", ["example.org"], false, true, true),
-                            mk(3, "dummyuser3", ["app.example.net"], true, false, false, "example.net"),
-                            mk(4, "alex@example.com", [], false, false, false, "example.dev"),
-                            Object.assign(mk(5, "Example Home", [], false, false, false, "AirPort"),
-                                          { primary: "Example Home", is_wifi: true, secondary: "" })];
-            root.appUnlocked = true;
-            const q = { search_2fa: "2FA codes", search_notes: "notes", search_websites: "websites", search_wifi: "wifi" }[mode];
-            if (q) search.text = q;
-            root.applyFilter();
-            root.select(root.entries[0]);
-            root.fullUntil = now + 95; root.sessionUntil = now + 275;
-            root.unlockLeft = 95; root.sessionLeft = 275;
-            root.notesText = "Recovery email: backup@example.com\nSecurity question: first pet — Pear";
-            root.notesLoaded = true;
-            root.totpCode = "482 913"; root.totpLeft = 21;
-            if (mode.indexOf("editor_") === 0) {
-                root.openEditor(mode.slice(7));
-                if (mode === "editor_totp") { edSetup.text = "otpauth://totp/Example:dummyuser1?secret=JBSWY3DPEHPK3PXP&issuer=Example"; }
-                if (mode === "editor_create") {
-                    crName.text = "Example Account 5"; crSite.text = "example.io"; crUser.text = "sam@example.io";
-                    crPass.text = "hutvab-6rixqo-Nocbam"; root.createMore = true;
-                }
-            }
-        }
-    }
-
-    Timer {
-        id: firstRunPreview
-        interval: 700            // after the (locked) first refresh has landed
-        onTriggered: { root.appUnlocked = true; root.entries = []; root.filtered = []; root.signedIn = false; }
-    }
-
-    Process {
-        id: signin
+        id: migrateProc
+        property string ticket: ""
+        property string options: ""
+        property bool purge: false
         running: false
         stdinEnabled: true
+        command: [root.pearExec, "migrate"]
+        onStarted: {
+            write(ticket + "\n" + (purge ? "" : options + "\n"));
+            ticket = "";
+            if (purge) stdinEnabled = false;
+        }
         stdout: SplitParser {
             splitMarker: "\n"
             onRead: function (line) {
-                if (!line || !line.trim().length) return;
                 let m = null;
-                try { m = JSON.parse(line); } catch (err) { return; }
-                if (m.need) {
-                    root.signinNeed = m.need;
-                    root.signinKind = m.kind || "";
-                    root.signinDefault = m.default || "";
-                    root.signinDetail = m.detail || "";
-                    root.signinOptions = m.options || [];
-                    root.signinDetails = m.details || [];
-                    root.signinChoice = (m.options && m.options.length === 1) ? 0 : -1;
-                    signinField.text = root.signinKind === "apple_id" ? root.signinDefault : "";
-                    codeField.text = "";
-                    Qt.callLater(root.focusSignin);
-                    return;
-                }
-                if (m.event === "stage" && m.stage === "device_chosen") {
-                    root.signinDevice = { name: m.name || "", model: m.model || "", secret: m.secret || "" };
-                    return;
-                }
-                if (m.event === "stage") {
-                    root.signinStage = m.stage;
-                    if (m.via) root.signinVia = m.via;
-                    if (m.count !== undefined) root.signinCount = m.count;
-                    return;
-                }
-                if (m.event === "done") {
-                    root.signinRunning = false;
-                    root.signinNeed = "";
-                    root.signinOutcome = m.cancelled ? "cancelled" : (m.ok ? "ok" : "error");
-                    if (m.cancelled) root.signinOpen = false;
-                    if (m.ok) root.refresh();
-                    return;
-                }
-                if (m.event === "err") root.signinError = m.text || "";
-                if (m.event === "warn") root.signinWarnings = root.signinWarnings.concat([m.text || ""]);
-                if (m.event) root.signinLogPush(m.event, m.text || "");
+                try { m = JSON.parse(line); } catch (e) { return; }
+                if (migrateProc.purge) root.onPurgeLine(m); else root.onMigrateLine(m);
             }
         }
-        onExited: {
-            root.signinRunning = false;
-            if (root.signinOutcome === "" && root.signinOpen) root.signinOutcome = "error";
+        onExited: function (code) {
+            stdinEnabled = true;
+            if (migrateProc.purge) { root.purging = false; return; }
+            if (root.migrateStep === "running" || root.migrateStep === "passphrase") {
+                if (code !== 4) {
+                    root.migrateStep = "error";
+                    if (!root.migrateError) root.migrateError = "The importer stopped unexpectedly. Nothing was changed.";
+                } else root.migrateStep = "intro";
+            }
         }
     }
 
-    // ---------------------------------------------------------------- actions
-    function refresh() {
-        const keep = root.selectedId;
-        run(["app-list"], "", function (d) {
+    // ---------------------------------------------------------------- unlock and lock
+    function authenticate() {
+        if (root.authing) return;
+        root.authing = true;
+        root.lockReason = "";
+        root.status = "waiting for your fingerprint or password…";
+        root.authRid = root.send("unlock", {}, function (d) {
+            root.authing = false;
+            root.authRid = -1;
+            if (root.authRetry) { root.authRetry = false; root.authenticate(); return; }
             if (d.locked) {
-                root.appUnlocked = false;
-                root.entries = [];
-                root.filtered = [];
-                root.clearSelection();
-                root.signedIn = d.signed_in !== false;
-                const headless = Quickshell.env("QT_QPA_PLATFORM") === "offscreen";
-                // Never signed in: the first thing a new user sees is the account sign-in, not
-                // a fingerprint prompt guarding an empty vault.
-                if (!root.signedIn) {
-                    if (root.snapshotPath) snapshotTimer.start();
-                    if (!root.firstRunShown && !headless && !root.signinOpen) {
-                        root.firstRunShown = true;
-                        root.startSignin("login");
-                    }
-                    return;
-                }
-                // Ask once, straight away - opening the app is the request to see it.
-                // Never raise a fingerprint prompt for a window nobody can see: an offscreen
-                // load (a test, or the snapshot hook) put a real prompt on screen once.
-                if (root.snapshotPath) snapshotTimer.start();
-                if (!root.autoAuthTried && !headless) {
-                    root.autoAuthTried = true;
-                    root.authenticate();
-                }
+                root.status = "";
+                root.lockReason = d.reason || "";
+                if (d.reason === "tpm-missing" || d.reason === "tpm-cleared" || d.reason === "damaged"
+                    || d.reason === "empty") root.vaultState = d.reason;
+                if (d.reason === "dismissed") root.status = "cancelled";
+                else if (d.reason === "denied") root.status = "not approved";
+                else if (d.reason === "rate-limited")
+                    root.status = "too many tries — wait " + (d.retry_after || 60) + " s";
                 return;
             }
+            if (d.error) { root.status = d.error; return; }
+            root.status = "";
             root.appUnlocked = true;
-            root.entries = d.entries || [];
+            root.vaultState = "unlocked";
+            root.syncedAt = d.synced_at || 0;
             root.needsLogin = !!d.needs_login;
-            root.signedIn = d.signed_in !== false;
-            root.readClocks(d);
-            if (root.snapshotPath && root.snapshotQuery) search.text = root.snapshotQuery;
-            root.applyFilter();
-            if (root.snapshotPath) snapshotTimer.start();
-            if (keep) {
-                for (let i = 0; i < root.filtered.length; i++) {
-                    if (root.filtered[i].id === keep) {
-                        root.cursor = i;
-                        root.selected = root.filtered[i];
-                        root.selectedId = keep;
-                        break;
-                    }
-                }
+            root.syncing = true;
+            root.setEntries(d.entries || []);
+            if (!root.signedIn && !root.entries.length && !root.firstRunShown) {
+                root.firstRunShown = true;
+                root.startSignin("login");
             }
         });
     }
 
-    // Unlock never goes through the shared command queue: a hung prompt used to hold the queue
-    // busy, which disabled this button and parked every retry behind the stuck attempt. It gets
-    // its own process, and pressing Unlock while one is pending kills it and starts over.
-    property bool authing: false
-
-    function authenticate() {
-        root.status = "waiting for authentication…";
-        if (authProc.running) {
-            authProc.restartAfterExit = true;
-            authProc.running = false;          // backend tears its prompt down on SIGTERM
-            return;
-        }
-        root.authing = true;
-        authProc.running = true;
+    // "Nothing appeared? Retry": withdraw the dialog that never showed and ask again.
+    function retryAuth() {
+        if (!root.authing) { root.authenticate(); return; }
+        root.authRetry = true;
+        root.send("cancel", { target: root.authRid }, null);
     }
 
-    function applyFilter() {
+    function lockNow() { root.send("lock", {}, null); }
+
+    // After tpm-cleared or damaged: new keys, then sign in again. The daemon moves the old
+    // files aside rather than deleting them.
+    function startOver() {
+        root.send("reset", {}, function (d) {
+            root.startOverConfirm = false;
+            if (d.error) { root.status = root.errorWords(d); return; }
+            root.vaultState = d.state || "empty";
+            root.lockReason = "";
+            root.status = "";
+            v1Check.check();
+        });
+    }
+
+    function signOut() {
+        root.send("signout", {}, function (d) {
+            if (d.error) { root.showFlash(root.errorWords(d)); return; }
+            root.settingsOpen = false;
+        });
+    }
+
+    // Back to the locked window, with nothing in it. Never re-prompts on its own.
+    function lockApp(reason) {
+        root.endGrant();
+        root.appUnlocked = false;
+        root.autoAuthTried = true;
+        root.authing = false;
+        root.vaultState = root.vaultState === "unlocked" ? "locked" : root.vaultState;
+        root.entries = []; root.filtered = [];
+        root.selected = null; root.selectedId = "";
+        root.editorOpen = false;
+        root.settingsOpen = false;
+        root.historyCheck = "";
+        if (root.signinOpen && root.signinMode === "relogin") root.signinOpen = false;
+        search.text = "";
+        root.lockReason = "";
+        root.status = reason === "screen-locked" ? "locked because the screen locked"
+                    : reason === "sleep" ? "locked for sleep"
+                    : reason === "idle" ? "locked after a while without use"
+                    : reason === "signout" ? "signed out of iCloud"
+                    : reason === "reset" ? ""
+                    : reason === "error" ? "locked after an error" : "";
+        if (reason === "signout") root.signedIn = false;
+    }
+
+    function setEntries(list_) {
+        const keep = root.selectedId;
+        root.entries = list_;
+        root.applyFilter(keep);
+        if (root.snapshotPath) snapshotTimer.start();
+    }
+
+    function syncNow() {
+        if (root.syncing) return;
+        root.send("sync", {}, function (d) {
+            if (d.queued) root.syncing = true;
+            else if (d.skipped === "signed-out") root.showFlash("Not signed in to iCloud");
+        });
+    }
+
+    // ---------------------------------------------------------------- the account grant
+    // Everything that shows or changes a secret runs through here: if this account is not
+    // open, the daemon raises the second dialog, naming it.
+    function withGrant(after) {
+        if (!root.selected) return;
+        if (root.unlocked) { if (after) after(); return; }
+        const id = root.selectedId;
+        const name = root.selected.primary;
+        root.granting = true;
+        root.status = "waiting for approval to open " + name + "…";
+        root.grantRid = root.send("grant", { id: id }, function (d) {
+            root.granting = false;
+            root.grantRid = -1;
+            if (d.error) {
+                root.status = d.error === "dismissed" || d.error === "cancelled" ? ""
+                            : d.error === "denied" ? "not approved"
+                            : d.error === "no-agent" || d.error === "busy"
+                                ? "the approval dialog isn't available — try again in a moment"
+                            : d.error === "rate-limited" ? "too many tries — wait " + (d.retry_after || 60) + " s"
+                            : d.error === "locked" ? "" : d.error;
+                return;
+            }
+            root.status = "";
+            if (id !== root.selectedId) { root.send("release", {}, null); return; }
+            root.grantId = id;
+            root.grantSingleUse = !!d.single_use;
+            root.grantExpires = d.expires || 0;
+            root.grantLeft = root.grantSingleUse ? 0 : Math.max(0, Math.ceil(root.grantExpires - Date.now() / 1000));
+            if (after) after();
+        });
+    }
+
+    // The grant ran out or was dropped: everything that came from it goes.
+    function endGrant() {
+        root.grantId = ""; root.grantExpires = 0; root.grantLeft = 0; root.grantSingleUse = false;
+        root.forgetSecrets();
+    }
+
+    function hideSecrets() {
+        root.revealed = "";
+        root.totpCode = ""; root.totpLeft = 0;
+        root.notesText = root.editorOpen && root.editorMode === "notes" ? root.notesText : "";
+        root.notesLoaded = root.editorOpen && root.editorMode === "notes" ? root.notesLoaded : false;
+        root.historyRows = []; root.revealedHistory = ({}); root.historyLoaded = false;
+    }
+
+    function forgetSecrets() {
+        root.hideSecrets();
+        root.notesText = ""; root.notesLoaded = false;
+        root.confirming = false; root.changing = false; root.generateNew = false;
+        root.renaming = false;
+        if (root.editorOpen && root.editorMode !== "create") root.editorOpen = false;
+        newPw.text = "";
+    }
+
+    function secretShown() { hideTimer.restart(); }
+
+    // ---------------------------------------------------------------- list
+    function applyFilter(keep) {
         const q = search.text.trim().toLowerCase();
-        // "2fa", "mfa", "2fa codes", "verification codes", "otp"... list every entry that has
-        // a verification code, rather than searching for those letters in names.
-        // A few words filter by kind instead of matching text: "notes", "websites", "wifi".
+        // "2fa", "notes", "websites", "wifi": filter by kind rather than by those letters.
         const kind = root.searchKind(q);
         const out = [];
         for (const e of root.entries) {
-            const hay = (e.primary + " " + e.real_title + " " + e.secondary + " " + e.domain
+            const hay = (e.primary + " " + e.title + " " + e.secondary + " " + e.domain
                          + " " + (e.sites || []).join(" ")).toLowerCase();
             if (kind ? kind(e) : (!q || hay.indexOf(q) !== -1))
                 out.push(e);
             if (out.length >= 600) break;
         }
         root.filtered = out;
+        if (keep) {
+            for (let i = 0; i < out.length; i++) {
+                if (out[i].id === keep) {
+                    root.cursor = i;
+                    root.selected = out[i];
+                    return;
+                }
+            }
+        }
         root.cursor = out.length ? 0 : -1;
         if (out.length) root.select(out[0]); else root.clearSelection();
     }
@@ -515,52 +715,21 @@ ShellRoot {
     }
 
     function clearSelection() {
-        root.selected = null; root.selectedId = ""; root.relock();
-    }
-
-    // Every gated reply carries the clocks, so the window never has to guess.
-    function readClocks(d) {
-        if (!d || d.expires === undefined) return;
-        root.fullUntil = d.full_until || 0;
-        root.sessionUntil = d.expires || 0;
-        const now = Date.now() / 1000;
-        root.unlockLeft = Math.max(0, Math.ceil(root.fullUntil - now));
-        root.sessionLeft = Math.max(0, Math.ceil(root.sessionUntil - now));
-    }
-
-    // The scan stopped counting. Everything on screen that came from it goes.
-    function forgetSecrets() {
-        root.revealed = ""; root.totpCode = ""; root.totpLeft = 0;
-        root.notesText = ""; root.notesLoaded = false;
-        root.historyRows = []; root.revealedHistory = ({}); root.historyLoaded = false;
-        root.confirming = false; root.changing = false; root.generated = false;
-        root.renaming = false;
-        newPw.text = "";
-    }
-
-    // Out of time: back to the locked window, with nothing in it.
-    function lockApp() {
-        root.forgetSecrets();
-        root.appUnlocked = false;
-        root.autoAuthTried = true;            // don't re-prompt on our own; the screen invites it
-        root.fullUntil = 0; root.sessionUntil = 0; root.unlockLeft = 0; root.sessionLeft = 0;
-        root.entries = []; root.filtered = [];
-        root.clearSelection();
-        root.editorOpen = false;
-        search.text = "";
-    }
-
-    // Selecting another entry hides what was on screen for the last one. The clocks are the
-    // app's, not the entry's, so they keep running.
-    function relock() {
-        root.forgetSecrets();
+        if (root.grantId !== "" || root.granting) root.send("release", {}, null);
+        root.selected = null; root.selectedId = "";
+        root.endGrant();
         root.detailIndex = 0;
     }
 
+    // Selecting another account drops the open one: the daemon wipes its grant (and cancels a
+    // dialog still waiting for it) and this window forgets what it showed.
     function select(e) {
         if (!e || e.id === root.selectedId) return;
+        if (root.grantId !== "" || root.granting) root.send("release", {}, null);
+        root.granting = false;
         root.selected = e; root.selectedId = e.id;
-        root.relock();
+        root.endGrant();
+        root.detailIndex = 0;
     }
 
     function moveCursor(delta) {
@@ -571,65 +740,144 @@ ShellRoot {
         list.positionViewAtIndex(root.cursor, ListView.Contain);
     }
 
-    function unlockThen(after) {
-        if (root.unlocked) { if (after) after(); return; }
-        root.status = "waiting for fingerprint…";
-        run(["app-unlock"], "", function (d) {
-            root.readClocks(d);
-            if (after) after();
-            if (!root.selectedId) return;
-            // Fetch history under the scan just given. Queued, so it cannot clobber
-            // whatever `after` started.
-            root.run(["app-history", root.selectedId], "", function (h) {
-                root.historyRows = h.history || [];
-                root.historyLoaded = true;
+    // ---------------------------------------------------------------- copy, reveal, codes
+    function clipWords(field) {
+        return field === "password" ? "Password" : field === "code" ? "Code"
+             : field === "notes" ? "Notes" : field === "domain" ? "Website" : "Username";
+    }
+
+    function copyField(field) {
+        if (!root.selected) return;
+        const id = root.selectedId;
+        const go = function () {
+            root.send("copy", { id: id, field: field }, function (d) {
+                if (d.error) { root.status = d.error === "no-grant" || d.error === "grant-expired"
+                                   ? "that account closed — open it again" : d.error; return; }
+                clipComponent.createObject(root, { ticket: d.ticket, running: true });
+                root.showFlash(root.clipWords(field) + " copied — clears after one paste or "
+                               + (root.settings.clip_timeout_s || 30) + " s");
+            });
+        };
+        if (field === "password" || field === "code" || field === "notes") root.withGrant(go); else go();
+    }
+    function copyPassword() { root.copyField("password"); }
+
+    function doReveal() {
+        root.withGrant(function () {
+            if (root.revealed) { root.revealed = ""; return; }
+            root.send("reveal", { id: root.selectedId, field: "password" }, function (d) {
+                if (d.error) { root.status = d.error; return; }
+                root.revealed = d.value || "";
+                root.hideAfter = d.hide_after || 20;
+                root.secretShown();
             });
         });
     }
 
-    // Copy never brings the value into this process - icp puts it on the clipboard itself.
-    function copyField(field, label) {
-        if (!root.selected) return;
-        const go = function () {
-            run(["app-copy", root.selectedId, "--field", field], "", function (d) {
-                root.flash = d.clears_in
-                    ? label + " copied — clears in " + d.clears_in + "s"
-                    : label + " copied";
-                flashTimer.restart();
+    function loadNotes(after) {
+        root.withGrant(function () {
+            if (root.notesLoaded || !root.selected.has_notes) { root.notesLoaded = true; if (after) after(); return; }
+            root.send("reveal", { id: root.selectedId, field: "notes" }, function (d) {
+                if (d.error) { root.status = d.error; return; }
+                root.notesText = d.value || ""; root.notesLoaded = true;
+                root.hideAfter = d.hide_after || 20;
+                root.secretShown();
+                if (after) after();
             });
-        };
-        if (field === "password") unlockThen(go); else go();
+        });
     }
-    function copyPassword() { root.copyField("password", "Password"); }
 
-    function generatePassword() {
-        run(["app-generate"], "", function (d) {
-            newPw.text = d.password;
-            root.generated = true;
-            root.flash = "generated — " + d.entropy_bits + " bits, one digit, one capital";
-            flashTimer.restart();
+    function loadHistory() {
+        root.withGrant(function () {
+            root.send("history", { id: root.selectedId }, function (d) {
+                if (d.error) { root.status = d.error; return; }
+                root.historyRows = d.items || [];
+                root.historyLoaded = true;
+                root.secretShown();
+            });
+        });
+    }
+
+    function loadTotp() {
+        root.withGrant(function () {
+            root.send("totp", { id: root.selectedId }, function (d) {
+                if (d.error) { root.status = d.error; return; }
+                root.totpCode = d.code || "";
+                root.totpLeft = Math.max(1, Math.round((d.valid_until || 0) - Date.now() / 1000));
+                root.secretShown();
+            });
+        });
+    }
+
+    // ---------------------------------------------------------------- edits
+    function setFields(fields, extra, done) {
+        const id = root.selectedId;
+        root.withGrant(function () {
+            root.send("set", Object.assign({ id: id, fields: fields }, extra || {}), done);
         });
     }
 
     function saveNickname(value) {
-        unlockThen(function () {
-            root.status = "renaming…";
-            run(["app-set-nickname", root.selectedId], value, function (d) {
-                root.renaming = false;
-                // Say which it was. A name written to Apple's metadata record reaches every
-                // device; one stored here does not, and the user should not have to guess.
-                root.flash = !d.nickname
-                    ? (d.synced ? "name cleared on all your devices" : "name cleared")
-                    : (d.synced ? "renamed on all your devices" : "renamed on this machine only");
-                flashTimer.restart();
-                root.refresh();
-            });
+        root.status = "renaming…";
+        root.setFields({ nickname: value }, null, function (d) {
+            root.status = "";
+            if (d.error) { root.status = root.errorWords(d); return; }
+            root.renaming = false;
+            root.showFlash(!value ? (d.synced ? "name cleared on all your devices" : "name cleared")
+                           : (d.synced ? "renamed on all your devices" : "renamed on this computer only"));
         });
     }
 
-    // Sign-in is driven entirely by whatever the backend asks for: it emits a prompt, we
-    // render it, we answer. The UI deliberately knows nothing about Apple's sequence, so a
-    // step added later needs no change here.
+    // The new password is either typed here or generated by the daemon; a generated one never
+    // comes to this window unless you reveal it afterwards.
+    function commitChange() {
+        const pw = newPw.text;
+        const gen = root.generateNew;
+        root.confirming = false;
+        root.status = "pushing to iCloud…";
+        root.setFields(gen ? {} : { password: pw }, gen ? { generate: {} } : null, function (d) {
+            root.status = "";
+            newPw.text = ""; root.revealed = ""; root.historyRows = []; root.historyLoaded = false;
+            root.changing = false; root.generateNew = false;
+            if (d.error) { root.status = root.errorWords(d); return; }
+            root.showFlash(gen ? "changed to a new generated password on all your devices — reveal it to see it"
+                               : "changed on all your devices");
+        });
+    }
+
+    function errorWords(d) {
+        switch (d.error) {
+        case "not-signed-in": return "not signed in to iCloud";
+        case "needs-login": root.needsLogin = true; return "iCloud wants you to sign in again";
+        case "anisette-unavailable": return "the local sign-in helper isn't running";
+        case "network": return "iCloud couldn't be reached";
+        case "apple": return "iCloud refused it" + (d.detail ? ": " + d.detail : "");
+        case "busy-sync": return "a sync is running — try again in a moment";
+        case "invalid": return "that " + (d.field || "value") + " isn't valid";
+        case "dismissed": case "cancelled": return "cancelled";
+        case "denied": return "not approved";
+        case "no-grant": case "grant-expired": return "that account closed — open it again";
+        case "rate-limited": return "too many tries — wait " + (d.retry_after || 60) + " s";
+        }
+        return d.error || "failed";
+    }
+
+    function agoShort(unix) {
+        const s = Math.max(0, Date.now() / 1000 - unix);
+        if (s < 90) return "just now";
+        if (s < 3600) return Math.round(s / 60) + " min ago";
+        if (s < 86400) return Math.round(s / 3600) + " h ago";
+        return Math.round(s / 86400) + " d ago";
+    }
+
+    function showFlash(text) {
+        root.flash = text;
+        flashTimer.restart();
+    }
+
+    // ---------------------------------------------------------------- sign-in
+    // Driven entirely by the daemon's sign-in stream: it says what stage it is at and asks
+    // typed questions; this draws them and answers. A step Apple adds later needs no change.
     function startSignin(mode) {
         root.signinMode = mode;
         root.signinOpen = true;
@@ -639,28 +887,330 @@ ShellRoot {
         root.signinChoice = -1; root.signinVia = "trusted"; root.signinCount = -1;
         root.signinVerified = false; root.signinError = ""; root.signinWarnings = [];
         root.signinLog = []; root.signinShowDetails = false; root.signinOutcome = "";
-        root.signinDevice = ({});
+        root.signinDevice = ({}); root.signinAskId = -1;
         signinField.text = ""; codeField.text = "";
-        signin.command = [root.icp, "app-signin", "--mode", mode];
-        signin.running = true;
+        root.signinRid = root.send("signin", { mode: mode }, function (d) {
+            root.signinRunning = false;
+            root.signinNeed = "";
+            if (d.error === "cancelled") { root.signinOutcome = "cancelled"; root.signinOpen = false; return; }
+            if (d.error) {
+                root.signinOutcome = "error";
+                if (!root.signinError) root.signinError = root.errorWords(d);
+                return;
+            }
+            root.signinOutcome = "ok";
+            root.signedIn = true;
+            root.needsLogin = false;
+            // A sign-in leaves the store unlocked on this connection: fetch the list (no
+            // second dialog, the daemon knows this window is already in).
+            root.authenticate();
+        });
+    }
+
+    function onSigninEvent(m) {
+        if (m.event === "ask") {
+            root.signinAskId = m.ask_id;
+            root.signinNeed = m.need || "text";
+            root.signinKind = m.kind || "";
+            root.signinDefault = m.default || "";
+            root.signinDetail = m.detail || "";
+            root.signinOptions = m.options || [];
+            root.signinDetails = m.details || [];
+            root.signinChoice = (m.options && m.options.length === 1) ? 0 : -1;
+            signinField.text = root.signinKind === "apple_id" ? root.signinDefault : "";
+            codeField.text = "";
+            Qt.callLater(root.focusSignin);
+            return;
+        }
+        if (m.event === "stage") {
+            const info = m.info || {};
+            if (m.stage === "device_chosen") {
+                root.signinDevice = { name: info.name || "", model: info.model || "", secret: info.secret || "" };
+                return;
+            }
+            root.signinStage = m.stage || "";
+            if (info.via) root.signinVia = info.via;
+            if (info.count !== undefined) root.signinCount = info.count;
+            return;
+        }
+        // out: progress lines, shown only under "Details" if it fails
+        if (m.kind === "err") root.signinError = m.text || "";
+        if (m.kind === "warn") root.signinWarnings = root.signinWarnings.concat([m.text || ""]);
+        root.signinLogPush(m.kind || "out", m.text || "");
     }
 
     function signinSend(value) {
         if (!root.signinRunning || root.signinNeed === "") return;
         if (root.signinKind === "code") root.signinVerified = true;
-        signin.write(JSON.stringify({ value: String(value) }) + "\n");
+        root.send("answer", { ask_id: root.signinAskId, value: String(value) }, null);
         root.signinNeed = "";
         signinField.text = "";
         codeField.text = "";
     }
 
     function signinCancel() {
-        if (root.signinRunning) signin.write(JSON.stringify({ cancel: true }) + "\n");
+        if (root.signinRunning) {
+            if (root.signinNeed !== "") root.send("answer", { ask_id: root.signinAskId, cancel: true }, null);
+            else root.send("cancel", { target: root.signinRid }, null);
+        }
         root.signinOpen = false;
     }
 
     function signinLogPush(kind, text) {
         root.signinLog = root.signinLog.slice(-40).concat([{ kind: kind, text: text }]);
+    }
+
+    // ---------------------------------------------------------------- migration
+    function migrateBegin() {
+        root.migrateError = "";
+        root.migrateStage = "";
+        root.migrateRetry = false;
+        root.migrateResult = ({});
+        root.migrateStep = "running";
+        root.send("migrate-begin", {}, function (d) {
+            if (d.error) {
+                root.migrateStep = "intro";
+                root.migrateError = d.error === "dismissed" || d.error === "cancelled" ? ""
+                                  : root.errorWords(d);
+                return;
+            }
+            migrateProc.purge = false;
+            migrateProc.ticket = d.ticket;
+            migrateProc.options = JSON.stringify({ move_manifests: root.migrateManifests });
+            migrateProc.running = true;
+        });
+    }
+
+    function onMigrateLine(m) {
+        if (!m) return;
+        if (m.stage) { root.migrateStage = m.stage; root.migrateStep = "running"; return; }
+        if (m.need === "passphrase") {
+            root.migrateRetry = !!m.retry;
+            root.migrateStep = "passphrase";
+            oldPass.text = "";
+            Qt.callLater(function () { oldPass.forceActiveFocus(); });
+            return;
+        }
+        if (m.done) {
+            root.migrateResult = Object.assign({}, root.migrateResult, m);
+            root.migrateStep = "done";
+            migrateProc.stdinEnabled = false;
+            return;
+        }
+        if (m.error) {
+            root.migrateError = m.error === "wrong-passphrase" ? "That passphrase didn't open your old vault."
+                : m.error === "mismatch" ? "The converted copy didn't match your old vault, so nothing was changed. Your 1.x passwords are untouched."
+                : m.error === "unsafe-file" ? "A file in ~/.config/icp isn't safe to read (" + (m.detail || "") + "). Nothing was changed."
+                : m.error === "no-v1" ? "No 1.x vault was found to move."
+                : "Something went wrong" + (m.detail ? ": " + m.detail : ".");
+            if (root.migrateStep !== "done") root.migrateStep = "error";
+        }
+    }
+
+    function migratePassphrase() {
+        if (!oldPass.text.length) return;
+        migrateProc.write(JSON.stringify({ passphrase: oldPass.text }) + "\n");
+        oldPass.text = "";
+        root.migrateStep = "running";
+    }
+
+    function migrateCancel() {
+        if (migrateProc.running) migrateProc.write(JSON.stringify({ cancel: true }) + "\n");
+        root.migrateStep = "intro";
+    }
+
+    function migrateFinish() {
+        root.migrateStep = "";
+        root.v1Present = false;
+        root.signedIn = true;
+        // migrate-begin opened the list on this connection; fetch it without a dialog.
+        root.authenticate();
+    }
+
+    // ---------------------------------------------------------------- settings and cleanup
+    function setSetting(key, value) {
+        const s = {};
+        s[key] = value;
+        root.send("settings", { set: s }, function (d) {
+            if (d.error) { root.showFlash("Couldn't change that setting"); return; }
+            root.settings = d.settings;
+        });
+    }
+
+    function purgeOldCopy() {
+        root.purging = true;
+        root.send("purge-old-copy", {}, function (d) {
+            if (d.error) { root.purging = false; root.showFlash(root.errorWords(d)); return; }
+            migrateProc.purge = true;
+            migrateProc.ticket = d.ticket;
+            migrateProc.running = true;
+        });
+    }
+
+    function onPurgeLine(m) {
+        if (!m) return;
+        if (m.done) {
+            root.oldCopy = null;
+            const kept = (m.kept || []).length;
+            root.showFlash(kept ? "Old copy deleted, except " + kept + " file(s) that changed since the move"
+                                : "Old encrypted copy deleted");
+        } else if (m.error) root.showFlash("Couldn't delete the old copy");
+    }
+
+    // The clipboard-history check, only on request: read Omarchy's history file, keep the
+    // entries that could be a password, and let the daemon compare them by keyed hash. The
+    // answer is positions only; nothing is removed from here.
+    function checkClipboardHistory() {
+        root.historyChecking = true;
+        root.historyCheck = "";
+        clipHistoryFile.path = "";
+        clipHistoryFile.path = root.clipHistoryPath;
+    }
+
+    FileView {
+        id: clipHistoryFile
+        printErrors: false
+        onLoaded: {
+            let items = [], index = [];
+            try {
+                const h = JSON.parse(text());
+                let size = 0;
+                for (let i = 0; i < h.length && items.length < 1000; i++) {
+                    const t = h[i] && h[i].type === "text" ? h[i].text : null;
+                    // Passwords are one line without spaces; everything else is skipped, which
+                    // also keeps the request under the daemon's line limit.
+                    if (typeof t !== "string" || t.length < 4 || t.length > 256 || /\s/.test(t)) continue;
+                    size += t.length + 8;
+                    if (size > 56000) break;
+                    items.push(t); index.push(i + 1);
+                }
+            } catch (e) {}
+            clipHistoryFile.path = "";
+            if (!items.length) {
+                root.historyChecking = false;
+                root.historyCheck = "Nothing in your clipboard history looks like a saved password.";
+                return;
+            }
+            root.send("clip-history-check", { items: items }, function (d) {
+                root.historyChecking = false;
+                items = [];
+                if (d.error) { root.historyCheck = d.error === "dismissed" ? "" : root.errorWords(d); return; }
+                const pos = (d.matches || []).map(function (k) { return index[k]; });
+                root.historyCheck = !pos.length ? "None of your saved passwords are in your clipboard history."
+                    : pos.length + (pos.length === 1 ? " entry" : " entries")
+                      + " in your clipboard history " + (pos.length === 1 ? "is" : "are")
+                      + " a saved password (number " + pos.join(", ")
+                      + " from the newest). Delete " + (pos.length === 1 ? "it" : "them")
+                      + " in Omarchy's clipboard history.";
+            });
+        }
+        onLoadFailed: {
+            clipHistoryFile.path = "";
+            root.historyChecking = false;
+            root.historyCheck = "There's no clipboard history to check.";
+        }
+    }
+
+    // ---------------------------------------------------------------- editor sheet
+    function openEditor(mode) {
+        root.editorMode = mode; root.editorError = ""; root.totpPreview = ({});
+        root.editorBusy = false; root.createMore = false; root.createGenerate = false;
+        edArea.text = mode === "sites" ? (root.selected ? (root.selected.sites || []).join("\n") : "")
+                    : mode === "notes" ? root.notesText : "";
+        edSetup.text = "";
+        if (mode === "create") {
+            crName.text = ""; crSite.text = ""; crUser.text = ""; crPass.text = "";
+            crNotes.text = ""; crSetup.text = "";
+        }
+        root.editorOpen = true;
+        Qt.callLater(function () {
+            if (mode === "create") crName.forceActiveFocus();
+            else if (mode === "totp") edSetup.forceActiveFocus();
+            else edArea.forceActiveFocus();
+        });
+    }
+    function closeEditor() {
+        if (root.editorBusy) return;
+        root.editorOpen = false;
+        edArea.text = ""; crPass.text = "";
+    }
+
+    function editorTitle() {
+        switch (root.editorMode) {
+        case "sites": return "Websites";
+        case "notes": return "Notes";
+        case "totp": return root.selected && root.selected.has_totp ? "Verification code" : "Set up a verification code";
+        case "create": return "New password";
+        }
+        return "";
+    }
+    function editorReady() {
+        if (root.editorBusy) return false;
+        if (root.editorMode === "totp") return !!root.totpPreview.code;
+        if (root.editorMode === "create")
+            return (crPass.text.length > 0 || root.createGenerate)
+                   && (crSite.text.trim().length > 0 || crName.text.trim().length > 0)
+                   && (!crSetup.text.trim() || !!root.totpPreview.code);
+        return true;
+    }
+
+    function editorSave() {
+        if (!root.editorReady()) return;
+        root.editorError = "";
+        const mode = root.editorMode;
+        const done = function (d) {
+            root.editorBusy = false;
+            if (d.error) { root.editorError = root.errorWords(d); return; }
+            if (mode === "notes") { root.notesText = edArea.text.replace(/^\n+|\n+$/g, ""); root.notesLoaded = true; }
+            if (mode === "totp") root.totpCode = "";
+            root.editorOpen = false;
+            edArea.text = ""; crPass.text = "";
+            root.showFlash(mode === "create" ? "Added to iCloud Keychain" : "Saved to iCloud — on all your devices");
+        };
+        root.editorBusy = true;
+        if (mode === "sites") {
+            root.setFields({ sites: edArea.text.split("\n").map(function (s) { return s.trim(); })
+                                         .filter(function (s) { return s; }) }, null, done);
+        } else if (mode === "notes") {
+            root.setFields({ notes: edArea.text }, null, done);
+        } else if (mode === "totp") {
+            root.setFields({ totp: { setup: edSetup.text } }, null, done);
+        } else {
+            const f = { title: crName.text, domain: crSite.text.trim(), username: crUser.text };
+            if (crNotes.text) f.notes = crNotes.text;
+            if (crSetup.text.trim()) f.totp = { setup: crSetup.text.trim() };
+            if (!root.createGenerate) f.password = crPass.text;
+            root.send("create", root.createGenerate ? { fields: f, generate: {} } : { fields: f },
+                      function (d) {
+                          if (!d.error && d.id) root.selectedId = "";
+                          done(d);
+                      });
+        }
+    }
+    function removeTotp() {
+        root.editorError = ""; root.editorBusy = true;
+        root.setFields({ totp: { remove: true } }, null, function (d) {
+            root.editorBusy = false;
+            if (d.error) { root.editorError = root.errorWords(d); return; }
+            root.editorOpen = false; root.totpCode = "";
+            root.showFlash("Verification code removed");
+        });
+    }
+    function previewTotp(text) {
+        if (!text.trim()) { root.totpPreview = ({}); return; }
+        root.send("totp-preview", { setup: text }, function (d) {
+            root.totpPreview = d && d.code ? d : ({ error: "" });
+        });
+    }
+    function groupCode(c) { return c && c.length === 6 ? c.slice(0, 3) + " " + c.slice(3) : (c || ""); }
+
+    // ---------------------------------------------------------------- links
+    function openDomain(d) {
+        if (!d) return;
+        const url = String(d).replace(/^https?:\/\//, "").toLowerCase();
+        if (!root.urlPattern.test(url)) { root.showFlash("That website can't be opened from here"); return; }
+        opener.lua = "hl.dsp.exec_cmd(\"xdg-open https://" + url + "\")";
+        opener.running = true;
     }
 
     function focusSignin() {
@@ -673,7 +1223,7 @@ ShellRoot {
 
     function signinTitle() {
         if (root.signinOutcome === "ok" && root.signinStage === "not_joined") return "Signed in, not joined yet";
-        if (root.signinOutcome === "ok") return root.signinMode === "sync" ? "You're reconnected" : "You're signed in";
+        if (root.signinOutcome === "ok") return root.signinMode === "relogin" ? "You're reconnected" : "You're signed in";
         if (root.signinOutcome === "error") return "Couldn't finish signing in";
         switch (root.signinKind) {
         case "code": return "Enter the verification code";
@@ -685,7 +1235,7 @@ ShellRoot {
         }
         if (root.signinNeed === "" && root.signinStep() === 2) return "Trusting this computer";
         if (root.signinNeed === "" && root.signinStage === "syncing") return "Syncing";
-        return root.signinMode === "sync" ? "Confirm it's you" : "Sign in to iCloud";
+        return root.signinMode === "relogin" ? "Confirm it's you" : "Sign in to iCloud";
     }
     function signinSubtitle() {
         if (root.signinOutcome === "ok" && root.signinStage === "not_joined")
@@ -698,7 +1248,7 @@ ShellRoot {
         switch (root.signinKind) {
         case "apple_id":
         case "password":
-            return root.signinMode === "sync" ? "Your session expired. Sign in again to keep your passwords syncing."
+            return root.signinMode === "relogin" ? "Your session expired. Sign in again to keep your passwords syncing."
                                               : "Pear Passwords uses your Apple Account to read your iCloud Keychain.";
         case "code":
             return root.signinVia === "sms" ? "A code was sent to your phone by text message."
@@ -736,63 +1286,15 @@ ShellRoot {
         if (!root.signinPrimaryReady()) return;
         if (root.signinKind === "code") root.signinSend(codeField.text);
         else if (root.signinNeed === "choice") root.signinSend(root.signinChoice);
-        else if (root.signinNeed === "confirm") root.signinSend("y");
+        else if (root.signinNeed === "confirm") root.signinSend("yes");
         else root.signinSend(signinField.text);
     }
 
-    // Development only: PEAR_PASSWORDS_SIGNIN_PREVIEW=<state> draws one sheet state with made-up
-    // values and starts nothing, so each screen can be checked without talking to Apple.
-    function applySigninPreview(state) {
-        root.signinOpen = true;
-        const set = (o) => { for (const k in o) root[k] = o[k]; };
-        set({ signinMode: "login", signinRunning: true, signinNeed: "", signinKind: "",
-              signinStage: "", signinOutcome: "", signinVia: "trusted" });
-        switch (state) {
-        case "apple_id": set({ signinStage: "account", signinNeed: "text", signinKind: "apple_id" });
-            signinField.text = "name@example.com"; break;
-        case "password": set({ signinStage: "account", signinNeed: "secret", signinKind: "password" });
-            signinField.text = "xxxxxxxxxxxx"; break;
-        case "signing_in": set({ signinStage: "signing_in" }); break;
-        case "code": set({ signinStage: "verify", signinNeed: "text", signinKind: "code" });
-            codeField.text = "314"; codeField.forceActiveFocus(); break;
-        case "device": set({ signinStage: "finding_devices", signinNeed: "choice", signinKind: "device",
-            signinOptions: ["Work Mac (MacBook Pro)", "My iPhone (iPhone 16 Pro)"],
-            signinDetails: ["backed up 12 Aug 2026 · Mac login password · serial ending 4K2P",
-                            "backed up 3 Sep 2026 · 6-digit passcode · serial ending 7XQ2"], signinChoice: 1 }); break;
-        case "join_confirm": set({ signinStage: "finding_devices", signinNeed: "confirm", signinKind: "join_confirm",
-            signinDetail: "My iPhone (iPhone 16 Pro)" }); break;
-        case "device_passcode": set({ signinStage: "finding_devices", signinNeed: "secret", signinKind: "device_passcode",
-            signinDetail: "My iPhone (iPhone 16 Pro)" }); signinField.text = "xxxxxx"; break;
-        case "ipad_passcode": set({ signinStage: "finding_devices", signinNeed: "secret", signinKind: "device_passcode",
-            signinDetail: "Alex’s iPad",
-            signinDevice: { name: "Alex’s iPad", model: "iPad Pro (11-inch) (3rd generation)", secret: "passcode" } }); break;
-        case "ipad_confirm": set({ signinStage: "finding_devices", signinNeed: "confirm", signinKind: "join_confirm",
-            signinDetail: "Alex’s iPad",
-            signinDevice: { name: "Alex’s iPad", model: "iPad Pro (11-inch) (3rd generation)", secret: "passcode" } }); break;
-        case "ipad_device": set({ signinStage: "finding_devices", signinNeed: "choice", signinKind: "device",
-            signinOptions: ["Alex’s MacBook Pro", "Alex’s iPad"],
-            signinDetails: ["MacBook Pro (14-inch, 2023) · backed up 12 Aug 2026 · Mac login password · serial ending 4K2P",
-                            "iPad Pro (11-inch) (3rd generation) · backed up 3 Sep 2026 · 6-digit passcode · serial ending 7XQ2"],
-            signinChoice: 1 }); break;
-        case "mac_confirm": set({ signinStage: "finding_devices", signinNeed: "confirm", signinKind: "join_confirm",
-            signinDetail: "Work Mac (MacBook Pro)" }); break;
-        case "mac_passcode": set({ signinStage: "finding_devices", signinNeed: "secret", signinKind: "device_passcode",
-            signinDetail: "Work Mac (MacBook Pro)" }); signinField.text = "xxxxxxxxxx"; break;
-        case "not_joined": set({ signinRunning: false, signinOutcome: "ok", signinStage: "not_joined" }); break;
-        case "joining": set({ signinStage: "joining" }); break;
-        case "sync_code": set({ signinMode: "sync", signinStage: "verify", signinNeed: "text", signinKind: "code" }); break;
-        case "done": set({ signinRunning: false, signinOutcome: "ok", signinVerified: true, signinCount: 547,
-            signinStage: "synced", signinWarnings: ["3 items could not be decrypted and were skipped."] }); break;
-        case "error": set({ signinRunning: false, signinOutcome: "error", signinError: "2FA rejected (code was rejected)",
-            signinLog: [{ kind: "step", text: "requesting code" }, { kind: "err", text: "2FA rejected (code was rejected)" }],
-            signinShowDetails: true }); break;
-        }
-    }
 
     // The word follows the device: a Mac escrows with its login password, iPhone/iPad a passcode.
     function deviceName() { return root.signinDevice.name || root.signinDetail; }
     function secretWord() {
-        // This is interpolated into a StyledText warning, and signinDevice.secret comes off an
+        // This is interpolated into the escrow warning, and signinDevice.secret comes off an
         // Apple API response rather than from here, so it is clamped to the words the rest of
         // this file branches on instead of being rendered as whatever arrives.
         const named = ["password", "passcode", "PIN"];
@@ -803,14 +1305,14 @@ ShellRoot {
         return "passcode or password";
     }
     function signinSteps() {
-        return root.signinMode === "sync" ? ["Verify", "Sync"] : ["Account", "Verify", "Trust", "Sync"];
+        return root.signinMode === "relogin" ? ["Verify", "Sync"] : ["Account", "Verify", "Trust", "Sync"];
     }
     // Which step of the indicator the current stage or question belongs to.
     function signinStep() {
         const k = root.signinKind, s = root.signinStage;
         if (root.signinStage === "not_joined") return 2;
         if (root.signinOutcome === "ok") return root.signinSteps().length;
-        if (root.signinMode === "sync") return (s === "syncing" || s === "synced") ? 1 : 0;
+        if (root.signinMode === "relogin") return (s === "syncing" || s === "synced") ? 1 : 0;
         if (s === "syncing" || s === "synced") return 3;
         if (s === "finding_devices" || s === "joining"
             || k === "device" || k === "join_confirm" || k === "device_passcode") return 2;
@@ -863,7 +1365,7 @@ ShellRoot {
         if (!root.selected) return "";
         const parts = [];
         if (root.selected.mdat) parts.push("changed " + root.ago(root.selected.mdat));
-        if (root.unlocked) parts.push("unlocked " + root.clock(root.unlockLeft));
+        if (root.unlocked) parts.push(root.grantSingleUse ? "open for one use" : "open " + root.clock(root.grantLeft));
         return parts.join("   ·   ");
     }
 
@@ -911,25 +1413,25 @@ ShellRoot {
     }
 
     function fieldAction(key) {
-        if (key === "username") root.copyField("username", "Username");
+        if (key === "username") root.copyField("username");
         else if (key === "password") root.copyPassword();
         else if (key === "view") root.doReveal();
         else if (key === "change")
-            root.unlockThen(function () { root.changing = true; newPw.forceActiveFocus(); });
+            root.withGrant(function () { root.changing = true; root.generateNew = false; newPw.forceActiveFocus(); });
         else if (key === "website") root.openDomain(root.selected.domain);
         else if (key.indexOf("open:") === 0) root.openDomain(root.allSites()[parseInt(key.slice(5))]);
         else if (key === "totp") root.loadTotp();
-        else if (key === "editsites") root.unlockThen(function () { root.openEditor("sites"); });
-        else if (key === "edittotp") root.unlockThen(function () { root.openEditor("totp"); });
+        else if (key === "editsites") root.withGrant(function () { root.openEditor("sites"); });
+        else if (key === "edittotp") root.withGrant(function () { root.openEditor("totp"); });
         else if (key === "notes") root.loadNotes(root.notesLoaded ? function () { root.openEditor("notes"); } : null);
         else if (key === "editnotes") root.loadNotes(function () { root.openEditor("notes"); });
     }
 
     // ---- keyboard: the detail panel -------------------------------------------------------
-    // Stops, in order: every field row, then either each history row (unlocked) or the single
-    // "unlock" line (locked), so a keyboard user can unlock history as well as read it.
+    // Stops, in order: every field row, then either each history row (loaded) or the single
+    // "show" line, so a keyboard user can open history as well as read it.
     function panelStops() {
-        return root.fieldCount + (root.unlocked ? root.historyRows.length : 1);
+        return root.fieldCount + (root.historyLoaded ? root.historyRows.length : 1);
     }
     function enterPanel(at) {
         if (!root.selected || !root.appUnlocked) return;
@@ -946,7 +1448,7 @@ ShellRoot {
         const next = root.detailIndex + delta;
         if (next < 0 || next >= n) return false;       // let the caller decide what an edge means
         root.detailIndex = next;
-        if (next >= root.fieldCount && root.unlocked)
+        if (next >= root.fieldCount && root.historyLoaded)
             historyList.positionViewAtIndex(next - root.fieldCount, ListView.Contain);
         return true;
     }
@@ -954,175 +1456,24 @@ ShellRoot {
         const m = Object.assign({}, root.revealedHistory);
         m[h] = !m[h];
         root.revealedHistory = m;
+        root.secretShown();
     }
     // Enter does exactly what a click on the row does.
     function panelActivate() {
         const rows = root.fieldRows(), k = root.detailIndex;
         if (k < rows.length) { root.fieldAction(rows[k].key); return; }
-        if (!root.unlocked) { root.unlockThen(null); return; }
+        if (!root.historyLoaded) { root.loadHistory(); return; }
         root.toggleHistory(k - rows.length);
     }
     // Space shows: the password on its row, a former password on a history row.
     function panelShow() {
         const rows = root.fieldRows(), k = root.detailIndex;
         if (k < rows.length && rows[k].key === "password") { root.doReveal(); return; }
-        if (k >= rows.length && root.unlocked) { root.toggleHistory(k - rows.length); return; }
+        if (k >= rows.length && root.historyLoaded) { root.toggleHistory(k - rows.length); return; }
         root.panelActivate();
     }
     function fieldFocused(i) { return root.panelFocus && root.detailIndex === i; }
 
-    function openDomain(d) {
-        if (!d) return;
-        Qt.openUrlExternally(d.indexOf("://") === -1 ? "https://" + d : d);
-    }
-
-    function doReveal() {
-        unlockThen(function () {
-            if (root.revealed) { root.revealed = ""; return; }
-            run(["app-reveal", root.selectedId], "", function (d) { root.revealed = d.password || ""; });
-        });
-    }
-
-    function loadHistory() {
-        unlockThen(function () {
-            run(["app-history", root.selectedId], "", function (d) {
-                root.historyRows = d.history || [];
-            });
-        });
-    }
-
-    function loadNotes(after) {
-        unlockThen(function () {
-            if (root.notesLoaded || !root.selected.has_notes) { root.notesLoaded = true; if (after) after(); return; }
-            run(["app-details", root.selectedId], "", function (d) {
-                root.notesText = d.notes || ""; root.notesLoaded = true;
-                if (after) after();
-            });
-        });
-    }
-
-    function openEditor(mode) {
-        root.editorMode = mode; root.editorError = ""; root.totpPreview = ({});
-        root.editorBusy = false; root.editorScanning = false; root.createMore = false;
-        edArea.text = mode === "sites" ? (root.selected ? (root.selected.sites || []).join("\n") : "")
-                    : mode === "notes" ? root.notesText : "";
-        edSetup.text = "";
-        if (mode === "create") {
-            crName.text = ""; crSite.text = ""; crUser.text = ""; crPass.text = "";
-            crNotes.text = ""; crSetup.text = "";
-        }
-        root.editorOpen = true;
-        Qt.callLater(function () {
-            if (mode === "create") crName.forceActiveFocus();
-            else if (mode === "totp") edSetup.forceActiveFocus();
-            else edArea.forceActiveFocus();
-        });
-    }
-    function closeEditor() { if (!root.editorBusy) root.editorOpen = false; }
-
-    function editorTitle() {
-        switch (root.editorMode) {
-        case "sites": return "Websites";
-        case "notes": return "Notes";
-        case "totp": return root.selected && root.selected.has_totp ? "Verification code" : "Set up a verification code";
-        case "create": return "New password";
-        }
-        return "";
-    }
-    function editorReady() {
-        if (root.editorBusy || root.editorScanning) return false;
-        if (root.editorMode === "totp") return !!root.totpPreview.code;
-        if (root.editorMode === "create")
-            return crPass.text.length > 0 && (crSite.text.trim().length > 0 || crName.text.trim().length > 0)
-                   && (!crSetup.text.trim() || !!root.totpPreview.code);
-        return true;
-    }
-
-    function editorSave() {
-        if (!root.editorReady()) return;
-        root.editorError = "";
-        const id = root.selectedId;
-        let args, payload;
-        if (root.editorMode === "sites") {
-            args = ["app-set-details", id];
-            payload = { sites: edArea.text.split("\n").map(function (s) { return s.trim(); }).filter(function (s) { return s; }) };
-        } else if (root.editorMode === "notes") {
-            args = ["app-set-details", id]; payload = { notes: edArea.text };
-        } else if (root.editorMode === "totp") {
-            args = ["app-set-totp", id]; payload = { setup: edSetup.text };
-        } else {
-            args = ["app-create"];
-            payload = { title: crName.text, site: crSite.text, username: crUser.text,
-                        password: crPass.text, notes: crNotes.text, setup: crSetup.text };
-        }
-        root.editorBusy = true;
-        root.edRun(args, JSON.stringify(payload), function (d) {
-            root.editorBusy = false;
-            if (d.ok === false) { root.editorError = d.error || "Couldn't save"; return; }
-            if (root.editorMode === "notes") { root.notesText = edArea.text.replace(/^\n+|\n+$/g, ""); root.notesLoaded = true; }
-            if (root.editorMode === "totp") { root.totpCode = ""; }
-            if (root.editorMode === "create" && d.id) { root.selectedId = d.id; root.selected = null; }
-            root.editorOpen = false;
-            root.flash = root.editorMode === "create" ? "Added to iCloud Keychain" : "Saved to iCloud — on all your devices";
-            flashTimer.restart();
-            root.refresh();
-        });
-    }
-    function removeTotp() {
-        root.editorError = ""; root.editorBusy = true;
-        root.edRun(["app-set-totp", root.selectedId], JSON.stringify({ remove: true }), function (d) {
-            root.editorBusy = false;
-            if (d.ok === false) { root.editorError = d.error || "Couldn't remove it"; return; }
-            root.editorOpen = false; root.totpCode = "";
-            root.flash = "Verification code removed"; flashTimer.restart();
-            root.refresh();
-        });
-    }
-    function scanQr(field) {
-        root.editorScanning = true; root.editorError = "";
-        root.edRun(["app-scan-qr"], "", function (d) {
-            root.editorScanning = false;
-            if (d.cancelled) return;
-            if (d.ok === false) { root.editorError = d.error || "No QR code found"; return; }
-            field.text = d.text;
-        });
-    }
-    function previewTotp(text) {
-        if (!text.trim()) { root.totpPreview = ({}); return; }
-        run(["app-totp-preview"], text, function (d) {
-            root.totpPreview = d && d.code ? d : ({ error: "" });
-        });
-    }
-    function groupCode(c) { return c && c.length === 6 ? c.slice(0, 3) + " " + c.slice(3) : (c || ""); }
-
-    // Editor commands get their own process: a save fetches the zone, writes and re-syncs,
-    // which takes long enough that it must not hold up the list's own queue.
-    function edRun(args, stdinText, done) {
-        edProc.handler = done;
-        edProc.pending = stdinText && stdinText.length ? stdinText + "\n" : "";
-        edProc.command = [root.icp].concat(args);
-        edProc.running = true;
-    }
-
-    function loadTotp() {
-        unlockThen(function () {
-            run(["app-totp", root.selectedId], "", function (d) {
-                root.totpCode = d.code; root.totpLeft = d.seconds;
-            });
-        });
-    }
-
-    function commitChange() {
-        const pw = newPw.text;
-        root.confirming = false;
-        root.status = "pushing to iCloud…";
-        run(["app-set-password", root.selectedId], pw, function (d) {
-            newPw.text = ""; root.revealed = ""; root.historyRows = [];
-            root.flash = "changed on all your devices (" + d.records_written + " records)";
-            flashTimer.restart();
-            root.refresh();
-        });
-    }
 
     // ---------------------------------------------------------------- helpers
     function clock(seconds) {
@@ -1151,24 +1502,15 @@ ShellRoot {
     }
     function isRecent(unix) { return unix && (Date.now() / 1000 - unix) < 30 * 86400; }
 
-    Component.onCompleted: {
-        refresh();
-        const preview = Quickshell.env("PEAR_PASSWORDS_SIGNIN_PREVIEW");
-        if (preview === "first_run") { firstRunPreview.start(); return; }
-        if (preview && (preview === "detail" || preview.indexOf("editor_") === 0 || preview.indexOf("search_") === 0)) {
-            detailPreview.mode = preview; detailPreview.start(); return;
-        }
-        if (preview === "first_launch") { root.signedIn = false; Qt.callLater(() => root.applySigninPreview("apple_id")); return; }
-        if (preview) Qt.callLater(() => root.applySigninPreview(preview));
-    }
-
     FloatingWindow {
         id: win
         title: "Pear Passwords"
         implicitWidth: 960
         implicitHeight: 640
         color: Theme.bg
-        visible: true
+        // Hidden until the rules are in and the daemon has answered (or a moment has passed),
+        // so a second launch that only raises the first window never flashes on screen.
+        visible: root.windowReady && (root.phase !== "connecting" || root.connectGrace)
         onClosed: Qt.quit()
 
         Rectangle { anchors.fill: parent; color: Theme.bg }
@@ -1182,95 +1524,11 @@ ShellRoot {
             // offscreen snapshot) includes the real background instead of transparency.
             Rectangle { anchors.fill: parent; color: Theme.bg; z: -1 }
 
-            // ---- setup gate. Covers everything until the backend exists, because there is
-            // nothing to show without it. Installing it is one click rather than a sentence
-            // telling you to go and find a terminal.
-            Rectangle {
-                id: setupGate
-                anchors.fill: parent
-                visible: !root.backendReady
-                color: Theme.bg
-                z: 90
-
-                Column {
-                    anchors.centerIn: parent
-                    width: Math.min(460, parent.width - 80)
-                    spacing: 14
-
-                    Text {
-                        textFormat: Text.PlainText
-                        width: parent.width
-                        text: "One more step"
-                        color: Theme.fg
-                        font.family: Theme.uiFont
-                        font.pixelSize: Math.round(Theme.fBody * 1.5)
-                    }
-                    Text {
-                        textFormat: Text.PlainText
-                        width: parent.width
-                        wrapMode: Text.WordWrap
-                        color: Theme.dim
-                        font.family: Theme.uiFont
-                        font.pixelSize: Theme.fSmall
-                        text: "Pear Passwords keeps its own copy of the few Python packages it "
-                            + "needs, so it never depends on what happens to be installed on "
-                            + "this machine. Setting that up downloads them now. Every package "
-                            + "is pinned to an exact version and checked against a hash that "
-                            + "ships with the app, and none of it needs your password. The "
-                            + "sign-in helper is compiled here from its own pinned source "
-                            + "instead of being pulled as a prebuilt image, so the first run "
-                            + "takes a couple of minutes."
-                    }
-                    Text {
-                        textFormat: Text.PlainText
-                        width: parent.width
-                        wrapMode: Text.WordWrap
-                        visible: root.setupSource === "" && !root.setupRunning
-                        color: Theme.danger
-                        font.family: Theme.uiFont
-                        font.pixelSize: Theme.fSmall
-                        text: "Can't find where Pear Passwords was installed from, so it can't "
-                            + "set itself up. Run ./install.sh from the plugin folder instead."
-                    }
-                    Text {
-                        textFormat: Text.PlainText
-                        width: parent.width
-                        wrapMode: Text.WordWrap
-                        visible: root.setupRunning || root.setupLog !== ""
-                        color: Theme.dim
-                        font.family: Theme.uiFont
-                        font.pixelSize: Theme.fCaption
-                        elide: Text.ElideRight
-                        maximumLineCount: 2
-                        text: root.setupLog
-                    }
-                    Text {
-                        textFormat: Text.PlainText
-                        width: parent.width
-                        wrapMode: Text.WordWrap
-                        visible: root.setupError !== ""
-                        color: Theme.danger
-                        font.family: Theme.uiFont
-                        font.pixelSize: Theme.fSmall
-                        text: root.setupError
-                    }
-                    AppButton {
-                        text: root.setupRunning ? "Setting up…"
-                                                : (root.setupError !== "" ? "Try again" : "Set up")
-                        enabled: !root.setupRunning && root.setupSource !== ""
-                        onClicked: {
-                            root.setupError = "";
-                            root.setupLog = "";
-                            setupProc.running = true;
-                        }
-                    }
-                }
-            }
-
             Keys.onPressed: function (ev) {
                 if (ev.key === Qt.Key_Escape) {
                     if (root.confirming) { root.confirming = false; }
                     else if (root.revealed) { root.revealed = ""; }
+                    else if (root.settingsOpen) { root.settingsOpen = false; }
                     else if (search.text.length) { search.text = ""; }
                     else Qt.quit();
                     ev.accepted = true;
@@ -1283,6 +1541,8 @@ ShellRoot {
                     ev.accepted = true;
                 } else if (ev.key === Qt.Key_Space && ev.modifiers & Qt.ControlModifier) {
                     root.doReveal(); ev.accepted = true;
+                } else if (ev.key === Qt.Key_L && ev.modifiers & Qt.ControlModifier) {
+                    root.lockNow(); ev.accepted = true;
                 }
             }
 
@@ -1295,7 +1555,7 @@ ShellRoot {
                 // type the code.
                 Rectangle {
                     Layout.fillWidth: true
-                    visible: (root.needsLogin || (!root.signedIn && root.entries.length > 0)) && !root.signinOpen
+                    visible: root.appUnlocked && (root.needsLogin || (!root.signedIn && root.entries.length > 0)) && !root.signinOpen
                     implicitHeight: 38
                     color: Theme.panel
                     Rectangle { anchors.left: parent.left; anchors.top: parent.top
@@ -1317,7 +1577,7 @@ ShellRoot {
                         }
                         AppButton {
                             text: "Sign in"
-                            onClicked: root.startSignin(root.signedIn ? "sync" : "login")
+                            onClicked: root.startSignin(root.signedIn ? "relogin" : "login")
                         }
                     }
                 }
@@ -1351,7 +1611,7 @@ ShellRoot {
                                 anchors.right: parent.right
                                 anchors.rightMargin: 16
                                 anchors.verticalCenter: parent.verticalCenter
-                                visible: root.appUnlocked
+                                visible: root.appUnlocked && root.signedIn
                                 text: "+ New"
                                 color: hNew.hovered ? Theme.fg : Theme.dim
                                 font.family: Theme.uiFont
@@ -1366,8 +1626,7 @@ ShellRoot {
                                 anchors.rightMargin: newButton.visible ? newButton.width + 28 : 14
                                 enabled: root.appUnlocked
                                 opacity: root.appUnlocked ? 1 : 0.6
-                                placeholderText: !root.signedIn && root.entries.length === 0 ? "No passwords"
-                                    : !root.appUnlocked ? "Locked"
+                                placeholderText: !root.appUnlocked ? "Locked"
                                     : root.entries.length === 0 ? "No passwords"
                                     : "Search " + root.entries.length + " passwords"
                                 color: Theme.fg
@@ -1376,7 +1635,7 @@ ShellRoot {
                                 font.family: Theme.uiFont
                                 font.pixelSize: Theme.fBody
                                 focus: true
-                                onTextChanged: root.applyFilter()
+                                onTextChanged: root.applyFilter(root.selectedId)
                                 Keys.onDownPressed: root.moveCursor(1)
                                 Keys.onTabPressed: root.enterPanel(0)
                                 Keys.onUpPressed: root.moveCursor(-1)
@@ -1447,9 +1706,6 @@ ShellRoot {
                                 acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
                                 onWheel: function (ev) {
                                     const px = ev.pixelDelta.y, ad = ev.angleDelta.y;
-                                    if (root.debugWheel)
-                                        console.log("wheel t=" + Date.now() + " px=" + px + " angle=" + ad
-                                                    + " phase=" + ev.phase);
                                     // The lift carries no movement, so catch it before "did it move".
                                     if (ev.phase === Qt.ScrollEnd) { list.letGo(); return; }
                                     if (px !== 0 || ad % 120 !== 0) {
@@ -1514,8 +1770,6 @@ ShellRoot {
                                 list.vel = Math.max(-8, Math.min(8, v));
                                 if (list.contentY < list.minY || list.contentY > list.maxY) list.startBounce();
                                 else list.mode = Math.abs(list.vel) > 0.02 ? "coast" : "idle";
-                                if (root.debugWheel)
-                                    console.log("release v=" + list.vel.toFixed(2) + " px/ms -> " + list.mode);
                             }
 
                             function startBounce() {
@@ -1657,20 +1911,12 @@ ShellRoot {
                             }
                         }
 
-                        // Never signed in: no list and no placeholder rows - this keeps the search
-                        // bar pinned to the top instead of floating to the middle of an empty column.
-                        Item {
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            visible: !root.appUnlocked && !root.signedIn
-                        }
-
                         // Locked: rows with no content. Widths come from the row index, never
                         // from the entries - the backend has not sent any.
                         Column {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            visible: !root.appUnlocked && root.signedIn
+                            visible: !root.appUnlocked
                             topPadding: 6
                             spacing: 0
                             Repeater {
@@ -1742,22 +1988,29 @@ ShellRoot {
 
                         ColumnLayout {
                             anchors.centerIn: parent
-                            visible: !root.appUnlocked && root.signedIn
+                            width: Math.min(parent.width - 80, 420)
+                            visible: !root.appUnlocked
                             spacing: 14
                             // Everything here is greyed except the one thing you can do. A locked
                             // screen shouldn't shout its own state louder than the way out of it.
                             Text {
                                 textFormat: Text.PlainText
                                 Layout.alignment: Qt.AlignHCenter
-                                text: "Pear Passwords is locked"
+                                text: root.screen === "no-agent" ? "The unlock dialog isn't available"
+                                                                 : "Pear Passwords is locked"
                                 color: Theme.dim
                                 font.family: Theme.uiFont
                                 font.pixelSize: Theme.fHeading
                             }
                             Text {
                                 textFormat: Text.PlainText
-                                Layout.alignment: Qt.AlignHCenter
-                                text: root.authing
+                                Layout.fillWidth: true
+                                horizontalAlignment: Text.AlignHCenter
+                                wrapMode: Text.Wrap
+                                text: root.screen === "no-agent"
+                                    ? "Your desktop shell may be restarting. Try again in a moment, or run "
+                                      + "omarchy restart shell."
+                                    : root.authing
                                     ? "Waiting for your fingerprint or password. Nothing appeared? Retry"
                                     : "Click anywhere, or press Unlock, and use your fingerprint or password"
                                 color: Theme.dim
@@ -1770,8 +2023,8 @@ ShellRoot {
                             AppButton {
                                 Layout.alignment: Qt.AlignHCenter
                                 Layout.topMargin: 6
-                                text: root.authing ? "Retry" : "Unlock"
-                                onClicked: root.authenticate()
+                                text: root.authing ? "Retry" : root.screen === "no-agent" ? "Try again" : "Unlock"
+                                onClicked: root.authing ? root.retryAuth() : root.authenticate()
                             }
                         }
 
@@ -1779,7 +2032,7 @@ ShellRoot {
                         ColumnLayout {
                             anchors.centerIn: parent
                             width: Math.min(parent.width - 80, 360)
-                            visible: (root.appUnlocked && root.entries.length === 0) || (!root.appUnlocked && !root.signedIn)
+                            visible: root.appUnlocked && root.entries.length === 0
                             spacing: 10
                             Text {
                                 textFormat: Text.PlainText
@@ -1874,9 +2127,9 @@ ShellRoot {
                                             MouseArea {
                                                 anchors.fill: parent
                                                 cursorShape: Qt.PointingHandCursor
-                                                onClicked: root.unlockThen(function () {
+                                                onClicked: root.withGrant(function () {
                                                     nickField.text = root.selected.nickname
-                                                        || root.selected.real_title;
+                                                        || root.selected.title;
                                                     root.renaming = true;
                                                     nickField.forceActiveFocus();
                                                     nickField.selectAll();
@@ -2067,19 +2320,32 @@ ShellRoot {
                                     O.TextField {
                                         id: newPw
                                         Layout.fillWidth: true
+                                        visible: !root.generateNew
                                         placeholderText: "New password"
-                                        // Generated passwords are shown in clear so they can be
-                                        // read and rehearsed; typed ones stay masked.
-                                        password: !root.generated
+                                        password: true
                                         font.family: Theme.uiFont
                                         font.pixelSize: Theme.fBody
-                                        onTextEdited: root.generated = false
                                         onAccepted: if (text.length) root.confirming = true
                                     }
-                                    AppButton { text: "Generate"; onClicked: root.generatePassword() }
+                                    // A generated password is made by the daemon and never comes
+                                    // here unless you reveal it afterwards.
+                                    Text {
+                                        textFormat: Text.PlainText
+                                        Layout.fillWidth: true
+                                        visible: root.generateNew
+                                        text: "Pear will generate a strong password in Apple's style"
+                                        color: Theme.fg
+                                        font.family: Theme.uiFont
+                                        font.pixelSize: Theme.fBody
+                                        elide: Text.ElideRight
+                                    }
+                                    AppButton {
+                                        text: root.generateNew ? "Type one" : "Generate"
+                                        onClicked: { root.generateNew = !root.generateNew; newPw.text = ""; }
+                                    }
                                     AppButton {
                                         text: "Change…"
-                                        enabled: newPw.text.length > 0 && !root.busy
+                                        enabled: (newPw.text.length > 0 || root.generateNew) && !root.busy
                                         onClicked: root.confirming = true
                                     }
                                     Text {
@@ -2092,7 +2358,7 @@ ShellRoot {
                                             anchors.fill: parent
                                             anchors.margins: -8
                                             cursorShape: Qt.PointingHandCursor
-                                            onClicked: { root.changing = false; newPw.text = ""; root.generated = false; }
+                                            onClicked: { root.changing = false; newPw.text = ""; root.generateNew = false; }
                                         }
                                     }
                                 }
@@ -2114,7 +2380,7 @@ ShellRoot {
                                     Text {
                                         textFormat: Text.PlainText
                                         Layout.fillWidth: true
-                                        text: (root.revealed ? root.revealed : "current password") + "   →   " + newPw.text
+                                        text: "current password   →   " + (root.generateNew ? "a generated password" : "the one you typed")
                                         color: Theme.dim
                                         font.family: Theme.uiFont
                                         font.pixelSize: Theme.fSmall
@@ -2145,9 +2411,9 @@ ShellRoot {
                                 Item { Layout.fillWidth: true }
                                 Text {
                                     textFormat: Text.PlainText
-                                    visible: !root.unlocked
-                                    text: "unlock"
-                                    readonly property bool keyed: root.panelFocus && !root.unlocked
+                                    visible: !root.historyLoaded && !!root.selected && root.selected.history_count > 0
+                                    text: root.unlocked ? "show" : "unlock"
+                                    readonly property bool keyed: root.panelFocus && !root.historyLoaded
                                                                   && root.detailIndex === root.fieldCount
                                     color: hUnlock.hovered || keyed ? Theme.fg : Theme.dim
                                     font.underline: keyed
@@ -2158,7 +2424,7 @@ ShellRoot {
                                         anchors.fill: parent
                                         anchors.margins: -8
                                         cursorShape: Qt.PointingHandCursor
-                                        onClicked: root.unlockThen(null)
+                                        onClicked: root.loadHistory()
                                     }
                                 }
                             }
@@ -2167,7 +2433,8 @@ ShellRoot {
                                 textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 Layout.topMargin: 10
-                                visible: root.unlocked && root.historyLoaded && root.historyRows.length === 0
+                                visible: !!root.selected && (root.selected.history_count === 0
+                                         || (root.historyLoaded && root.historyRows.length === 0))
                                 text: "No changes recorded yet."
                                 color: Theme.dim
                                 font.family: Theme.uiFont
@@ -2176,7 +2443,7 @@ ShellRoot {
 
                             Item {
                                 Layout.fillHeight: true
-                                visible: !(root.unlocked && root.historyRows.length > 0)
+                                visible: !(root.historyLoaded && root.historyRows.length > 0)
                             }
 
                             // The list is widened 12px each side and its text inset by the same,
@@ -2187,7 +2454,7 @@ ShellRoot {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
                                 Layout.topMargin: 6
-                                visible: root.unlocked && root.historyRows.length > 0
+                                visible: root.historyLoaded && root.historyRows.length > 0
                             ListView {
                                 id: historyList
                                 anchors.fill: parent
@@ -2222,11 +2489,7 @@ ShellRoot {
                                     MouseArea {
                                         anchors.fill: parent
                                         cursorShape: Qt.PointingHandCursor
-                                        onClicked: {
-                                            const m = Object.assign({}, root.revealedHistory);
-                                            m[hrow.index] = !m[hrow.index];
-                                            root.revealedHistory = m;
-                                        }
+                                        onClicked: root.toggleHistory(hrow.index)
                                     }
                                     ColumnLayout {
                                         anchors.left: parent.left
@@ -2237,9 +2500,8 @@ ShellRoot {
                                         spacing: 3
                                         Text {
                                             textFormat: Text.PlainText
-                                            text: Qt.formatDateTime(new Date(hrow.modelData.at * 1000), "d MMM yyyy") + "   "
-                                                  + (hrow.modelData.source === "sync" ? "changed on another device"
-                                                     : hrow.modelData.source === "local" ? "changed here" : "from Apple")
+                                            text: Qt.formatDateTime(new Date(hrow.modelData.date), "d MMM yyyy") + "   "
+                                                  + (hrow.modelData.source === "local" ? "seen changing here" : "from Apple")
                                             color: Theme.dim
                                             font.family: Theme.uiFont
                                             font.pixelSize: Theme.fSmall
@@ -2248,8 +2510,8 @@ ShellRoot {
                                             textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             text: root.revealedHistory[hrow.index]
-                                                ? ((hrow.modelData.old ? hrow.modelData.old + "   →   " : "") + (hrow.modelData.new || ""))
-                                                : "••••••••   →   ••••••••"
+                                                ? (hrow.modelData.value || "")
+                                                : "••••••••••••"
                                             color: root.revealedHistory[hrow.index] ? Theme.fg : Theme.dim
                                             font.family: Theme.uiFont
                                             font.pixelSize: Theme.fBody
@@ -2272,14 +2534,13 @@ ShellRoot {
                         anchors.fill: parent
                         anchors.leftMargin: 12
                         anchors.rightMargin: 12
-                        spacing: 10
+                        spacing: 14
                         Text {
                             textFormat: Text.PlainText
                             Layout.fillWidth: true
                             text: root.flash ? root.flash
                                 : root.status ? root.status
-                                : root.busy ? "working…"
-                                : !root.appUnlocked && root.signedIn ? "locked"
+                                : !root.appUnlocked ? "locked"
                                 : root.entries.length === 0 ? ""
                                 : root.filtered.length + " of " + root.entries.length + " shown"
                             color: root.flash ? Theme.accent : Theme.dim
@@ -2288,36 +2549,68 @@ ShellRoot {
                             elide: Text.ElideRight
                             opacity: root.appUnlocked || root.flash ? 1 : 0.45
                         }
-                        // Which of the two states the app is in, and how long is left of it.
-                        // Click it to scan now rather than waiting to be asked mid-action.
+                        // The one open account and how long it stays open: "GitHub open 1:58".
                         Text {
                             textFormat: Text.PlainText
-                            visible: root.appUnlocked && root.sessionLeft > 0
-                            text: root.unlocked ? "unlocked " + root.clock(root.unlockLeft)
-                                                : "read-only · locks in " + root.clock(root.sessionLeft)
-                            color: root.unlocked ? Theme.accent : (hLock.hovered ? Theme.fg : Theme.dim)
+                            visible: root.unlocked
+                            Layout.maximumWidth: 260
+                            text: (root.selected ? root.selected.primary : "")
+                                  + (root.grantSingleUse ? " open for one use" : " open " + root.clock(root.grantLeft))
+                            color: Theme.accent
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fSmall
-                            font.underline: hLock.hovered && !root.unlocked
-                            HoverHandler { id: hLock; cursorShape: root.unlocked ? Qt.ArrowCursor : Qt.PointingHandCursor }
-                            TapHandler { onTapped: if (!root.unlocked) root.unlockThen(null) }
+                            elide: Text.ElideMiddle
                         }
-                        // Always reachable - the banner only appears once Apple has already
-                        // refused a sync, which is no help for a first sign-in.
                         Text {
                             textFormat: Text.PlainText
+                            visible: root.appUnlocked && root.signedIn
+                            text: root.syncing ? "syncing…"
+                                : root.syncedAt > 0 ? "synced " + root.agoShort(root.syncedAt) : "sync now"
+                            color: hSync.hovered ? Theme.fg : Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            font.underline: hSync.hovered && !root.syncing
+                            HoverHandler { id: hSync; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: root.syncNow() }
+                        }
+                        // Only while unlocked: signing in raises a dialog of its own and needs the
+                        // window to be the authenticated one.
+                        Text {
+                            textFormat: Text.PlainText
+                            visible: root.appUnlocked && (!root.signedIn || root.needsLogin)
                             text: "sign in…"
-                            opacity: root.appUnlocked ? 1 : 0.45
                             color: hSign.hovered ? Theme.accent : Theme.dim
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fSmall
                             font.underline: hSign.hovered
-                            HoverHandler { id: hSign }
-                            TapHandler { onTapped: root.startSignin("login") }
+                            HoverHandler { id: hSign; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: root.startSignin(root.signedIn ? "relogin" : "login") }
                         }
                         Text {
                             textFormat: Text.PlainText
-                            visible: root.entries.length > 0
+                            visible: root.appUnlocked
+                            text: "settings"
+                            color: hSettings.hovered ? Theme.fg : Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            font.underline: hSettings.hovered
+                            HoverHandler { id: hSettings; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: root.settingsOpen = true }
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            visible: root.appUnlocked
+                            text: "lock"
+                            color: hLockNow.hovered ? Theme.fg : Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            font.underline: hLockNow.hovered
+                            HoverHandler { id: hLockNow; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: root.lockNow() }
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            visible: root.entries.length > 0 && !root.unlocked
                             text: root.panelFocus
                                 ? "↑↓ move   ⏎ copy / open   ␣ show   esc list"
                                 : "↑↓ move   ⏎ copy   ⇥ details   esc back"
@@ -2337,7 +2630,7 @@ ShellRoot {
             parent: scope
             z: 50
             anchors.fill: parent
-            enabled: !root.appUnlocked && root.signedIn && !root.signinOpen && !root.editorOpen
+            enabled: root.screen === "locked" && !root.authing && !root.signinOpen && !root.editorOpen
             visible: enabled
             cursorShape: Qt.PointingHandCursor
             onClicked: root.authenticate()
@@ -2396,7 +2689,7 @@ ShellRoot {
                         Layout.topMargin: 6
                         visible: text !== ""
                         text: root.editorMode === "create" ? "Saved to your iCloud Keychain, so it reaches your other devices."
-                            : root.editorMode === "totp" ? "Paste the setup key or link from the site's two-factor settings, or scan its QR code."
+                            : root.editorMode === "totp" ? "Paste the setup key or otpauth:// link from the site's two-factor settings."
                             : root.selected ? root.selected.primary : ""
                         color: Theme.dim
                         font.family: Theme.uiFont
@@ -2485,11 +2778,6 @@ ShellRoot {
                                 placeholderText: "Setup key or otpauth:// link"
                                 onTextChanged: { previewDebounce.text = text; previewDebounce.restart(); }
                                 onAccepted: root.editorSave()
-                            }
-                            AppButton {
-                                text: root.editorScanning ? "Drag over the code…" : "Scan QR code"
-                                enabled: !root.editorScanning && !root.editorBusy
-                                onClicked: root.scanQr(edSetup)
                             }
                         }
                         // What the code will be, before anything is saved: type it into the
@@ -2592,13 +2880,22 @@ ShellRoot {
                             O.TextField {
                                 id: crPass
                                 Layout.fillWidth: true
+                                visible: !root.createGenerate
+                                password: true
                                 font.family: Theme.uiFont; font.pixelSize: Theme.fBody; verticalPadding: 9
                                 placeholderText: "Required"
                                 onAccepted: root.editorSave()
                             }
+                            Text {
+                                textFormat: Text.PlainText
+                                Layout.fillWidth: true
+                                visible: root.createGenerate
+                                text: "Pear will generate one"
+                                color: Theme.fg; font.family: Theme.uiFont; font.pixelSize: Theme.fBody
+                            }
                             AppButton {
-                                text: "Generate"
-                                onClicked: root.run(["app-generate"], "", function (d) { crPass.text = d.password || ""; })
+                                text: root.createGenerate ? "Type one" : "Generate"
+                                onClicked: { root.createGenerate = !root.createGenerate; crPass.text = ""; }
                             }
                         }
                         Text {
@@ -2645,11 +2942,6 @@ ShellRoot {
                                 font.family: Theme.uiFont; font.pixelSize: Theme.fBody; verticalPadding: 9
                                 placeholderText: "Setup key or link (optional)"
                                 onTextChanged: { previewDebounce.text = text; previewDebounce.restart(); }
-                            }
-                            AppButton {
-                                text: root.editorScanning ? "Drag…" : "Scan"
-                                enabled: !root.editorScanning && !root.editorBusy
-                                onClicked: root.scanQr(crSetup)
                             }
                         }
                         Text {
@@ -3060,9 +3352,9 @@ ShellRoot {
                             anchors.verticalCenter: parent.verticalCenter
                             anchors.leftMargin: 20
                             anchors.rightMargin: 16
-                            text: "<b>This can't be undone.</b> Each wrong " + root.secretWord() + " uses 1 of about 10 attempts. "
+                            text: "This can't be undone. Each wrong " + root.secretWord() + " uses 1 of about 10 attempts. "
                                 + "After the 10th wrong attempt, the escrow record for this device is destroyed permanently."
-                            textFormat: Text.StyledText
+                            textFormat: Text.PlainText
                             color: Theme.fg
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fSmall
@@ -3085,6 +3377,7 @@ ShellRoot {
                     Repeater {
                         model: root.signinOutcome === "ok" ? root.signinWarnings : []
                         delegate: Text {
+                            textFormat: Text.PlainText
                             required property var modelData
                             Layout.fillWidth: true
                             Layout.topMargin: 6
@@ -3147,7 +3440,7 @@ ShellRoot {
                                   ? (root.signinKind === "join_confirm" && root.signinNeed === "confirm" ? "Not now" : "Cancel")
                                   : "Close"
                             onClicked: {
-                                if (root.signinRunning && root.signinNeed === "confirm") root.signinSend("n");
+                                if (root.signinRunning && root.signinNeed === "confirm") root.signinSend("no");
                                 else if (root.signinRunning) root.signinCancel();
                                 else root.signinOpen = false;
                             }
@@ -3163,5 +3456,785 @@ ShellRoot {
                 }
             }
         }
+
+        // ---------------------------------------------------------------- state screens
+        // Everything that is not the list: can't reach the service, nothing to show yet, or a
+        // problem with the keys. Under the sheets, so a sign-in started here draws on top.
+        Rectangle {
+            parent: scope
+            z: 85
+            anchors.fill: parent
+            color: Theme.bg
+            visible: ["connecting", "not-installed", "launcher", "daemon-failed", "abi-mismatch",
+                      "empty", "tpm-missing", "tpm-cleared", "damaged"].indexOf(root.screen) >= 0
+            MouseArea { anchors.fill: parent }
+
+            ColumnLayout {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - 120, 500)
+                spacing: 14
+
+                Text {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: root.stateTitle()
+                    color: Theme.fg
+                    font.family: Theme.uiFont
+                    font.pixelSize: Math.round(Theme.fHeading * 1.25)
+                    font.weight: Font.DemiBold
+                    wrapMode: Text.Wrap
+                }
+                Text {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    visible: text !== ""
+                    text: root.stateBody()
+                    color: Theme.dim
+                    font.family: Theme.uiFont
+                    font.pixelSize: Theme.fBody
+                    lineHeight: 1.15
+                    wrapMode: Text.Wrap
+                }
+                // A command to run, selectable so it can be copied.
+                Rectangle {
+                    Layout.fillWidth: true
+                    visible: root.stateCommand() !== ""
+                    implicitHeight: cmdText.implicitHeight + 20
+                    radius: Theme.radius
+                    color: Theme.panel
+                    TextEdit {
+                        id: cmdText
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.margins: 12
+                        textFormat: TextEdit.PlainText
+                        readOnly: true
+                        selectByMouse: true
+                        wrapMode: TextEdit.WrapAnywhere
+                        text: root.stateCommand()
+                        color: Theme.fg
+                        selectionColor: Theme.selected
+                        font.family: "monospace"
+                        font.pixelSize: Theme.fSmall
+                    }
+                }
+                // Start over: said in full before it is offered, and asked twice.
+                Text {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    visible: root.startOverConfirm
+                    text: "Start over? New keys are made and you sign in to iCloud again. Local password "
+                        + "history and nicknames can't be brought back. The old files are moved aside, not deleted."
+                    color: Theme.danger
+                    font.family: Theme.uiFont
+                    font.pixelSize: Theme.fSmall
+                    wrapMode: Text.Wrap
+                }
+                RowLayout {
+                    Layout.topMargin: 10
+                    spacing: 10
+                    AppButton {
+                        visible: root.screen === "tpm-cleared" || root.screen === "damaged"
+                        text: root.startOverConfirm ? "Yes, start over" : "Start over…"
+                        onClicked: root.startOverConfirm ? root.startOver() : root.startOverConfirm = true
+                    }
+                    AppButton {
+                        visible: root.stateButton() !== ""
+                        active: true
+                        text: root.stateButton()
+                        onClicked: root.stateAction()
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- migration
+        Rectangle {
+            parent: scope
+            z: 86
+            anchors.fill: parent
+            color: Theme.bg
+            visible: root.screen === "migrate"
+            MouseArea { anchors.fill: parent }
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - 80, 560)
+                height: Math.min(migSheet.implicitHeight + 64, parent.height - 40)
+                radius: Theme.radius
+                color: Theme.bg
+                border.width: 1
+                border.color: Theme.line
+                clip: true
+
+                ColumnLayout {
+                    id: migSheet
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: 32
+                    spacing: 0
+
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        text: root.migrateStep === "running" ? "Moving your passwords…"
+                            : root.migrateStep === "passphrase" ? "Your old Pear Passwords passphrase"
+                            : root.migrateStep === "done" ? "Your passwords are here"
+                            : root.migrateStep === "error" ? "The move didn't finish"
+                            : "Move your passwords into Pear Passwords 2"
+                        color: Theme.fg
+                        font.family: Theme.uiFont
+                        font.pixelSize: Math.round(Theme.fHeading * 1.25)
+                        font.weight: Font.DemiBold
+                        wrapMode: Text.Wrap
+                    }
+
+                    // ---- intro
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 12
+                        spacing: 12
+                        visible: root.migrateStep === "intro" || root.migrateStep === ""
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: "Pear Passwords 2 keeps your passwords in a system service under its own account, "
+                                + "so nothing in your home folder can decrypt them any more. This moves your 1.x vault "
+                                + "across once. It's checked against the original before anything changes; then "
+                                + "~/.config/icp is renamed to a dated backup you can delete later from Settings."
+                            color: Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fBody
+                            lineHeight: 1.15
+                            wrapMode: Text.Wrap
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: "For the smoothest move, open and unlock Pear Passwords 1.3.2 within 15 minutes "
+                                + "before this step. Otherwise you'll be asked for your old passphrase, this one last time."
+                            color: Theme.fg
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fBody
+                            lineHeight: 1.15
+                            wrapMode: Text.Wrap
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: "The old background services are stopped and turned off: " + root.legacyUnits.join(", ") + "."
+                            color: Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            wrapMode: Text.Wrap
+                        }
+                        // consent: the old browser-extension connection files
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 12
+                            Rectangle {
+                                Layout.alignment: Qt.AlignTop
+                                implicitWidth: 18; implicitHeight: 18
+                                radius: Theme.radius
+                                color: root.migrateManifests ? Theme.accent : "transparent"
+                                border.width: 1
+                                border.color: root.migrateManifests ? Theme.accent : Theme.dim
+                                Text {
+                                    textFormat: Text.PlainText
+                                    anchors.centerIn: parent
+                                    visible: root.migrateManifests
+                                    text: "✓"
+                                    color: Theme.bg
+                                    font.pixelSize: Theme.fSmall
+                                }
+                            }
+                            Text {
+                                textFormat: Text.PlainText
+                                Layout.fillWidth: true
+                                text: "Also move the old browser-extension connection files (org.icp.native.json) "
+                                    + "into the backup. Only files that are exactly the old ones are moved; ~/icp is left alone."
+                                color: Theme.fg
+                                font.family: Theme.uiFont
+                                font.pixelSize: Theme.fSmall
+                                wrapMode: Text.Wrap
+                            }
+                            TapHandler { onTapped: root.migrateManifests = !root.migrateManifests }
+                            HoverHandler { cursorShape: Qt.PointingHandCursor }
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            visible: root.migrateError !== ""
+                            text: root.migrateError
+                            color: Theme.danger
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    // ---- running
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 12
+                        spacing: 16
+                        visible: root.migrateStep === "running"
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: root.migrateStage === "reading" ? "Reading your 1.x vault…"
+                                : root.migrateStage === "peek" ? "Getting the key from Pear Passwords 1.3.2…"
+                                : root.migrateStage === "converting" ? "Converting and checking every entry…"
+                                : root.migrateStage === "cleanup" ? "Tidying up the old install…"
+                                : "Waiting for your approval…"
+                            color: Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fBody
+                        }
+                        Item {
+                            Layout.fillWidth: true
+                            implicitHeight: 2
+                            clip: true
+                            Rectangle { anchors.fill: parent; color: Theme.line }
+                            Rectangle {
+                                id: migSweep
+                                width: parent.width * 0.3
+                                height: parent.height
+                                color: Theme.accent
+                                NumberAnimation on x {
+                                    running: root.migrateStep === "running"
+                                    loops: Animation.Infinite
+                                    from: -migSweep.width
+                                    to: migSweep.parent.width
+                                    duration: 1300
+                                    easing.type: Easing.InOutQuad
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- the old passphrase, once
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 12
+                        spacing: 10
+                        visible: root.migrateStep === "passphrase"
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: root.migrateRetry ? "That passphrase didn't open your old vault. Try again."
+                                : "Pear Passwords 1.3.2 wasn't unlocked recently, so the old vault needs its "
+                                  + "passphrase — this one last time. It goes to the service in memory and is never stored."
+                            color: root.migrateRetry ? Theme.danger : Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fBody
+                            lineHeight: 1.15
+                            wrapMode: Text.Wrap
+                        }
+                        O.TextField {
+                            id: oldPass
+                            Layout.fillWidth: true
+                            password: true
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fBody
+                            verticalPadding: 10
+                            placeholderText: "Old passphrase"
+                            onAccepted: root.migratePassphrase()
+                            Keys.onEscapePressed: root.migrateCancel()
+                        }
+                    }
+
+                    // ---- done
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 12
+                        spacing: 12
+                        visible: root.migrateStep === "done"
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: root.migrateSummary()
+                            color: Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fBody
+                            lineHeight: 1.15
+                            wrapMode: Text.Wrap
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: "Browser autofill is off until you turn it on. If you use a Pear Passwords "
+                                + "browser extension, register it once:"
+                            color: Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            wrapMode: Text.Wrap
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true
+                            implicitHeight: regText.implicitHeight + 20
+                            radius: Theme.radius
+                            color: Theme.panel
+                            TextEdit {
+                                id: regText
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.margins: 12
+                                textFormat: TextEdit.PlainText
+                                readOnly: true
+                                selectByMouse: true
+                                wrapMode: TextEdit.WrapAnywhere
+                                text: root.registerCommand
+                                color: Theme.fg
+                                selectionColor: Theme.selected
+                                font.family: "monospace"
+                                font.pixelSize: Theme.fSmall
+                            }
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            visible: (root.migrateResult.kept_manifests || []).length > 0
+                            text: "Left in place (not the old files, or you chose to keep them): "
+                                + (root.migrateResult.kept_manifests || []).join(", ")
+                            color: Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            wrapMode: Text.WrapAnywhere
+                        }
+                    }
+
+                    // ---- error
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        Layout.topMargin: 12
+                        visible: root.migrateStep === "error"
+                        text: root.migrateError
+                        color: Theme.danger
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fBody
+                        wrapMode: Text.Wrap
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 28
+                        spacing: 10
+                        Text {
+                            textFormat: Text.PlainText
+                            visible: root.migrateStep === "intro"
+                            text: "Start fresh instead"
+                            color: hFresh.hovered ? Theme.fg : Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            font.underline: hFresh.hovered
+                            HoverHandler { id: hFresh; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: { root.migrateStep = ""; root.v1Present = false; } }
+                        }
+                        Item { Layout.fillWidth: true }
+                        AppButton {
+                            visible: root.migrateStep === "passphrase"
+                            text: "Cancel"
+                            onClicked: root.migrateCancel()
+                        }
+                        AppButton {
+                            visible: root.migrateStep !== "running"
+                            active: true
+                            enabled: root.migrateStep !== "passphrase" || oldPass.text.length > 0
+                            text: root.migrateStep === "done" ? "Done"
+                                : root.migrateStep === "error" ? "Back" : "Continue"
+                            onClicked: {
+                                if (root.migrateStep === "done") root.migrateFinish();
+                                else if (root.migrateStep === "error") { root.migrateStep = "intro"; }
+                                else if (root.migrateStep === "passphrase") root.migratePassphrase();
+                                else root.migrateBegin();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- settings
+        Rectangle {
+            parent: scope
+            z: 88
+            anchors.fill: parent
+            visible: root.settingsOpen
+            color: Qt.rgba(0, 0, 0, 0.55)
+            MouseArea { anchors.fill: parent; onClicked: root.settingsOpen = false }
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - 80, 600)
+                height: Math.min(setSheet.implicitHeight + 60, parent.height - 40)
+                radius: Theme.radius
+                color: Theme.bg
+                border.width: 1
+                border.color: Theme.line
+                clip: true
+                MouseArea { anchors.fill: parent }
+                Keys.onEscapePressed: root.settingsOpen = false
+
+                Flickable {
+                    anchors.fill: parent
+                    anchors.margins: 30
+                    contentHeight: setSheet.implicitHeight
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: AppScrollBar {}
+
+                ColumnLayout {
+                    id: setSheet
+                    width: parent.width
+                    spacing: 0
+
+                    Text {
+                        textFormat: Text.PlainText
+                        text: "Settings"
+                        color: Theme.fg
+                        font.family: Theme.uiFont
+                        font.pixelSize: Math.round(Theme.fHeading * 1.25)
+                        font.weight: Font.DemiBold
+                    }
+
+                    Repeater {
+                        model: [
+                            { key: "grant_s", label: "An account you open stays open for",
+                              choices: [[0, "one use"], [30, "30 s"], [60, "1 min"], [120, "2 min"], [300, "5 min"], [600, "10 min"]] },
+                            { key: "idle_lock_s", label: "Lock when not used for",
+                              choices: [[0, "never"], [300, "5 min"], [900, "15 min"], [1800, "30 min"]] },
+                            { key: "clip_timeout_s", label: "A copied password clears after one paste or",
+                              choices: [[10, "10 s"], [15, "15 s"], [30, "30 s"], [45, "45 s"], [60, "60 s"]] }
+                        ]
+                        delegate: ColumnLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            Layout.topMargin: 20
+                            spacing: 8
+                            Text {
+                                textFormat: Text.PlainText
+                                text: parent.modelData.label
+                                color: Theme.fg
+                                font.family: Theme.uiFont
+                                font.pixelSize: Theme.fSmall
+                            }
+                            Flow {
+                                Layout.fillWidth: true
+                                spacing: 6
+                                Repeater {
+                                    model: parent.parent.modelData.choices
+                                    delegate: AppButton {
+                                        required property var modelData
+                                        readonly property string key: parent.parent.modelData.key
+                                        text: modelData[1]
+                                        active: root.settings[key] === modelData[0]
+                                        fontSize: Theme.fSmall
+                                        onClicked: root.setSetting(key, modelData[0])
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        Layout.topMargin: 24
+                        text: root.sealedWith === "host+tpm2"
+                            ? "Your keys are sealed to this computer and its security chip."
+                            : "Your keys are sealed to this computer. Turning on the security chip (PTT) in the "
+                              + "BIOS also ties them to this laptop; Pear picks that up on its own."
+                        color: Theme.dim
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                        wrapMode: Text.Wrap
+                    }
+
+                    // ---- clipboard history
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.topMargin: 24
+                        text: "Clipboard history"
+                        color: Theme.fg
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                    }
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        Layout.topMargin: 6
+                        text: "Passwords copied before Pear Passwords 2 may still be in Omarchy's clipboard history. "
+                            + "This compares the two without showing either, and needs your approval."
+                        color: Theme.dim
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                        wrapMode: Text.Wrap
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 8
+                        spacing: 12
+                        AppButton {
+                            text: root.historyChecking ? "Checking…" : "Check clipboard history"
+                            enabled: !root.historyChecking
+                            fontSize: Theme.fSmall
+                            onClicked: root.checkClipboardHistory()
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: root.historyCheck
+                            color: Theme.fg
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    // ---- the 1.x backup
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 24
+                        spacing: 8
+                        visible: !!root.oldCopy
+                        Text {
+                            textFormat: Text.PlainText
+                            text: "Old 1.x copy"
+                            color: Theme.fg
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: "The encrypted 1.x vault is still in " + (root.oldCopy ? root.oldCopy.dir : "")
+                                + ". It is sealed with your old passphrase only; once everything looks right here, delete it."
+                            color: root.oldCopyStale() ? Theme.fg : Theme.dim
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            wrapMode: Text.Wrap
+                        }
+                        AppButton {
+                            text: root.purging ? "Deleting…" : "Delete the old encrypted copy"
+                            enabled: !root.purging
+                            fontSize: Theme.fSmall
+                            onClicked: root.purgeOldCopy()
+                        }
+                    }
+
+                    // ---- autofill
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.topMargin: 24
+                        text: "Browser autofill"
+                        color: Theme.fg
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                    }
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        Layout.topMargin: 6
+                        text: "Off unless you register an extension of your own. Every fill then asks for your "
+                            + "approval, and the browser holds that one password afterwards. To turn it on:"
+                        color: Theme.dim
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                        wrapMode: Text.Wrap
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 8
+                        implicitHeight: setReg.implicitHeight + 16
+                        radius: Theme.radius
+                        color: Theme.panel
+                        TextEdit {
+                            id: setReg
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.margins: 10
+                            textFormat: TextEdit.PlainText
+                            readOnly: true
+                            selectByMouse: true
+                            wrapMode: TextEdit.WrapAnywhere
+                            text: root.registerCommand
+                            color: Theme.fg
+                            selectionColor: Theme.selected
+                            font.family: "monospace"
+                            font.pixelSize: Theme.fCaption
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 28
+                        spacing: 10
+                        AppButton {
+                            visible: root.signedIn
+                            text: "Sign out of iCloud…"
+                            fontSize: Theme.fSmall
+                            onClicked: root.signOut()
+                        }
+                        Item { Layout.fillWidth: true }
+                        AppButton { text: "Lock now"; onClicked: { root.settingsOpen = false; root.lockNow(); } }
+                        AppButton { active: true; text: "Close"; onClicked: root.settingsOpen = false }
+                    }
+                }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- screen texts
+    function stateTitle() {
+        switch (root.screen) {
+        case "connecting": return "Pear Passwords";
+        case "not-installed": return "One more step";
+        case "launcher": return "Open Pear Passwords from its launcher";
+        case "daemon-failed": return "Pear's background service didn't start";
+        case "abi-mismatch": return "Python was upgraded";
+        case "empty": return "No passwords yet";
+        case "tpm-missing": return "The security chip is switched off";
+        case "tpm-cleared": return "The security chip was reset";
+        case "damaged": return "Pear Passwords can't read its data";
+        }
+        return "";
+    }
+    function stateBody() {
+        switch (root.screen) {
+        case "connecting": return "Connecting…";
+        case "not-installed":
+            return "Pear Passwords 2 keeps your passwords in a small system service, which needs a one-time "
+                 + "step with sudo. Run ./install.sh from the plugin folder, then paste the command it prints.";
+        case "launcher":
+            return "This window was started directly, so it can't prove it's the real app. Close it and "
+                 + "open Pear Passwords from the app launcher.";
+        case "daemon-failed":
+            return (root.daemonDetail ? root.daemonDetail + " " : "")
+                 + "Its log says why:";
+        case "abi-mismatch":
+            return "Pear's system part was built for the previous Python. Re-run the system step: run "
+                 + "./install.sh from the plugin folder, then paste the command it prints.";
+        case "empty":
+            return "Sign in to iCloud to bring in the passwords saved on your iPhone, iPad and Mac.";
+        case "tpm-missing":
+            return "The security chip (PTT) is switched off. Turn it back on in the BIOS and your "
+                 + "passwords come back.";
+        case "tpm-cleared":
+            return "The security chip was reset, so the keys can't be recovered. Starting over makes new keys "
+                 + "and signs you in to iCloud again. If this computer's place in your keychain was lost too, "
+                 + "that needs your Apple Account password, a verification code and one device-passcode attempt "
+                 + "(out of about 10). Local password history and nicknames are lost.";
+        case "damaged":
+            return "The keys opened but the stored data didn't check out. Nothing has been deleted; the files "
+                 + "are kept for diagnosis. Starting over moves them aside, makes new keys and signs you in to "
+                 + "iCloud again. Local password history and nicknames are lost.";
+        }
+        return "";
+    }
+    function stateCommand() {
+        return root.screen === "daemon-failed" ? "journalctl -b -u pear-passwordsd" : "";
+    }
+    function stateButton() {
+        switch (root.screen) {
+        case "not-installed": case "daemon-failed": case "abi-mismatch": return "Try again";
+        case "launcher": return "Close";
+        case "empty": return "Sign in to iCloud";
+        case "tpm-missing": case "tpm-cleared": case "damaged": return "Try again";
+        }
+        return "";
+    }
+    function stateAction() {
+        switch (root.screen) {
+        case "not-installed": case "daemon-failed": case "abi-mismatch": root.reconnect(); return;
+        case "launcher": Qt.quit(); return;
+        case "empty": root.startSignin("login"); return;
+        case "tpm-missing": case "tpm-cleared": case "damaged": root.authenticate(); return;
+        }
+    }
+    function migrateSummary() {
+        const c = root.migrateResult.counts || {};
+        const n = function (k, one, many) { const v = c[k] || 0; return v + " " + (v === 1 ? one : many); };
+        return n("credentials", "password", "passwords") + ", " + n("history", "history entry", "history entries")
+             + " and " + n("nicknames", "nickname", "nicknames") + " moved and checked. The old encrypted copy is in "
+             + (root.migrateResult.backup_dir || "a backup folder") + "; delete it from Settings once everything looks right.";
+    }
+    function oldCopyStale() {
+        return !!root.oldCopy && root.oldCopy.migrated_at && (Date.now() / 1000 - root.oldCopy.migrated_at) > 7 * 86400;
+    }
+
+    // ---------------------------------------------------------------- development previews
+    Timer {
+        id: snapshotTimer
+        interval: 1500
+        onTriggered: scope.grabToImage(function (r) {
+            r.saveToFile(root.snapshotPath);
+            Qt.quit();
+        })
+    }
+
+    // Made-up data only. Nothing is read from or sent to the daemon.
+    function applyPreview(mode) {
+        const now = Date.now() / 1000;
+        const mk = function (n, user, sites, totp, notes, noSite, domain) {
+            return { id: "demo" + n, domain: domain || ("example-" + n + ".com"), username: user,
+                     title: "Example Account " + n, primary: "Example Account " + n, nickname: "",
+                     apple_title: "Example Account " + n, secondary: user, no_site: !!noSite,
+                     mdat: now - n * 86400 * 3, has_totp: totp, aliases: [], sites: sites,
+                     has_notes: notes, ambiguous: false, is_wifi: false, history_count: n === 1 ? 2 : 0 };
+        };
+        root.phase = "ready";
+        root.windowReady = true;
+        root.signedIn = true;
+        root.sealedWith = "host";
+        root.syncedAt = now - 240;
+        root.vaultState = "locked";
+        if (["not-installed", "daemon-failed", "abi-mismatch", "launcher"].indexOf(mode) >= 0) {
+            root.phase = mode;
+            if (mode === "daemon-failed") root.daemonDetail = "It stopped with \"exit-code\".";
+        } else if (["tpm-missing", "tpm-cleared", "damaged"].indexOf(mode) >= 0) {
+            root.vaultState = mode;
+        } else if (mode === "empty") {
+            root.vaultState = "empty"; root.v1Checked = true; root.signedIn = false;
+        } else if (mode === "no-agent") {
+            root.lockReason = "no-agent";
+        } else if (mode.indexOf("migrate") === 0) {
+            root.vaultState = "empty"; root.v1Checked = true; root.v1Present = true;
+            root.migrateStep = mode === "migrate" ? "intro" : mode.slice(8);
+            root.migrateStage = "converting";
+            root.migrateResult = { counts: { credentials: 554, history: 31, nicknames: 12 },
+                                   backup_dir: root.home + "/.config/icp.v1-backup-20261008",
+                                   kept_manifests: [] };
+        } else if (mode !== "locked") {
+            root.appUnlocked = true;
+            root.vaultState = "unlocked";
+            root.oldCopy = { dir: root.home + "/.config/icp.v1-backup-20261008", migrated_at: now - 9 * 86400 };
+            root.setEntries([mk(1, "dummyuser1", ["login.example-1.com"], true, true, false),
+                             mk(2, "dummyuser2", [], false, true, false),
+                             mk(3, "alex@example.com", [], true, false, false),
+                             mk(4, "sam@example.com", [], false, false, true)]);
+            if (mode === "detail") {
+                root.grantId = "demo1"; root.grantExpires = now + 118; root.grantLeft = 118;
+                root.revealed = "correct-horse-battery";
+                root.totpCode = "482913"; root.totpLeft = 21;
+                root.historyRows = [{ date: "2026-09-01T10:00:00Z", value: "old-one", source: "apple" },
+                                    { date: "2026-08-01T10:00:00Z", value: "older-one", source: "local" }];
+                root.historyLoaded = true;
+            }
+            if (mode === "settings") root.settingsOpen = true;
+            if (mode === "copied") root.showFlash("Password copied — clears after one paste or 30 s");
+        }
+        if (root.snapshotPath) snapshotTimer.start();
+    }
+
+    Component.onCompleted: {
+        if (root.previewMode) { root.applyPreview(root.previewMode); return; }
+        daemon.connected = true;
     }
 }
