@@ -546,6 +546,11 @@ async def op_history(reg, conn, req):
     epoch = s.epoch
     items = await _store(reg, conn.uid, s.store.history, id)
     _still(s, conn, epoch)
+    # The read ran in a worker: a release or another account's grant may have landed since.
+    # A spent single-use grant was this read itself; anything else must still be that grant.
+    if not ended and reg.grants.current(conn.uid) is not g:
+        items = None
+        raise OpError("no-grant")
     # The store labels each item (vstore.entries.HistoryItem.source); a store that returns
     # plain (date, value) tuples falls back to matching the grant's copy of Apple's history.
     out = []

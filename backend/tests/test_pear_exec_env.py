@@ -79,6 +79,11 @@ def c_defines():
     return dict(re.findall(r'^#define\s+(PEAR_[A-Z_]+)\s+"([^"]*)"', src, re.M))
 
 
+QT_DISABLED = ("zwp_primary_selection_device_manager_v1,gtk_primary_selection_device_manager,"
+               "zwp_text_input_manager_v1,zwp_text_input_manager_v2,zwp_text_input_manager_v3,"
+               "qt_text_input_method_manager_v1")
+
+
 @unittest.skipUnless(CC, "no C compiler")
 class PearExecTests(unittest.TestCase):
     @classmethod
@@ -235,6 +240,7 @@ class PearExecTests(unittest.TestCase):
             "XCURSOR_SIZE": "24",
             "QT_QPA_PLATFORM": "wayland", "QT_QPA_PLATFORMTHEME": "",
             "QML_DISABLE_DISK_CACHE": "1", "QT_LOGGING_RULES": "*=false",
+            "QT_WAYLAND_DISABLED_INTERFACES": QT_DISABLED,
             "XDG_CONFIG_HOME": paths.EMPTY_DIR, "XDG_CACHE_HOME": paths.EMPTY_DIR,
             "XDG_STATE_HOME": paths.EMPTY_DIR, "XDG_DATA_HOME": paths.EMPTY_DIR,
             "XDG_DATA_DIRS": "/usr/share:/usr/local/share",
@@ -256,6 +262,10 @@ class PearExecTests(unittest.TestCase):
                      "QSG_RHI_BACKEND", "DISPLAY", "LC_PAPER", "PEAR_EXEC_TEST_ROOT"):
             self.assertNotIn(name, env)
         self.assertEqual(env["QML_DISABLE_DISK_CACHE"], "1")
+        # clipboard_ui-2: no primary selection, no input method for the secret fields
+        disabled = env["QT_WAYLAND_DISABLED_INTERFACES"].split(",")
+        for iface in ("zwp_primary_selection_device_manager_v1", "zwp_text_input_manager_v3"):
+            self.assertIn(iface, disabled)
         self.assertEqual(env["FONTCONFIG_FILE"], paths.FONTS_CONF)
         self.assertEqual(env["XDG_CONFIG_HOME"], paths.EMPTY_DIR)
 

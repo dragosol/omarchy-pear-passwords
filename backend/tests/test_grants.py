@@ -142,6 +142,34 @@ class GrantFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.ui.call("grant", id="e.1")
         self.assertEqual((await self.ui.call("totp", id="e.1"))["error"], "invalid")
 
+    async def test_history_read_after_a_release_returns_nothing(self):
+        # clipboard_ui-4: op_history awaits the store in a worker; a release (selecting
+        # another account) that lands meanwhile must keep A's history from coming back.
+        import asyncio
+        import threading
+        await self.ui.call("grant", id="e.0")
+        started, proceed = threading.Event(), threading.Event()
+        real = self.st.history
+
+        def slow(id):
+            started.set()
+            proceed.wait(5)
+            return real(id)
+        self.st.history = slow
+        pending = self.ui.send("history", id="e.0")
+        await asyncio.to_thread(started.wait, 5)
+        self.assertEqual((await self.ui.call("release"))["released"], True)
+        proceed.set()
+        r = await asyncio.wait_for(pending, 5)
+        self.assertEqual(r.get("error"), "no-grant")
+        self.assertNotIn("items", r)
+
+    async def test_single_use_history_is_still_answered(self):
+        await self.ui.call("settings", set={"grant_s": 0})
+        await self.ui.call("grant", id="e.0")
+        hist = await self.ui.call("history", id="e.0")
+        self.assertEqual(len(hist["items"]), 2)
+
     async def test_dismissed_grant_opens_nothing(self):
         self.h.authority.outcome = "dismissed"
         self.assertEqual((await self.ui.call("grant", id="e.0"))["error"], "dismissed")

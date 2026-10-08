@@ -61,6 +61,12 @@
 #define PEAR_TARGET_MIGRATE_MODULE  "icp.client.migrate"
 #define PEAR_TARGET_AUTOFILL_MODULE "icp.client.autofill"
 
+/* Wayland interfaces the window's Qt must never bind (QT_WAYLAND_DISABLED_INTERFACES). */
+#define QT_DISABLED_IFACES \
+    "zwp_primary_selection_device_manager_v1,gtk_primary_selection_device_manager," \
+    "zwp_text_input_manager_v1,zwp_text_input_manager_v2,zwp_text_input_manager_v3," \
+    "qt_text_input_method_manager_v1"
+
 #define COMPOSITOR_COMM         "Hyprland"
 
 #define EX_USAGE_   64      /* not exactly one known role */
@@ -507,6 +513,10 @@ int main(int argc, char **argv)
     env_put("QT_QPA_PLATFORMTHEME", "");
     env_put("QML_DISABLE_DISK_CACHE", "1");
     env_put("QT_LOGGING_RULES", "*=false");
+    /* No primary selection: a drag-select in a notes or setup-key field would otherwise put
+     * the text where any program can read it (wl-paste --primary), outside pear-clip's rules.
+     * No text-input protocol: an input method would be sent the fields' surrounding text. */
+    env_put("QT_WAYLAND_DISABLED_INTERFACES", QT_DISABLED_IFACES);
     env_put("XDG_CONFIG_HOME", PEAR_EMPTY_DIR);
     env_put("XDG_CACHE_HOME", PEAR_EMPTY_DIR);
     env_put("XDG_STATE_HOME", PEAR_EMPTY_DIR);

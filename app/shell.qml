@@ -147,13 +147,15 @@ ShellRoot {
     property string editorMode: ""               // sites | notes | totp | create
     property bool editorBusy: false
     property string editorError: ""
+    // An edit the account's approval ran out on: kept in this process only, never shown
+    // without a new approval, and given back when that editor is opened again for that account.
+    property var editDraft: null
     property var totpPreview: ({})
     property bool createMore: false
     property bool createGenerate: false
     property bool panelFocus: false
     property int detailIndex: 0
     readonly property int fieldCount: root.fieldRows().length
-    property bool firstRunShown: false
     // ---- sign-in sheet: draws only what the daemon's sign-in stream says
     property bool signinOpen: false
     property string signinMode: "login"          // login | relogin
@@ -313,7 +315,15 @@ ShellRoot {
             root.needsLogin = true;
             return;
         case "grant-expired":
-            if (m.id === root.grantId) root.endGrant();
+            if (m.id !== root.grantId) return;
+            if (root.grantSingleUse) {
+                // The one use was the request that just answered: keep what it returned until
+                // hide_after, focus loss or lock (the usual timers), and drop only the grant.
+                root.grantId = ""; root.grantExpires = 0; root.grantLeft = 0;
+                root.grantSingleUse = false;
+                return;
+            }
+            root.grantRanOut();
             return;
         case "clip":
             root.showFlash(root.clipWords(m.field) + (m.outcome === "pasted" ? " pasted — now cleared"
@@ -439,7 +449,10 @@ ShellRoot {
             const now = Date.now() / 1000;
             if (root.grantId !== "" && !root.grantSingleUse) {
                 root.grantLeft = Math.max(0, Math.ceil(root.grantExpires - now));
-                if (root.grantLeft === 0) root.endGrant();
+                if (root.grantLeft === 0) root.grantRanOut();
+                else if (root.grantLeft <= 20 && root.editorOpen && root.editorMode !== "create")
+                    root.editorError = "this account's approval ends in " + root.grantLeft
+                                     + " s — save now, or your edit waits for the next approval";
             }
             if (root.totpLeft > 0) {
                 root.totpLeft -= 1;
@@ -555,10 +568,8 @@ ShellRoot {
             root.needsLogin = !!d.needs_login;
             root.syncing = true;
             root.setEntries(d.entries || []);
-            if (!root.signedIn && !root.entries.length && !root.firstRunShown) {
-                root.firstRunShown = true;
-                root.startSignin("login");
-            }
+            // No sign-in started from here: "signin" raises its own .manage dialog, and a
+            // dialog may follow only a click. The empty list offers "Sign in to iCloud".
         });
     }
 
@@ -593,6 +604,7 @@ ShellRoot {
 
     // Back to the locked window, with nothing in it. Never re-prompts on its own.
     function lockApp(reason) {
+        root.editDraft = null;
         root.endGrant();
         root.appUnlocked = false;
         root.autoAuthTried = true;
@@ -669,6 +681,22 @@ ShellRoot {
         root.forgetSecrets();
     }
 
+    // The grant's time is up while you may be typing: keep the unsaved edit (in memory, out of
+    // sight) instead of throwing it away; opening that editor again after a new approval gives
+    // it back. Selecting another account or locking discards it.
+    function grantRanOut() {
+        let d = null;
+        if (root.editorOpen && root.editorMode !== "create" && root.selectedId !== "")
+            d = { id: root.selectedId, mode: root.editorMode, text: edArea.text, setup: edSetup.text };
+        if (root.changing && newPw.text) {
+            d = d || { id: root.selectedId };
+            d.pw = newPw.text;
+        }
+        root.endGrant();
+        root.editDraft = d;
+        if (d) root.showFlash("The account's approval ran out — your unsaved edit is kept; open it again to finish");
+    }
+
     function hideSecrets() {
         root.revealed = "";
         root.totpCode = ""; root.totpLeft = 0;
@@ -729,6 +757,7 @@ ShellRoot {
 
     function clearSelection() {
         if (root.grantId !== "" || root.granting) root.send("release", {}, null);
+        root.editDraft = null;
         root.selected = null; root.selectedId = "";
         root.endGrant();
         root.detailIndex = 0;
@@ -740,6 +769,7 @@ ShellRoot {
         if (!e || e.id === root.selectedId) return;
         if (root.grantId !== "" || root.granting) root.send("release", {}, null);
         root.granting = false;
+        root.editDraft = null;
         root.selected = e; root.selectedId = e.id;
         root.endGrant();
         root.detailIndex = 0;
@@ -775,10 +805,16 @@ ShellRoot {
     }
     function copyPassword() { root.copyField("password"); }
 
+    // A reply for an account you have since left, or whose approval has since ended, is
+    // dropped: a secret is shown only inside its own account's grant.
+    function stillOpen(id) { return id === root.selectedId && root.grantId === id; }
+
     function doReveal() {
         root.withGrant(function () {
             if (root.revealed) { root.revealed = ""; return; }
-            root.send("reveal", { id: root.selectedId, field: "password" }, function (d) {
+            const id = root.selectedId;
+            root.send("reveal", { id: id, field: "password" }, function (d) {
+                if (!root.stillOpen(id)) return;
                 if (d.error) { root.status = d.error; return; }
                 root.revealed = d.value || "";
                 root.hideAfter = d.hide_after || 20;
@@ -790,7 +826,9 @@ ShellRoot {
     function loadNotes(after) {
         root.withGrant(function () {
             if (root.notesLoaded || !root.selected.has_notes) { root.notesLoaded = true; if (after) after(); return; }
-            root.send("reveal", { id: root.selectedId, field: "notes" }, function (d) {
+            const id = root.selectedId;
+            root.send("reveal", { id: id, field: "notes" }, function (d) {
+                if (!root.stillOpen(id)) return;
                 if (d.error) { root.status = d.error; return; }
                 root.notesText = d.value || ""; root.notesLoaded = true;
                 root.hideAfter = d.hide_after || 20;
@@ -802,7 +840,9 @@ ShellRoot {
 
     function loadHistory() {
         root.withGrant(function () {
-            root.send("history", { id: root.selectedId }, function (d) {
+            const id = root.selectedId;
+            root.send("history", { id: id }, function (d) {
+                if (!root.stillOpen(id)) return;
                 if (d.error) { root.status = d.error; return; }
                 root.historyRows = d.items || [];
                 root.historyLoaded = true;
@@ -813,7 +853,9 @@ ShellRoot {
 
     function loadTotp() {
         root.withGrant(function () {
-            root.send("totp", { id: root.selectedId }, function (d) {
+            const id = root.selectedId;
+            root.send("totp", { id: id }, function (d) {
+                if (!root.stillOpen(id)) return;
                 if (d.error) { root.status = d.error; return; }
                 root.totpCode = d.code || "";
                 root.totpLeft = Math.max(1, Math.round((d.valid_until || 0) - Date.now() / 1000));
@@ -1141,6 +1183,12 @@ ShellRoot {
         edArea.text = mode === "sites" ? (root.selected ? (root.selected.sites || []).join("\n") : "")
                     : mode === "notes" ? root.notesText : "";
         edSetup.text = "";
+        const draft = root.editDraft;
+        if (draft && draft.id === root.selectedId && draft.mode === mode) {
+            edArea.text = draft.text || "";
+            edSetup.text = draft.setup || "";
+            root.editDraft = draft.pw ? { id: draft.id, pw: draft.pw } : null;
+        }
         if (mode === "create") {
             crName.text = ""; crSite.text = ""; crUser.text = ""; crPass.text = "";
             crNotes.text = ""; crSetup.text = "";
@@ -1440,7 +1488,16 @@ ShellRoot {
         else if (key === "password") root.copyPassword();
         else if (key === "view") root.doReveal();
         else if (key === "change")
-            root.withGrant(function () { root.changing = true; root.generateNew = false; newPw.forceActiveFocus(); });
+            root.withGrant(function () {
+                root.changing = true; root.generateNew = false;
+                const draft = root.editDraft;
+                if (draft && draft.id === root.selectedId && draft.pw) {
+                    newPw.text = draft.pw;
+                    root.editDraft = draft.mode ? { id: draft.id, mode: draft.mode, text: draft.text,
+                                                    setup: draft.setup } : null;
+                }
+                newPw.forceActiveFocus();
+            });
         else if (key === "website") root.openDomain(root.selected.domain);
         else if (key.indexOf("open:") === 0) root.openDomain(root.allSites()[parseInt(key.slice(5))]);
         else if (key === "totp") root.loadTotp();
@@ -2364,6 +2421,9 @@ ShellRoot {
                                     spacing: 8
                                     O.TextField {
                                         id: newPw
+                                        // No IME learning, no prediction (pear-exec also keeps input methods and the
+                                        // primary selection away from the window).
+                                        inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                                         Layout.fillWidth: true
                                         visible: !root.generateNew
                                         placeholderText: "New password"
@@ -2780,6 +2840,9 @@ ShellRoot {
                                 TextArea {
                                     textFormat: TextArea.PlainText
                                     id: edArea
+                                    // No IME learning, no prediction (pear-exec also keeps input methods and the
+                                    // primary selection away from the window).
+                                    inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                                     wrapMode: TextEdit.Wrap
                                     color: Theme.fg
                                     selectionColor: Theme.selected
@@ -2816,6 +2879,9 @@ ShellRoot {
                             spacing: 10
                             O.TextField {
                                 id: edSetup
+                                // No IME learning, no prediction (pear-exec also keeps input methods and the
+                                // primary selection away from the window).
+                                inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                                 Layout.fillWidth: true
                                 font.family: Theme.uiFont
                                 font.pixelSize: Theme.fBody
@@ -2965,6 +3031,9 @@ ShellRoot {
                         }
                         O.TextField {
                             id: crNotes
+                            // No IME learning, no prediction (pear-exec also keeps input methods and the
+                            // primary selection away from the window).
+                            inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                             Layout.row: 5; Layout.column: 1; Layout.fillWidth: true
                             visible: root.createMore
                             font.family: Theme.uiFont; font.pixelSize: Theme.fBody; verticalPadding: 9
@@ -2983,6 +3052,9 @@ ShellRoot {
                             spacing: 10
                             O.TextField {
                                 id: crSetup
+                                // No IME learning, no prediction (pear-exec also keeps input methods and the
+                                // primary selection away from the window).
+                                inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                                 Layout.fillWidth: true
                                 font.family: Theme.uiFont; font.pixelSize: Theme.fBody; verticalPadding: 9
                                 placeholderText: "Setup key or link (optional)"
