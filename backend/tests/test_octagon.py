@@ -60,16 +60,31 @@ class SyncSourcesTlksFromRpcTests(unittest.TestCase):
         client.fetch_recoverable_tlks = lambda: ({"TLK-PW": b"k" * 64}, ["VIEW-SYNCKEY"])
         client.sync_keychain = lambda: {"synckey": ["ZONE-SYNCKEY"], "item": []}
         captured = {}
-        orig = octagon.decrypt_to_vault
-        octagon.decrypt_to_vault = (
-            lambda recs, oct_state, tlks=None: captured.update(recs=recs, tlks=tlks) or 7)
+        orig = octagon.decrypt_to_sync_items
+        octagon.decrypt_to_sync_items = (
+            lambda recs, oct_state, tlks=None, nicknames=None:
+            captured.update(recs=recs, tlks=tlks, nicknames=nicknames) or ["item"])
         try:
-            n = client.sync_and_decrypt()
+            items = client.sync_and_decrypt(nicknames={"k1-x": "Mine"})
         finally:
-            octagon.decrypt_to_vault = orig
-        self.assertEqual(n, 7)
+            octagon.decrypt_to_sync_items = orig
+        self.assertEqual(items, ["item"])
         self.assertEqual(captured["tlks"], {"TLK-PW": b"k" * 64})           # TLKs from the RPC
         self.assertEqual(captured["recs"]["synckey"], ["ZONE-SYNCKEY", "VIEW-SYNCKEY"])  # merged
+        self.assertEqual(captured["nicknames"], {"k1-x": "Mine"})
+
+    def test_a_zone_that_fails_to_load_is_recorded_not_dropped_silently(self):
+        client = octagon.OctagonClient.__new__(octagon.OctagonClient)  # bypass __init__/network
+        client.user_id = "CKUSER"
+
+        class _Transport:
+            def fetch_records(self, request):
+                raise octagon.cloudkit.CloudKitError("zone gone")
+
+        client.transport = _Transport()
+        grouped = client.sync_keychain(zones=("Passwords", "WiFi"))
+        self.assertEqual(grouped, {})
+        self.assertEqual(client.failed_zones, ["Passwords", "WiFi"])
 
 
 class FetchRecoverableUnionTests(unittest.TestCase):
