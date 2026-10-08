@@ -152,8 +152,20 @@ class SourceTests(unittest.TestCase):
 
     def test_the_menu_has_no_cut(self):
         menu = secret_menu()
-        items = re.findall(r'MenuItem \{\s*text: "([^"]+)"', menu)
+        items = re.findall(r'Action \{\s*text: "([^"]+)"', menu)
         self.assertEqual(items, ["Copy", "Paste", "Select All"])
+        # The items are Actions drawn by one themed delegate; no stray MenuItem with its own
+        # text (which would skip the theme, or be a Cut).
+        self.assertNotRegex(menu, r'MenuItem \{\s*text:')
+
+    def test_the_menu_is_themed(self):
+        menu = secret_menu()
+        for want in ("font.family: Theme.uiFont", "font.pixelSize: Theme.fBody",
+                     "color: Theme.bg", "border.color: Theme.line", "radius: Theme.radius",
+                     "color: secretItem.enabled ? Theme.fg : Theme.dim",
+                     "Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.24)",
+                     "textFormat: Text.PlainText"):
+            self.assertIn(want, menu)
         self.assertNotRegex(menu, r"\.cut\(\)|\bCut\b")
         self.assertIn("root.copyText(secretMenu.source, secretMenu.target.selectedText)", menu)
 

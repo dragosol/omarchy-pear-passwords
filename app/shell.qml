@@ -3331,38 +3331,60 @@ ShellRoot {
         // Copy, Paste and Select All for the fields that hold a secret and may be copied (the
         // Apple ID password, the 2FA code and the 1.x passphrase have no menu at all). Copy is
         // root.copyText: the daemon and pear-clip, never Qt's clipboard. There is no Cut.
+        // Drawn like the category drop-down: Theme font and colours, padded rows, the accent
+        // under the row the pointer or keyboard is on, a hairline border.
         Menu {
             id: secretMenu
             parent: scope
             property Item target: null
             property string source: ""
             function aim(field, source_) { secretMenu.target = field; secretMenu.source = source_; }
-            palette.window: Theme.bg
-            palette.windowText: Theme.fg
-            palette.base: Theme.bg
-            palette.text: Theme.fg
-            palette.buttonText: Theme.fg
-            palette.highlight: Theme.selected
-            palette.highlightedText: Theme.fg
+            padding: 6
+            font.family: Theme.uiFont
+            font.pixelSize: Theme.fBody
             background: Rectangle {
-                implicitWidth: 180
+                implicitWidth: 200
                 color: Theme.bg
                 border.width: 1
                 border.color: Theme.line
                 radius: Theme.radius
             }
-            MenuItem {
+            delegate: MenuItem {
+                id: secretItem
+                implicitWidth: 188
+                implicitHeight: 34
+                leftPadding: 10
+                rightPadding: 10
+                font: secretMenu.font
+                indicator: null
+                arrow: null
+                contentItem: Text {
+                    textFormat: Text.PlainText
+                    text: secretItem.text
+                    font: secretItem.font
+                    color: secretItem.enabled ? Theme.fg : Theme.dim
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                }
+                background: Rectangle {
+                    radius: Theme.radius
+                    color: secretItem.highlighted && secretItem.enabled
+                        ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.24)
+                        : "transparent"
+                }
+            }
+            Action {
                 text: "Copy"
                 enabled: !!secretMenu.target && secretMenu.source !== ""
                          && secretMenu.target.selectedText !== ""
                 onTriggered: root.copyText(secretMenu.source, secretMenu.target.selectedText)
             }
-            MenuItem {
+            Action {
                 text: "Paste"
                 enabled: !!secretMenu.target && secretMenu.target.canPaste
                 onTriggered: secretMenu.target.paste()
             }
-            MenuItem {
+            Action {
                 text: "Select All"
                 enabled: !!secretMenu.target && secretMenu.target.length > 0
                 onTriggered: secretMenu.target.selectAll()
