@@ -16,10 +16,13 @@ The rules, in the order a request meets them:
      Flatpak app in its own pid namespace);
    - the compositor itself (the peer of our Wayland socket, the process pear-exec verified)
      when it holds the pipe's READ end, by inode and by an O_RDONLY/O_RDWR access mode in
-     /proc/<pid>/fdinfo/<fd>. That is the XWayland clipboard bridge: Hyprland's XWM, like
-     wlroots' xwm in sway, runs in the compositor and reads the value for an X11 app. Which
-     X11 app asked cannot be seen from here; the bridge counts as one reader. The compositor
-     holding only the WRITE end (it passes an ordinary Wayland paste on to us) is not a reader.
+     /proc/<pid>/fdinfo/<fd>. That is the XWayland clipboard bridge: Hyprland's XWM runs in
+     the compositor and reads the value for an X11 app. Which X11 app asked cannot be seen
+     from here; the bridge counts as one reader. It only works where the compositor's /proc
+     entries can be read: Hyprland as Omarchy runs it can; a compositor with file
+     capabilities (Arch's sway has cap_sys_nice) cannot, and X11 pastes are then refused.
+     The compositor holding only the WRITE end (it passes an ordinary Wayland paste on to us)
+     is not a reader.
    If no reader is identified, the request is refused: the pipe is closed unwritten, it does
    not count, and the offer stays up. That covers a pipe nobody holds any more (a history
    watcher's child that exited without reading, faster than the scan), a compositor whose fds
@@ -34,9 +37,10 @@ The rules, in the order a request meets them:
 3. Any other identified reader (a same-uid process, or the compositor's X11 bridge) gets the
    value and is the one paste - but only once the value was actually delivered: a write that
    hit EPIPE, or took no byte, is not a paste and the offer stays up for the real one. For
-   CLIP_REREQUEST_GRACE_S afterwards the same set of holder processes may ask again (the
-   XWayland bridge and some toolkits read twice); nobody else gets anything. Then the source
-   is destroyed.
+   CLIP_REREQUEST_GRACE_S afterwards the same set of holder processes may ask again (some
+   toolkits read twice); nobody else gets anything. The X11 bridge never gets that second
+   read: it is the same holder for every X11 app, so a re-read could hand the value to a
+   different X11 client than the one the user pasted into. Then the source is destroyed.
 4. With no paste by `timeout` seconds the source is destroyed. Destroying a source clears the
    clipboard only if it is still the selection: a copy you made since is never touched, and
    set_selection(null) is never sent.
@@ -240,6 +244,7 @@ class Offer:
     now: Callable[[], float] = time.monotonic
     grace: float = protocol.CLIP_REREQUEST_GRACE_S
     watcher_window: float = 0.0             # > 0 only under the G5 timing fallback
+    bridge: int | None = None               # the compositor's pid: its XWayland bridge reads once
     started: float = 0.0
     pasted_at: float | None = None
     paste_holders: frozenset | None = None
@@ -283,8 +288,10 @@ class Offer:
                         self.log.append((mime, "unidentified"))
                     return
             if self.pasted_at is not None:
-                # Only the paste that already happened may ask again, and only briefly.
+                # Only the paste that already happened may ask again, and only briefly - never
+                # the X11 bridge, which stands for whichever X11 app asks.
                 if (readers.pids == self.paste_holders
+                        and not (self.bridge and self.bridge in readers.pids)
                         and self.now() - self.pasted_at <= self.grace):
                     if _write_all(fd, self.value) > 0:
                         self.served += 1
@@ -524,7 +531,8 @@ def run(stdin, socket_path: str, wayland_path: str, identify=None, out=None) -> 
             if identify is None:
                 identify = factory({os.getpid(), conn.peer_pid or -1},
                                    compositor=conn.peer_pid)
-            offer = Offer(value, sensitive, float(timeout), identify, watcher_window=window)
+            offer = Offer(value, sensitive, float(timeout), identify, watcher_window=window,
+                          bridge=conn.peer_pid)
             outcome = serve(dc, offer, daemon, on_offered=lambda: report(out, "offered"))
             reason = (NOT_OFFERED.get(outcome) or offer.error
                       or "the compositor didn't take the clipboard")

@@ -813,6 +813,23 @@ class XWaylandBridgeTests(unittest.TestCase):
         self.assertEqual(child.communicate(timeout=10)[0], b"")
         self.assertEqual(offer.served, 1)
 
+    def test_the_bridge_is_never_served_a_second_time(self):
+        # x-vm (a): within the grace a second X11 paste got the value again, because the bridge
+        # is the same holder for every X11 app. It must get nothing, and nobody else either.
+        comp = os.getpid()
+        offer = clip.Offer(bytearray(b"dummy-value"), True, 30.0,
+                           clip.make_identifier({comp}, compositor=comp), bridge=comp)
+        offer.start()
+        r, w = os.pipe()
+        offer.on_send("text/plain;charset=utf-8", w)
+        self.assertEqual(offer.log[-1][1], "pasted")
+        self.assertEqual(read_all(r), b"dummy-value")
+        r2, w2 = os.pipe()                    # a second X11 app asks 0.1 s later
+        offer.on_send("text/plain;charset=utf-8", w2)
+        self.assertEqual(offer.log[-1][1], "refused")
+        self.assertEqual(read_all(r2), b"")
+        self.assertEqual(offer.served, 1)
+
     def test_compositor_holding_only_the_write_end_is_not_served(self):
         # An ordinary Wayland paste passes through the compositor as the WRITE end only.
         r, w = os.pipe()

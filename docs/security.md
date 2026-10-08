@@ -82,10 +82,13 @@ a locked computer does not sync.
   whose `/proc/<pid>/fd` it can read. Served: any such same-uid reader, and the compositor's
   X11 bridge, i.e. the compositor itself (the peer pear-exec verified) when it holds the
   pipe's read end, matched by inode and by an `O_RDONLY`/`O_RDWR` access mode in
-  `/proc/<pid>/fdinfo`. Hyprland's XWM (and wlroots' xwm in sway) reads the value there for an
-  X11 app; which X11 app asked is not visible, so the bridge is one reader. The compositor
-  holding only the write end is not a reader, and a compositor whose fds cannot be read is
-  refused. Omarchy's history watcher gets nothing; the first served reader is the one counted
+  `/proc/<pid>/fdinfo`. Hyprland's XWM reads the value there for an X11 app; which X11 app
+  asked is not visible, so the bridge is one reader, and it is served exactly once: no
+  re-read inside the grace window, because a second read could be a different X11 client.
+  The compositor holding only the write end is not a reader, and a compositor whose fds
+  cannot be read is refused - that includes any compositor with file capabilities (Arch's
+  sway has `cap_sys_nice`, so its `/proc` fd entries are closed to us and X11 pastes are
+  refused there; checked in the gate VM). Hyprland as Omarchy runs it has none. Omarchy's history watcher gets nothing; the first served reader is the one counted
   paste (as soon as one byte of the value reaches its pipe, so a reader that stalls part-way
   has used it up; a write that takes no byte is not a paste), and the offer is withdrawn
   after that paste or 30 s. Refused, without counting: watchers, a reader nobody can
