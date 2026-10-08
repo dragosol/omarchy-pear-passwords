@@ -218,10 +218,13 @@ administrator and runs a no-op command as root to prove it.
   polkit (`org.icp.unlock`, `ALWAYS_CHECK`): a fingerprint, or your account password in the same
   dialog on a machine with no reader, which is the prompt every other privileged action on the
   desktop uses. A successful check opens a grace window, so opening the app scans once rather
-  than once per password you read. Where that polkit action isn't installed the key keeps the
-  older behaviour instead and is wiped after `ICP_LOCK_TIMEOUT` seconds idle, so a machine
-  without the policy is never locked out of its own vault; `ICP_KEY_GATE=timeout` forces that.
-  The passphrase itself is asked for once per login session, when the agent has no key yet.
+  than once per password you read. That check is a convenience and not a boundary, and the code
+  says so: anything running as you can read the key out of the agent's memory through `/proc`
+  without touching the socket, so no socket-level check can stop it. What does bite is how long
+  the key is resident, so the key is wiped after `ICP_LOCK_TIMEOUT` seconds idle (900 by
+  default) whether the gate is in use or not, and there is deliberately no way for a caller to
+  claim it has already authenticated. After that idle period the passphrase is asked for again,
+  because nothing else can derive the key. `ICP_KEY_GATE=timeout` turns the polkit path off.
   **The background sync never asks for anything**: it runs with `--no-prompt`, reads the key only
   if the agent already has it available, and otherwise skips and syncs the next time you unlock
   the app. A timer has no business putting a password box on your screen.

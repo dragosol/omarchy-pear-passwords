@@ -134,11 +134,10 @@ def cmd_app_auth(args) -> int:
         json.dump({"ok": True, "authed": False, "via": via, "reason": status}, sys.stdout)
         return 0
 
-    # The person just passed the gate in this process. Tell the agent, so reading the vault does
-    # not ask them for the same thing twice, and take the opportunity to sync while the key is
-    # legitimately available - the timer cannot, because it is not allowed to prompt.
-    from ..auth import agent
-    agent.mark_authorized()
+    # Sync while someone is here and the key can legitimately be released; the timer cannot,
+    # because it is not allowed to prompt. No attempt is made to tell the agent this process
+    # already authenticated: a command for that is a command any process running as you can
+    # send, which is how 1.3.1 ended up with a gate that could be skipped by asking.
     _sync_in_background()
 
     json.dump({"ok": True, "authed": True, "via": via, **_session_state(_write_session())},

@@ -5,14 +5,18 @@ reach it. That is also the honest limit of this design: while unlocked, anything
 can ask for the key, exactly as anything running as you can scrape an unlocked Bitwarden. Only
 used once a passphrase is set.
 
-Releasing the key goes through polkit (`org.icp.unlock`, ALWAYS_CHECK), so day to day it is a
-fingerprint, or the account password in the same dialog where there is no reader - the prompt
-every other privileged action on the desktop uses. A successful check opens a grace window of
-ICP_LOCK_TIMEOUT seconds, so opening the app scans once rather than once per read.
+Releasing the key goes through polkit (`org.icp.unlock`, ALWAYS_CHECK), so while the key is
+held it is a fingerprint rather than the passphrase - or the account password in the same
+dialog where there is no reader, the prompt every other privileged action on the desktop uses.
+A successful check opens a grace window of ICP_LOCK_TIMEOUT seconds, so opening the app scans
+once rather than once per read.
 
-That check is defence in depth, not a boundary: the socket is reachable only by this user, and
-this user is exactly who polkit would approve. It raises the cost of a background process
-quietly draining the key; it does not stop code running as you that is willing to ask.
+Be clear about what that check is worth: it is a convenience, not a boundary. Code running as
+this user can read the key out of this process's memory through /proc and never touch the
+socket, so no socket-level check can stop it. The one control that does bite is how long the
+key is resident, which is why the idle wipe below is unconditional and why there is no command
+that lets a caller assert it has already authenticated - 1.3.1 had one, and it let any process
+running as you open the grace window by asking.
 
 Two commands exist because the caller's situation differs:
   GET   someone is at the keyboard - may scan a finger, may open a dialog
@@ -137,7 +141,7 @@ def _serve() -> int:
         try:
             conn, _ = srv.accept()
         except socket.timeout:
-            if key is not None and not _gate_usable() and time.monotonic() >= expires:
+            if key is not None and time.monotonic() >= expires:
                 wipe()
             continue
         with conn:
@@ -149,7 +153,11 @@ def _serve() -> int:
             cmd, _, arg = line.partition(" ")
 
             gated = _gate_usable()
-            if key is not None and not gated and time.monotonic() >= expires:
+            # Unconditional. 1.3.1 skipped this while gated, which left the key resident for a
+            # whole login session - and against code running as this user a socket gate buys
+            # nothing anyway, because it can read the agent's memory through /proc. Residency
+            # time is the only control that actually bites, so it is never traded away.
+            if key is not None and time.monotonic() >= expires:
                 wipe()
 
             if cmd in ("GET", "PEEK"):
@@ -177,15 +185,6 @@ def _serve() -> int:
                         conn.sendall(b"OK " + bytes(key).hex().encode() + b"\n")
                     else:
                         conn.sendall(b"DENIED\n")
-            elif cmd == "AUTHORIZED":
-                # The window just passed the same polkit check in its own process (cmd_app_auth).
-                # Trust it rather than prompting twice for one deliberate unlock; the socket is
-                # reachable only by this user, which is who polkit would have approved anyway.
-                if key is None:
-                    conn.sendall(b"LOCKED\n")
-                else:
-                    authorized_until = time.monotonic() + _timeout()
-                    conn.sendall(b"OK\n")
             elif cmd == "UNLOCK":
                 try:
                     key = bytearray(lockbox.unlock(arg))
@@ -285,14 +284,6 @@ def peek_key() -> bytes | None:
     if resp.startswith("OK "):
         return bytes.fromhex(resp[3:])
     return None
-
-
-def mark_authorized() -> None:
-    """Record that the caller has just passed the polkit check itself. Best effort."""
-    try:
-        _request("AUTHORIZED", autostart=False)
-    except (AgentError, OSError):
-        pass
 
 
 def unlock(passphrase: str) -> None:

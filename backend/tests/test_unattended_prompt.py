@@ -96,14 +96,37 @@ class SyncUnitTest(unittest.TestCase):
 
 
 class UnlockTriggersSyncTest(unittest.TestCase):
-    def test_a_successful_unlock_authorizes_the_agent_and_syncs(self):
+    def test_a_successful_unlock_syncs(self):
         """Because the timer now skips while locked, the unlock has to be what syncs."""
         from icp.cli import appapi
         src = __import__("inspect").getsource(appapi.cmd_app_auth)
-        self.assertIn("agent.mark_authorized()", src,
-                      "the window passes polkit but the agent still asks again")
         self.assertIn("_sync_in_background()", src,
                       "nothing syncs on unlock, so a locked timer means no syncing at all")
+
+
+class NoSelfAssertedAuthTest(unittest.TestCase):
+    """1.3.1 shipped an AUTHORIZED command that opened the grace window with no check, so any
+    process running as this user could take the key by asking for it. It must not come back."""
+
+    def test_the_agent_has_no_command_that_asserts_prior_authentication(self):
+        import inspect
+        from icp.auth import agent
+        src = inspect.getsource(agent)
+        self.assertNotIn("AUTHORIZED", src,
+                         "a caller can once again claim it already authenticated")
+        self.assertFalse(hasattr(agent, "mark_authorized"),
+                         "the client helper for that bypass is back")
+
+    def test_the_idle_wipe_is_unconditional(self):
+        """The gate is a convenience; residency time is the only control that bites, because
+        same-uid code can read this process's memory through /proc regardless of any socket."""
+        import inspect
+        from icp.auth import agent
+        src = inspect.getsource(agent._serve)
+        self.assertNotIn("not gated and time.monotonic() >= expires", src,
+                         "the idle wipe is skipped while gated, so the key is session-resident")
+        self.assertIn("if key is not None and time.monotonic() >= expires:", src,
+                      "the unconditional idle wipe is gone")
 
 
 if __name__ == "__main__":
