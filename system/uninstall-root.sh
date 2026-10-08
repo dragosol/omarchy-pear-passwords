@@ -12,7 +12,8 @@
 # - Only files whose contents still match the receipt are removed. Anything changed since is
 #   listed and kept, and stays in the receipt, so a later install refuses to overwrite it.
 # - The pear-passwords user and the pear-client group are removed only when no file outside
-#   the receipt is still owned by them. Your vault in /var/lib/pear-passwords is owned by
+#   the receipt is still owned by them. Until then this command stays installed, so it can be
+#   run again. Your vault in /var/lib/pear-passwords is owned by
 #   pear-passwords, so without --purge both stay, and reinstalling picks your vault up again.
 # - --purge <uid> first deletes /var/lib/pear-passwords/u<uid> (and the copies a "Start over"
 #   set aside) after you type the word it asks for. That is your vault on this computer. It
@@ -70,6 +71,15 @@ if pp_ours "$UNIT_DIR/$SOCKET_UNIT" && pp_ours "$UNIT_DIR/$SERVICE_UNIT"; then
   if pp_ours "$UNIT_DIR/$SEAL_SOCKET_UNIT"; then
     pp_sys systemctl disable --now "$SEAL_SOCKET_UNIT" || true
   fi
+  # The sockets set RemoveOnStop=yes; an older unit did not, and its socket file (owned by
+  # pear-passwords:pear-client) would keep the identities from being removed. Only socket
+  # files under our own runtime directories, never through a symlink.
+  for sp in "$SOCKET_PATH" "$SEAL_SOCKET_PATH"; do
+    rd=$(pp_d "${sp%/*}")
+    [ -d "$rd" ] && [ ! -L "$rd" ] || continue
+    [ -S "$(pp_d "$sp")" ] && rm -f -- "$(pp_d "$sp")"
+    rmdir -- "$rd" 2>/dev/null || true
+  done
 elif pp_exists "$UNIT_DIR/$SOCKET_UNIT" || pp_exists "$UNIT_DIR/$SERVICE_UNIT"; then
   pp_warn "the Pear units were changed since they were installed; left enabled and in place"
 fi
@@ -88,20 +98,44 @@ if [ -n "$purge_uid" ]; then
 fi
 
 : > "$work/kept"
-# While a vault is still in /var/lib/pear-passwords this command stays installed (and in the
-# receipt), so `--purge <uid>` keeps working after an uninstall that kept the vault.
+# This command itself goes last, and only once the user and the groups are gone too: while
+# anything keeps them (a vault in /var/lib/pear-passwords, or another file they own), it stays
+# installed and in the receipt, so `--purge <uid>` or a second run can finish the job.
 sd=$(pp_d "$STATE_DIR")
 vault_left=0
 if [ -d "$sd" ] && [ -n "$(ls -A "$sd" 2>/dev/null)" ]; then
   vault_left=1
-  awk -F "$PP_TAB" -v u="$UNINSTALL_ROOT" '$3 != u' "$PP_OLD" > "$work/remove"
-  awk -F "$PP_TAB" -v u="$UNINSTALL_ROOT" '$3 == u' "$PP_OLD" > "$work/keep.self"
+fi
+awk -F "$PP_TAB" -v u="$UNINSTALL_ROOT" '$3 != u' "$PP_OLD" > "$work/remove"
+awk -F "$PP_TAB" -v u="$UNINSTALL_ROOT" '$3 == u' "$PP_OLD" > "$work/keep.self"
+pp_remove_entries "$work/remove" "$work/kept" "$VENV"
+
+# The user and the groups, only if nothing of theirs is left anywhere.
+leftover=
+if [ "$vault_left" -eq 1 ]; then
+  leftover="$STATE_DIR still holds a vault"
+elif [ "$PP_TEST" -eq 1 ] && [ -n "${PP_TEST_LEFTOVER:-}" ]; then
+  leftover="$PP_TEST_LEFTOVER is still owned by it"     # test mode: nothing is chowned there
+elif [ "$PP_TEST" -eq 0 ] && [ -n "$(pp_getent passwd "$SERVICE_USER")" ]; then
+  echo "Checking for files still owned by $SERVICE_USER or $CLIENT_GROUP..."
+  for root in /etc /usr /var /opt /srv /run /home /root; do
+    [ -d "$root" ] || continue
+    f=$(find "$root" -xdev \( -user "$SERVICE_USER" -o -group "$SERVICE_GROUP" \
+          -o -group "$CLIENT_GROUP" \) ! -path "$STATE_DIR" -print -quit 2>/dev/null || true)
+    if [ -n "$f" ]; then leftover="$f is still owned by it"; break; fi
+  done
+fi
+
+if [ -n "$leftover" ]; then
+  cat "$work/keep.self" >> "$work/kept"
 else
-  cp "$PP_OLD" "$work/remove"
+  : > "$work/kept.self"
+  # With the directories again: the first pass left the ones this command was still in.
+  { cat "$work/keep.self"; awk -F "$PP_TAB" '$1 == "d"' "$PP_OLD"; } > "$work/remove.self"
+  pp_remove_entries "$work/remove.self" "$work/kept.self"
+  cat "$work/kept.self" >> "$work/kept"
   : > "$work/keep.self"
 fi
-pp_remove_entries "$work/remove" "$work/kept" "$VENV"
-cat "$work/keep.self" >> "$work/kept"
 
 if [ -s "$work/kept" ]; then
   # What is left stays recorded, so a reinstall sees it as edited rather than as foreign.
@@ -123,24 +157,13 @@ else
 fi
 pp_sys systemctl daemon-reload || true
 
-# The user and the groups, only if nothing of theirs is left anywhere.
-leftover=
-if [ "$vault_left" -eq 1 ]; then
-  leftover="$STATE_DIR still holds a vault"
-elif [ "$PP_TEST" -eq 0 ] && [ -n "$(pp_getent passwd "$SERVICE_USER")" ]; then
-  echo "Checking for files still owned by $SERVICE_USER or $CLIENT_GROUP..."
-  for root in /etc /usr /var /opt /srv /run /home /root; do
-    [ -d "$root" ] || continue
-    f=$(find "$root" -xdev \( -user "$SERVICE_USER" -o -group "$SERVICE_GROUP" \
-          -o -group "$CLIENT_GROUP" \) ! -path "$STATE_DIR" -print -quit 2>/dev/null || true)
-    if [ -n "$f" ]; then leftover="$f is still owned by it"; break; fi
-  done
-fi
 if [ -n "$leftover" ]; then
   echo "Kept the $SERVICE_USER user and the $CLIENT_GROUP group: $leftover."
   if [ "$vault_left" -eq 1 ]; then
     echo "Reinstalling picks the vault up again. To delete it, and then everything else:"
     echo "  sudo $UNINSTALL_ROOT --purge <uid>     (your uid: id -u)"
+  else
+    echo "Remove or re-own that file, then run this again: sudo $UNINSTALL_ROOT"
   fi
 else
   [ -d "$sd" ] && rmdir -- "$sd" 2>/dev/null || true

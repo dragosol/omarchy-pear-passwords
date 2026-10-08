@@ -88,6 +88,8 @@ class ServiceTests(unittest.TestCase):
             "SystemCallArchitectures": "native", "SystemCallErrorNumber": "EPERM",
             "LimitCORE": "0", "LimitMEMLOCK": "16M", "Restart": "on-failure",
             "WatchdogSec": "60", "ProtectProc": "default",
+            # gate bug 5: an ABI mismatch (78) is not restarted into the start limit
+            "RestartPreventExitStatus": "78",
         }
         for key, value in required.items():
             self.assertEqual(self.one(key), value, key)
@@ -131,11 +133,17 @@ class SocketTests(unittest.TestCase):
         env = env_file()
         want = {"ListenStream": env["SOCKET_PATH"], "SocketUser": env["SERVICE_USER"],
                 "SocketGroup": env["CLIENT_GROUP"], "SocketMode": "0660",
-                "DirectoryMode": "0755", "Accept": "no"}
+                "DirectoryMode": "0755", "Accept": "no",
+                # gate bug 3: a stopped socket leaves no pear-passwords-owned file in /run
+                "RemoveOnStop": "yes"}
         for key, value in want.items():
             self.assertEqual(values(rows, "Socket", key), [value], key)
         self.assertEqual(os.path.dirname(env["SOCKET_PATH"]), env["RUNTIME_DIR"])
         self.assertEqual(values(rows, "Install", "WantedBy"), ["sockets.target"])
+
+    def test_seal_socket_removes_its_file_on_stop(self):
+        rows = unit(os.path.join(SYSTEM, "units", "pear-passwords-seal.socket"))
+        self.assertEqual(values(rows, "Socket", "RemoveOnStop"), ["yes"])
 
 
 class SystemFileTests(unittest.TestCase):

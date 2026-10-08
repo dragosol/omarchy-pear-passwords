@@ -145,8 +145,14 @@ class Harness:
         return subprocess.run(["sh", script, *args], env=env, input=stdin, text=True,
                               capture_output=True, timeout=60)
 
-    def install(self):
-        return self.run(os.path.join(self.stage, "system", "install-root.sh"), self.stage)
+    def install(self, stop_at=None):
+        script = os.path.join(self.stage, "system", "install-root.sh")
+        if stop_at is None:
+            return self.run(script, self.stage)
+        env = {"PP_TEST_ROOT": self.root, "PATH": "/usr/bin:/bin", "HOME": self.tmp,
+               "PP_TEST_STOP_AT": stop_at}
+        return subprocess.run(["sh", script, self.stage], env=env, text=True,
+                              capture_output=True, timeout=60)
 
     def uninstall(self, *args, stdin=""):
         # The installed copy, as a user would run it.
@@ -330,6 +336,41 @@ class InstallRootTests(unittest.TestCase):
         os.symlink(target, self.h.r(P["AUTOFILL_REGISTER_BIN"]))
         self.refused(self.h.install(), "is a symlink")
         self.assertNothingWritten()
+
+    def test_a_first_install_interrupted_after_the_venv_build_can_be_rerun(self):
+        # installer-interrupted-install-bricks-reruns: $P and $VENV.new exist, no final receipt.
+        proc = self.h.install(stop_at="venv")
+        self.assertEqual(proc.returncode, 99, proc.stdout + proc.stderr)
+        self.assertTrue(os.path.isdir(self.h.r(P["VENV"] + ".new")))
+        self.ok(self.h.install())
+        self.assertFalse(os.path.exists(self.h.r(P["VENV"] + ".new")))
+        self.assertTrue(os.path.exists(self.h.r(P["VENV"] + "/bin/icp")))
+        proc = self.h.uninstall()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(os.path.exists(self.h.r(PREFIX)))
+
+    def test_an_upgrade_interrupted_after_the_venv_swap_can_be_rerun(self):
+        self.ok(self.h.install())
+        self.h.write("backend/icp/__init__.py", "# 2.0.1\n")     # a new venv tree
+        self.h.write("manifest.json", '{\n  "version": "2.0.1"\n}\n')
+        self.h.sums()
+        proc = self.h.install(stop_at="swap")
+        self.assertEqual(proc.returncode, 99, proc.stdout + proc.stderr)
+        self.ok(self.h.install())
+        names = {e[2] for e in self.h.receipt()}
+        self.assertIn(P["VENV"] + "/lib/site-packages/icp/__init__.py", names)
+        proc = self.h.uninstall()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(os.path.exists(self.h.r(PREFIX)), proc.stdout)
+
+    def test_a_venv_new_is_never_deleted_before_the_prefix_is_proven_ours(self):
+        planted = self.h.r(P["VENV"] + ".new/keep-me")
+        os.makedirs(os.path.dirname(planted))
+        with open(planted, "w") as f:
+            f.write("x")
+        self.refused(self.h.install(), "there is no install receipt")
+        self.assertTrue(os.path.exists(planted), "deleted before any ownership check")
+        self.assertFalse(os.path.exists(self.h.r(P["INSTALL_RECEIPT"])))
 
     def test_prefix_without_a_receipt_is_refused(self):
         os.makedirs(self.h.r(PREFIX))
@@ -646,6 +687,51 @@ class UninstallRootTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(os.path.exists(self.h.r(PREFIX)))
         self.assertIn("userdel pear-passwords", self.h.commands())
+
+    def test_a_leftover_owned_file_keeps_the_uninstaller_and_the_receipt(self):
+        # Gate bug 3: the identities were kept, and the only tool that removes them went too.
+        env_run = self.h.run
+
+        def run(script, *args, stdin=""):
+            env = {"PP_TEST_ROOT": self.h.root, "PATH": "/usr/bin:/bin", "HOME": self.h.tmp,
+                   "PP_TEST_LEFTOVER": "/srv/thing"}
+            return subprocess.run(["sh", script, *args], env=env, input=stdin, text=True,
+                                  capture_output=True, timeout=60)
+        self.h.run = run
+        try:
+            proc = self.h.uninstall()
+        finally:
+            self.h.run = env_run
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(os.path.exists(self.h.r(P["UNINSTALL_ROOT"])))
+        self.assertEqual([e[2] for e in self.h.receipt() if e[0] != "d"], [P["UNINSTALL_ROOT"]])
+        self.assertNotIn("userdel", self.h.commands())
+        self.assertIn("run this again", proc.stdout)
+        # Once the file is gone, the kept uninstaller finishes the job.
+        proc = self.h.uninstall()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(os.path.exists(self.h.r(PREFIX)))
+        self.assertFalse(os.path.exists(self.h.r(P["INSTALL_RECEIPT"])))
+        self.assertIn("userdel pear-passwords", self.h.commands())
+
+    def test_leftover_runtime_sockets_are_removed(self):
+        import socket as _socket
+        socks = []
+        for key in ("SOCKET_PATH", "SEAL_SOCKET_PATH"):
+            path = self.h.r(P[key])
+            os.makedirs(os.path.dirname(path))
+            s = _socket.socket(_socket.AF_UNIX)
+            s.bind(path)
+            socks.append(s)
+        try:
+            proc = self.h.uninstall()
+        finally:
+            for s in socks:
+                s.close()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for key in ("SOCKET_PATH", "SEAL_SOCKET_PATH"):
+            self.assertFalse(os.path.exists(self.h.r(P[key])), key)
+            self.assertFalse(os.path.exists(os.path.dirname(self.h.r(P[key]))), key)
 
     def test_purge_takes_only_a_numeric_uid(self):
         for bad in ("../x", "1000/..", "", "u1000"):

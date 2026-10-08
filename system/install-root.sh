@@ -23,6 +23,8 @@
 #   7. removes files an older 2.x installed that this one no longer ships (only if unchanged)
 #      and the 1.x polkit action (only if it is byte-for-byte a released copy);
 #   8. writes the receipt, reloads systemd and enables the socket.
+# A receipt naming everything a step may write is on disk before that step runs, so a run
+# interrupted anywhere can be re-run (or uninstalled) and proves ownership from it.
 #
 # Re-running the same command with a newer stage upgrades in place. It never touches
 # /var/lib/pear-passwords (your vault) and never fetches anything from the network. Not used
@@ -88,7 +90,6 @@ printf 'version=%s\nsums=%s\n' "$version" "$(pp_sha256 "$stage/SHA256SUMS")" > "
 
 # --- check everything before any write ------------------------------------------------------
 pp_load_receipt "$work/receipt.old"
-rm -rf "$(pp_d "$VENV.new")"   # a failed earlier run's half-built venv; root-only, ours
 pp_check_all "$work/table" > "$work/problems"
 if [ -s "$work/problems" ]; then
   echo "Not installing: these paths are in the way." >&2
@@ -96,6 +97,15 @@ if [ -s "$work/problems" ]; then
   echo "Nothing was changed. Move them aside if they are not needed, then run the command again." >&2
   exit 1
 fi
+
+# Before the first write: a receipt naming everything this run may write. An interrupted run
+# (Ctrl-C, a failed pip, a closed terminal) leaves it behind, and the next run accepts $P.
+pp_planned_receipt "$work/table" > "$work/receipt.planned"
+pp_write_receipt "$work/receipt.planned"
+# A failed earlier run's half-built venv, or the old one a swap without exch(1) set aside.
+# Removed only now: $P is proven ours (the checks above passed with a receipt), and these
+# are names only this script uses.
+rm -rf -- "$(pp_d "$VENV.new")" "$(pp_d "$VENV.old")"
 
 # --- identities ------------------------------------------------------------------------------
 pp_say "Creating the pear-passwords user and the pear-client group"
@@ -147,10 +157,20 @@ if [ "$PP_TEST" -eq 0 ]; then
   chown -R root:root "$new"
 fi
 chmod -R go-w "$new"
+pp_test_stop venv
 
 # --- install ---------------------------------------------------------------------------------
 pp_say "Installing into $PREFIX"
 pp_install_table "$work/table"
+
+# Before the swap, the receipt names both venv trees as ours, so an interruption between the
+# swap and the final receipt leaves nothing under $P the next run cannot account for.
+{
+  cat "$work/receipt.planned"
+  pp_manifest "$VENV.new" | awk -F "$PP_TAB" -v OFS="$PP_TAB" -v n="$VENV.new/" -v v="$VENV/" \
+    'index($3, n) == 1 { $3 = v substr($3, length(n) + 1) } { print }'
+} | LC_ALL=C sort -u > "$work/receipt.swap"
+pp_write_receipt "$work/receipt.swap"
 
 # Swap the venv in. exch(1) (util-linux 2.40+) swaps the two names in one rename; without it
 # the old venv is moved aside first, which leaves a moment with no venv (the socket queues).
@@ -166,6 +186,7 @@ elif [ -d "$old" ]; then
 else
   mv -T -- "$new" "$old"
 fi
+pp_test_stop swap
 
 # Files an earlier 2.x installed that this version no longer ships. The checks above already
 # refused if any of them was edited.

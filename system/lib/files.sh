@@ -64,6 +64,15 @@ pp_init_mode() {
   fi
 }
 
+# pp_test_stop NAME: in test mode only, stop here when PP_TEST_STOP_AT=NAME, as a kill or a
+# power cut would. A real run (root) never reads the variable.
+pp_test_stop() {
+  if [ "$PP_TEST" -eq 1 ] && [ "${PP_TEST_STOP_AT:-}" = "$1" ]; then
+    printf 'test: stopped at %s\n' "$1" >&2
+    exit 99
+  fi
+}
+
 # The real location of a system path.
 pp_d() { printf '%s%s' "$PP_D" "$1"; }
 
@@ -365,10 +374,12 @@ pp_check_all() {
   if [ -d "$(pp_d "$PREFIX")" ] && [ ! -L "$(pp_d "$PREFIX")" ]; then
     cut -f2 "$t" > "$t.dests"
     pp_manifest "$PREFIX" > "$t.cur"
-    awk -F "$PP_TAB" -v pre="$PREFIX" -v vnew="$VENV.new/" '
-      FILENAME == ARGV[1] { dest[$0] = 1; next }
+    # <dest>.pp-new is the half-written copy an interrupted run left beside a table
+    # destination; pp_install_row writes it again before renaming it into place.
+    awk -F "$PP_TAB" -v pre="$PREFIX" -v vnew="$VENV.new/" -v vold="$VENV.old/" '
+      FILENAME == ARGV[1] { dest[$0] = 1; dest[$0 ".pp-new"] = 1; next }
       FILENAME == ARGV[2] { old[$0] = 1; next }
-      index($3, vnew) == 1 || ($3 in dest) { next }
+      index($3, vnew) == 1 || index($3, vold) == 1 || ($3 in dest) { next }
       !($0 in old) { print $3 "  (in " pre ", but not in the receipt, or edited since)" }
     ' "$t.dests" "$PP_OLD" "$t.cur"
     find "$(pp_d "$PREFIX")" ! -type d ! -type f ! -type l | pp_strip_plain \
@@ -444,6 +455,21 @@ pp_new_receipt() {
     awk -F "$PP_TAB" -v OFS="$PP_TAB" '$1 == "d" { print "d", "-", $2 }' "$1"
     awk -F "$PP_TAB" '$1 != "d" { print $2 }' "$1" | while IFS= read -r p; do pp_manifest "$p"; done
     pp_manifest "$VENV"
+  } | LC_ALL=C sort -u
+}
+
+# pp_planned_receipt TABLE: the old receipt plus every table entry, files recorded with the
+# hash of their staged source. Written before the first write, so a run that is interrupted
+# anywhere leaves a receipt that names everything it may have written: the next run then
+# proves ownership from it instead of refusing a $P it cannot account for.
+pp_planned_receipt() {
+  {
+    cat "$PP_OLD"
+    awk -F "$PP_TAB" -v OFS="$PP_TAB" '$1 == "d" { print "d", "-", $2 } $1 == "l" { print "l", $3, $2 }' "$1"
+    awk -F "$PP_TAB" -v OFS="$PP_TAB" '$1 == "f" { print $2, $3 }' "$1" \
+      | while IFS="$PP_TAB" read -r dest src; do
+          printf 'f\t%s\t%s\n' "$(pp_sha256 "$src")" "$dest"
+        done
   } | LC_ALL=C sort -u
 }
 
