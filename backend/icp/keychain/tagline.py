@@ -179,6 +179,13 @@ def replace_tags(raw: str, tags) -> str:
     return body + sep + line(tags)
 
 
+def _stored_last_line(body: str) -> str | None:
+    """The last line of a stored `body` (its trailing line breaks ignored) when it reads as a
+    tag line, else None."""
+    q = _parts(body.rstrip("\r\n"))
+    return q[2].rstrip("\r") if q is not None else None
+
+
 def _merge(tags, typed) -> list[str] | None:
     """`tags` then the `typed` ones not already there, or None past MAX_TAGS."""
     out, seen = list(tags), {fold(t) for t in tags}
@@ -196,13 +203,24 @@ def replace_body(raw: str, body: str) -> str:
     A new body whose own last line is a tag line is treated the same whether or not `raw` has
     tags, as create and an Apple device treat it: that line joins the tag line. When the two
     together would make more than MAX_TAGS tags, the result would not be a tag line either,
-    so the typed line stays body text."""
+    so the typed line stays body text.
+
+    Only a line the user typed joins: when the stored body already ends in that same line
+    (held open by a tag removal, or followed by the real tag line), saving it again leaves it
+    body text, held open again; notes held open whose body comes back unchanged (callers trim
+    line breaks) are kept byte for byte."""
     raw = raw or ""
     p = _parts(raw)
+    typed = _parts(body) if body else None
+    if typed is not None and _stored_last_line(raw if p is None else p[0]) == \
+            typed[2].rstrip("\r"):
+        typed = None
+        if p is None:
+            # Not typed, and no tag line to put after it: hold it open again.
+            return raw if body == raw.strip("\n") else _hold_open(body)
     if p is None:
         return body
     _, sep, cand, tags = p
-    typed = _parts(body) if body else None
     if typed is not None:
         merged = _merge(tags, typed[3])
         if merged is not None:
