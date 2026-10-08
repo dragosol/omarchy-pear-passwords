@@ -294,6 +294,7 @@ static int sig_ok(const char *sig)
 static char *check_wayland(const char *rt, uid_t ruid)
 {
     const char *name = getenv("WAYLAND_DISPLAY");
+    size_t rt_len = strlen(rt);
     const char *sig = getenv("HYPRLAND_INSTANCE_SIGNATURE");
     const char *comm = compositor_comm();
     char *sock_path, *lock_path, buf[256], *line2;
@@ -307,6 +308,11 @@ static char *check_wayland(const char *rt, uid_t ruid)
     struct dirent *de;
     int fd;
 
+    /* Also the exact path in the runtime directory just verified: that is what this program
+     * exports, and the window passes it on to the clip and migrate it starts. Any other path
+     * is refused. */
+    if (name != NULL && name[0] == '/' && strncmp(name, rt, rt_len) == 0 && name[rt_len] == '/')
+        name += rt_len + 1;
     if (!wayland_name_ok(name))
         die(EX_REFUSED, "WAYLAND_DISPLAY must be a socket name like wayland-1");
     if (!sig_ok(sig))

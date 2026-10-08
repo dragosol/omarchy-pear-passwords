@@ -240,6 +240,23 @@ def test_removing_every_tag_restores_the_body_exactly(monkeypatch):
     assert _notes_of(z.saved[0][2]) == b"\n  keep my leading newline and spaces  "
 
 
+def test_remove_all_tags_then_save_the_notes_unchanged(monkeypatch):
+    # faudit-real #1: the body's own "Tags: #abc" line, held open by the removal, must not
+    # become list metadata when the notes editor saves that body back unchanged.
+    z = _zone(monkeypatch, [("PW", up.new_password_plist("s.example", "u", "pw")),
+                            ("META", _meta_notes("s.example", "u",
+                                                 b"pin 1234\nTags: #abc\n\nTags: #work"))])
+    push.push_details(z, "s.example", "u", tags=[])
+    held = _notes_of(z.saved[-1][2])
+    assert held == b"pin 1234\nTags: #abc\n"
+    body = tagline.split(held.decode())[0]             # what the notes editor is given
+    z = _zone(monkeypatch, [("PW", up.new_password_plist("s.example", "u", "pw")),
+                            ("META", _meta_notes("s.example", "u", held))])
+    push.push_details(z, "s.example", "u", notes_body=body)
+    assert _notes_of(z.saved[-1][2]) == held
+    assert tagline.split(held.decode())[1] == []
+
+
 def test_a_body_edit_keeps_the_tag_line(monkeypatch):
     z = _zone(monkeypatch, [("PW", up.new_password_plist("s.example", "u", "pw")),
                             ("META", _meta_notes("s.example", "u", b"old body\nTAGS: #Keep"))])

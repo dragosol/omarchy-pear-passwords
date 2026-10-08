@@ -243,6 +243,8 @@ class PearExecTests(unittest.TestCase):
         return {
             "HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name, "PATH": "/usr/bin",
             "XDG_RUNTIME_DIR": self.rt,
+            # The full path: pear-clip connects to it as given. A nested pear-exec accepts
+            # exactly this path back (vm-real, critical).
             "WAYLAND_DISPLAY": os.path.join(self.rt, "wayland-7"),
             # The window gets no session bus, so Qt's AT-SPI bridge never starts.
             "DBUS_SESSION_BUS_ADDRESS": NO_SESSION_BUS,
@@ -261,6 +263,46 @@ class PearExecTests(unittest.TestCase):
         p, res = self.run_exec("ui")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(res["env"], self.expected_env())
+
+    def test_window_environment_passes_nested_clip_and_migrate(self):
+        # vm-real, critical: the window starts `pear-exec clip` and `pear-exec migrate` with
+        # the environment `pear-exec ui` gave it. Feed exactly that back in; only the test
+        # build's own hooks are added.
+        p, res = self.run_exec("ui")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        window_env = dict(res["env"])
+        window_env["PEAR_EXEC_TEST_ROOT"] = self.root
+        window_env["PEAR_EXEC_TEST_COMM"] = COMM
+        for role in ("clip", "migrate"):
+            p, nested = self.run_exec(role, env=window_env)
+            self.assertEqual(p.returncode, 0, (role, p.stderr))
+            self.assertEqual(nested["argv"], list(paths.ROLE_TARGETS[role][1:]), role)
+            self.assertEqual(nested["env"]["WAYLAND_DISPLAY"],
+                             window_env["WAYLAND_DISPLAY"], role)
+            self.assertEqual(nested["env"]["DBUS_SESSION_BUS_ADDRESS"],
+                             f"unix:path={self.rt}/bus", role)
+
+    def test_only_the_runtime_dir_path_is_accepted(self):
+        # The full-path form is only the verified runtime directory's own socket; every
+        # other path, and every lookalike, is still refused.
+        bad = [os.path.join(self.root, "wayland-7"),
+               self.rt + "x/wayland-7",
+               self.rt + "/../" + os.path.basename(self.rt) + "/wayland-7",
+               self.rt + "//wayland-7",
+               self.rt + "/wayland-7/",
+               self.rt + "/hypr/wayland-7",
+               self.rt + "/",
+               self.rt,
+               "/run/user/%d/wayland-7" % self.uid]
+        for name in bad:
+            p, res = self.run_exec(env=self.env(WAYLAND_DISPLAY=name))
+            self.expect_refused(p, res)
+        p, res = self.run_exec(env=self.env(WAYLAND_DISPLAY=self.rt + "/wayland-7"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        # Full path, but not the socket the instance lock names: still refused.
+        self.compositor("wayland-8")
+        p, res = self.run_exec(env=self.env(WAYLAND_DISPLAY=self.rt + "/wayland-8"))
+        self.expect_refused(p, res)
 
     def test_specific_drops_and_forces(self):
         # Spelled out, so a failure names the variable rather than a dict diff.
@@ -338,7 +380,9 @@ class PearExecTests(unittest.TestCase):
         # A path that does lead to the real socket, with a lock file naming it exactly: only
         # the name rule can refuse these.
         os.makedirs(os.path.join(self.rt, "wayland-8"), mode=0o700)
-        for name in ("wayland-8/../wayland-7", os.path.join(self.rt, "wayland-7"),
+        # (The runtime directory's own full path is accepted: see
+        # test_only_the_runtime_dir_path_is_accepted.)
+        for name in ("wayland-8/../wayland-7", os.path.join(self.rt, "wayland-8/../wayland-7"),
                      "./wayland-7", "wayland-", "wayland-7x", "Wayland-7"):
             self.lock(name, self.comp.pid)
             p, res = self.run_exec(env=self.env(WAYLAND_DISPLAY=name))

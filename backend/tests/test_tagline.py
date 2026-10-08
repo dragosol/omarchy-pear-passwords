@@ -138,6 +138,29 @@ class ComposeTests(unittest.TestCase):
         # Adding a tag again composes after it, and the body line still stays body text.
         self.assertEqual(tl.split(tl.replace_tags(out, ["c"])), (out, ["c"]))
 
+    def test_remove_all_tags_then_save_the_notes_unchanged(self):
+        # faudit-real #1: the notes editor saves the held-open body unchanged (trimmed by the
+        # caller); the body's own "Tags:" line must not become a tag on the next split.
+        for raw, held in (("pin 1234\nTags: #abc\n\nTags: #work", "pin 1234\nTags: #abc\n"),
+                          ("pin\r\nTags: #abc\r\n\r\nTags: #w", "pin\r\nTags: #abc\r\n")):
+            gone = tl.replace_tags(raw, [])
+            self.assertEqual(gone, held)
+            out = tl.replace_body(gone, gone.strip("\n"))
+            self.assertEqual(out, held)                       # byte for byte
+            self.assertEqual(tl.split(out)[1], [])
+            # Another line edited, the held line left as it was: still body text.
+            out = tl.replace_body(gone, "pin 9\nTags: #abc")
+            self.assertEqual(tl.split(out), (out, []))
+        # The same with the tags kept: saving the body unchanged never merges its last line.
+        raw = "pin 1234\nTags: #abc\n\nTags: #work"
+        body = tl.split(raw)[0]
+        self.assertEqual(tl.replace_body(raw, body), raw)
+        self.assertEqual(tl.split(tl.replace_body(raw, "pin 9\nTags: #abc")),
+                         ("pin 9\nTags: #abc", ["work"]))
+        # A line the user did type (different from the stored one) still joins.
+        self.assertEqual(tl.split(tl.replace_body("pin 1234\nTags: #abc\n", "pin\nTags: #new")),
+                         ("pin", ["new"]))
+
     def test_a_typed_last_tag_line_in_a_body_edit_joins_the_tags_either_way(self):
         # One rule, with or without tags already: the typed line joins the tag line, as create
         # and an Apple device treat it.
@@ -217,6 +240,18 @@ class PropertyTests(unittest.TestCase):
             nb = self.body(rnd)
             out = tl.replace_body(b, nb)
             nbody, typed = tl.split(nb)
+            # ...unless the stored body already ended in that same line: not typed, so it stays
+            # body text (held open when there is no tag line to follow it).
+            def last(t):
+                q = tl._parts(t.rstrip("\r\n"))
+                return q[2].rstrip("\r") if q else None
+            if typed and last(prefix) == last(nb):
+                if not cur:
+                    self.assertTrue(out.startswith(nb), (b, nb))
+                    self.assertEqual(tl.split(out), (out, []), (b, nb))
+                else:
+                    self.assertEqual(tl.split(out), (nb, cur), (b, nb))
+                continue
             if not cur:
                 want = (nbody, typed)
             else:
