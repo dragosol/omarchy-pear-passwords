@@ -13,11 +13,13 @@ One request per connection, one JSON line each way:
     {"op":"encrypt"|"decrypt","name":"pear.list.u1000","b64":"..."}
     {"b64":"..."}  |  {"error":"refused"|"bad-request"|"internal","detail":"..."}
 
-It serves exactly one peer: SO_PEERCRED uid `pear-passwords` (anyone else is disconnected
-without a reply), and only names `pear.(list|secret).u<digits>`. It runs the system-scope
-equivalent of the primary path's command - the same empty `--tpm2-pcrs=` and
-`--tpm2-public-key=`, `--with-key=auto` - with the secret on a pipe, keeps nothing between
-requests and logs no payload. "refused" is only ever a decrypt the tool rejected (the daemon
+An encrypt may carry "with": "host" | "host+tpm2" (default "host"). It serves exactly one
+peer: SO_PEERCRED uid `pear-passwords` (anyone else is disconnected without a reply), and
+only names `pear.(list|secret).u<digits>`. It runs system-scope systemd-creds locally, where
+the flags take effect: an explicit `--with-key=host` or `--with-key=host+tpm2` (never auto,
+never a *-with-public-key type), no PCRs (`--tpm2-pcrs=`) and an empty `--tpm2-public-key=`
+so no signed PCR policy is ever picked up. The secret travels on a pipe; it keeps nothing
+between requests and logs no payload. "refused" is only ever a decrypt the tool rejected (the daemon
 classifies it into tpm-missing, tpm-cleared or damaged); everything else is "internal", which
 the daemon treats as transient.
 """
@@ -45,8 +47,13 @@ MAX_REQUEST = 256 * 1024            # a sealed 32-byte key is well under 4 KiB; 
 Runner = Callable[[list, bytes], "tuple[int, bytes, bytes]"]
 
 
-def encrypt_argv(name: str) -> list[str]:
-    return [SYSTEMD_CREDS, "encrypt", "--with-key=auto", "--tpm2-pcrs=",
+WITH_KEYS = ("host", "host+tpm2")
+
+
+def encrypt_argv(name: str, with_key: str = "host") -> list[str]:
+    if with_key not in WITH_KEYS:
+        raise ValueError(f"bad key type {with_key!r}")
+    return [SYSTEMD_CREDS, "encrypt", f"--with-key={with_key}", "--tpm2-pcrs=",
             "--tpm2-public-key=", f"--name={name}", "-", "-"]
 
 
@@ -66,11 +73,15 @@ def handle(line: bytes, run: Runner = _run) -> dict:
         req = json.loads(line)
     except ValueError:
         return {"error": "bad-request", "detail": "not JSON"}
-    if not isinstance(req, dict) or set(req) != {"op", "name", "b64"}:
+    if not isinstance(req, dict) or not {"op", "name", "b64"} <= set(req) \
+            or set(req) - {"op", "name", "b64", "with"}:
         return {"error": "bad-request", "detail": "expected op, name and b64"}
     op, name, b64 = req["op"], req["name"], req["b64"]
+    with_key = req.get("with", "host")
     if op not in ("encrypt", "decrypt"):
         return {"error": "bad-request", "detail": "op"}
+    if with_key not in WITH_KEYS or (op == "decrypt" and "with" in req):
+        return {"error": "bad-request", "detail": "with"}
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         return {"error": "bad-request", "detail": "name"}
     try:
@@ -80,7 +91,7 @@ def handle(line: bytes, run: Runner = _run) -> dict:
     if not data:
         return {"error": "bad-request", "detail": "b64"}
     try:
-        argv = encrypt_argv(name) if op == "encrypt" else decrypt_argv(name)
+        argv = encrypt_argv(name, with_key) if op == "encrypt" else decrypt_argv(name)
         try:
             rc, out, err = run(argv, bytes(data))
         except FileNotFoundError:

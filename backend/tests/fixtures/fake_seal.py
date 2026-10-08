@@ -28,6 +28,7 @@ class FakeSealBackend:
         self.calls: list[tuple[str, str]] = []       # (op, name); never the data
         self.unavailable = False                     # the tool cannot run at all
         self.corrupt_next_encrypts = 0               # emit blobs that will not open
+        self.srk_visible = True                      # False: no systemd-tpm2-setup PEM (no UKI)
 
     # --- the backend interface ---------------------------------------------------------------
     def encrypt(self, name: str, plaintext: bytes) -> bytes:
@@ -59,11 +60,17 @@ class FakeSealBackend:
             raise UnsealRefused("TPM2 unseal failed")
         return base64.b64decode(doc["data"])
 
+    def key_type(self, blob: bytes) -> str:
+        if not blob.startswith(MAGIC):
+            raise SealUnavailable("fake: not a credential")
+        doc = json.loads(nacl.secret.SecretBox(self.host_key).decrypt(blob[len(MAGIC):]))
+        return doc["with"]
+
     def tpm_present(self) -> bool:
         return self.tpm
 
     def srk_fingerprint(self) -> str | None:
-        return self.srk if self.tpm else None
+        return self.srk if self.tpm and self.srk_visible else None
 
     # --- helpers for tests -------------------------------------------------------------------
     def count(self, op: str, tier: str | None = None) -> int:

@@ -25,18 +25,32 @@ from icp.vstore import seal
 from test_store_v2 import UID, StoreCase, item
 
 FAKE_CREDS = """#!{python}
-import base64, sys
+import base64, os, sys
 argv = sys.argv[1:]
 with open({log!r}, "a") as f:
     f.write(repr(argv) + "\\n")
+ctl = {ctl!r}
+mode = open(ctl).read().strip() if os.path.exists(ctl) else ""
+head = bytes.fromhex(open(ctl + ".head").read().strip()) if os.path.exists(ctl + ".head") \\
+    else bytes.fromhex("55b9ed1d38594d43a8319d2ebb332ac6")
 data = sys.stdin.buffer.read()
+if mode == "down":
+    sys.stderr.write("Failed to connect to io.systemd.Credentials: Connection refused\\n")
+    sys.exit(1)
+if mode == "broken":
+    sys.stderr.write("Failed to frobnicate: Input/output error\\n")
+    sys.exit(1)
 if argv[:2] == ["--user", "encrypt"]:
-    sys.stdout.buffer.write(b"ENC:" + base64.b64encode(data))
+    sys.stdout.buffer.write(base64.b64encode(head + b"ENC:" + data))
 elif argv[:2] == ["--user", "decrypt"]:
-    if not data.startswith(b"ENC:"):
+    try:
+        raw = base64.b64decode(data, validate=True)[16:]
+    except ValueError:
+        raw = b""
+    if not raw.startswith(b"ENC:"):
         sys.stderr.write("Failed to decrypt: refused\\n")
         sys.exit(1)
-    sys.stdout.buffer.write(base64.b64decode(data[4:]))
+    sys.stdout.buffer.write(raw[4:])
 else:
     sys.exit(2)
 """
@@ -48,14 +62,25 @@ class CommandLineTests(unittest.TestCase):
         d = Path(self._tmp.name)
         self.log = d / "argv.log"
         exe = d / "systemd-creds"
-        exe.write_text(FAKE_CREDS.format(python=sys.executable, log=str(self.log)))
+        self.ctl = d / "mode"
+        exe.write_text(FAKE_CREDS.format(python=sys.executable, log=str(self.log),
+                                         ctl=str(self.ctl)))
         exe.chmod(0o755)
         self._patch = mock.patch.object(seal, "SYSTEMD_CREDS", str(exe))
         self._patch.start()
+        self._tpm = mock.patch.object(seal, "tpm_present", return_value=False)
+        self._tpm.start()
 
     def tearDown(self):
+        self._tpm.stop()
         self._patch.stop()
         self._tmp.cleanup()
+
+    def mode(self, m):
+        self.ctl.write_text(m)
+
+    def head(self, h: bytes):
+        Path(str(self.ctl) + ".head").write_text(h.hex())
 
     def argvs(self):
         return [eval(line) for line in self.log.read_text().splitlines()]
@@ -66,14 +91,76 @@ class CommandLineTests(unittest.TestCase):
         blob = b.encrypt("pear.list.u1000", secret)
         self.assertEqual(b.decrypt("pear.list.u1000", blob), secret)
         enc, dec = self.argvs()
-        self.assertEqual(enc, ["--user", "encrypt", "--with-key=auto", "--tpm2-pcrs=",
-                               "--tpm2-public-key=", "--name=pear.list.u1000", "-", "-"])
+        # In uid scope --with-key and --tpm2-* never reach the service; none is passed, and
+        # the key type is read back from the blob instead.
+        self.assertEqual(enc, ["--user", "encrypt", "--name=pear.list.u1000", "-", "-"])
+        self.assertEqual(b.key_type(blob), "host")
         self.assertEqual(dec, ["--user", "decrypt", "--name=pear.list.u1000", "-", "-"])
         # The secret travels on the pipe only.
         for argv in (enc, dec):
             joined = " ".join(argv)
             self.assertNotIn(secret.hex(), joined)
             self.assertNotIn(base64.b64encode(secret).decode(), joined)
+
+    def test_key_type_comes_from_the_header_and_bad_types_are_refused(self):
+        # crypto-user-scope-drops-tpm-flags
+        b = seal.SystemdCredsBackend()
+        for bad in (seal.CRED_BY_TPM2_WITH_PK, seal.CRED_BY_HOST, seal.CRED_BY_NULL,
+                    seal.CRED_BY_TPM2):
+            self.head(bad)
+            with self.assertRaises(seal.SealUnavailable, msg=bad.hex()):
+                b.encrypt("pear.list.u1000", b"k" * 32)
+        self.head(bytes.fromhex("af4950a849134eb1a73846304ff30c05"))   # a scoped TPM type
+        with self.assertRaises(seal.SealUnavailable):
+            b.encrypt("pear.list.u1000", b"k" * 32)           # ...but there is no TPM
+        with mock.patch.object(seal, "tpm_present", return_value=True):
+            self.assertEqual(b.key_type(b.encrypt("pear.list.u1000", b"k" * 32)), "host+tpm2")
+
+    def test_a_pcr_public_key_blocks_tpm_sealing(self):
+        b = seal.SystemdCredsBackend()
+        pem = Path(self._tmp.name) / "tpm2-pcr-public-key.pem"
+        pem.write_text("-----BEGIN PUBLIC KEY-----\n")
+        with mock.patch.object(seal, "PCR_PUBLIC_KEY_PATHS", (str(pem),)):
+            with mock.patch.object(seal, "tpm_present", return_value=True):
+                with self.assertRaises(seal.SealUnavailable) as cm:
+                    b.encrypt("pear.list.u1000", b"k" * 32)
+                self.assertIn(str(pem), str(cm.exception))
+                self.assertFalse(self.log.exists(), "systemd-creds ran anyway")
+            # without a TPM, auto cannot use the public key: host sealing goes ahead
+            self.assertEqual(b.key_type(b.encrypt("pear.list.u1000", b"k" * 32)), "host")
+
+    def test_a_mechanism_failure_is_never_a_refusal(self):
+        # crypto-transient-unseal-is-damaged / function-transient-unseal-is-damaged
+        b = seal.SystemdCredsBackend()
+        blob = b.encrypt("pear.list.u1000", b"k" * 32)
+        self.mode("down")
+        with self.assertRaises(seal.SealUnavailable):
+            b.decrypt("pear.list.u1000", blob)
+        self.mode("broken")                     # unknown message, and the canary fails too
+        with self.assertRaises(seal.SealUnavailable):
+            b.decrypt("pear.list.u1000", blob)
+        self.mode("")                           # the tool works: this blob is refused
+        with self.assertRaises(seal.UnsealRefused):
+            b.decrypt("pear.list.u1000", base64.b64encode(bytes(16) + b"garbage"))
+
+    def test_a_transient_failure_leaves_the_store_locked_not_damaged(self):
+        with tempfile.TemporaryDirectory() as root, \
+                vstore_env(root, seal.SystemdCredsBackend()):
+            s = vstore.UserStore.create(UID)
+            s.apply_sync([item("a.example.test", "me", "TEST-pw")], set())
+            s.lock()
+            before = sorted(p.name for p in (Path(root) / f"u{UID}" / "keys").iterdir())
+            s2 = vstore.UserStore.open(UID)
+            for m in ("down", "broken"):
+                self.mode(m)
+                with self.assertRaises(seal.SealUnavailable):
+                    s2.unlock()
+                self.assertEqual(s2.state(), "locked", m)
+            self.assertEqual(sorted(p.name for p in (Path(root) / f"u{UID}" / "keys").iterdir()),
+                             before)
+            self.mode("")
+            s2.unlock()
+            self.assertEqual(s2.state(), "unlocked")
 
     def test_refusal_and_absence_are_different(self):
         b = seal.SystemdCredsBackend()
@@ -96,7 +183,7 @@ class CommandLineTests(unittest.TestCase):
             s2 = vstore.UserStore.open(UID)
             s2.unlock()
             self.assertEqual(s2.open_entry(s2.list_meta()[0].id).password, "TEST-pw")
-        names = [a[5] for a in self.argvs() if a[1] == "encrypt"]
+        names = [a[2] for a in self.argvs() if a[1] == "encrypt"]
         self.assertEqual(names, [f"--name=pear.list.u{UID}", f"--name=pear.secret.u{UID}"])
 
 
@@ -156,15 +243,18 @@ class SealServiceTests(unittest.TestCase):
                 self.seen.append((req["op"], req["name"]))
                 data = base64.b64decode(req["b64"])
                 if req["op"] == "encrypt":
-                    reply = {"b64": base64.b64encode(b"S" + data).decode()}
-                elif data.startswith(b"S"):
-                    reply = {"b64": base64.b64encode(data[1:]).decode()}
+                    reply = {"b64": base64.b64encode(seal.CRED_BY_HOST + b"S" + data).decode()}
+                elif data[16:].startswith(b"S"):
+                    reply = {"b64": base64.b64encode(data[17:]).decode()}
                 else:
                     reply = {"error": "refused", "detail": "no"}
                 conn.sendall(json.dumps(reply).encode() + b"\n")
 
     def test_round_trip_and_refusal(self):
         b = seal.SealServiceBackend(self.path)
+        patcher = mock.patch.object(seal, "tpm_present", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         blob = b.encrypt("pear.secret.u1000", b"k" * 32)
         self.assertEqual(b.decrypt("pear.secret.u1000", blob), b"k" * 32)
         with self.assertRaises(seal.UnsealRefused):
@@ -212,6 +302,15 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(seal.classify(b, "host+tpm2", "srk-one"), "tpm-cleared")
         b.srk = "srk-one"
         self.assertEqual(seal.classify(b, "host+tpm2", "srk-one"), "damaged")
+
+    def test_classify_without_an_srk_to_compare(self):
+        # crypto-tpm-cleared-unreachable / gate G1 tpm-cleared: no systemd-tpm2-setup PEM on a
+        # Limine or GRUB boot without a UKI, so nothing was recorded and nothing is readable.
+        b = FakeSealBackend(tpm=True)
+        b.srk_visible = False
+        self.assertEqual(seal.classify(b, "host+tpm2", None), "tpm-cleared")
+        self.assertEqual(seal.classify(b, "host+tpm2", "srk-one"), "tpm-cleared")
+        self.assertEqual(seal.classify(b, "host", None), "damaged")
 
 
 class ResealTests(StoreCase):
@@ -323,6 +422,19 @@ class SealStateTests(StoreCase):
         self.assertEqual(cm.exception.kind, "tpm-cleared")
         self.assertEqual(s.status()["state"], "tpm-cleared")
         self.assertEqual(self.snapshot(), before)
+
+    def test_tpm_cleared_on_a_boot_without_an_srk_pem(self):
+        self.backend.srk_visible = False       # no UKI: no tpm2-srk-public-key.pem, ever
+        s = vstore.UserStore.create(UID)
+        s.apply_sync([item("a.example.test", "me", "pw")], set())
+        s.lock()
+        kj = json.loads((self.udir / "keys" / "keys.json").read_bytes())
+        self.assertNotIn("tpm_srk_fp", kj)
+        self.backend.srk = "srk-two"           # BIOS "Clear TPM"
+        s2 = vstore.UserStore.open(UID)
+        with self.assertRaises(vstore.SealError) as cm:
+            s2.unlock()
+        self.assertEqual(cm.exception.kind, "tpm-cleared")
 
     def test_host_key_lost_is_damaged(self):
         s = self.locked_store()

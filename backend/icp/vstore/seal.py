@@ -2,21 +2,40 @@
 
 Primary path (spec section 6, gate G1): the daemon, as uid `pear-passwords`, runs
 
-    systemd-creds --user encrypt --with-key=auto --tpm2-pcrs= --tpm2-public-key= \\
-                  --name=pear.<tier>.u<uid> - -
+    systemd-creds --user encrypt --name=pear.<tier>.u<uid> - -
 
 with the secret on a pipe, never in argv or a file. `--user` binds the blob to the daemon's
-uid, so even another root-less process that got hold of the file cannot decrypt it, and
-`--with-key=auto` means the host key today and host+TPM2 as soon as a TPM2 is usable. The two
-empty flags matter: no PCRs (Secure Boot is off and the boot is unmeasured, so any firmware,
-Limine or kernel update would break a PCR-bound blob) and no signed PCR policy (so a future
-UKI cannot silently bind the blobs). Both were checked to be accepted in uid scope on
-systemd 261.
+uid, so even another root-less process that got hold of the file cannot decrypt it.
+
+What the key type is, and what it must never be. In uid scope systemd-creds cannot read
+/var/lib/systemd/credential.secret itself, so it hands the request to the
+io.systemd.Credentials varlink service - and that request has no field for PCRs or a public
+key, and systemd 261 also drops --with-key on the way (checked: an explicit withKey sent
+straight over varlink even turns a user-scope request into a system-scope blob that uid
+scope then refuses with "Scope mismatch"). So the service always picks `auto`: the host key
+today, host+TPM2 once a TPM2 is usable, with no PCRs. The one thing auto would add on its own
+is a signed PCR-11 policy, when a tpm2-pcr-public-key.pem exists (a UKI setup) - and a blob
+bound to it refuses to open after a boot that cannot present a matching signature (a Limine
+fallback, another kernel). So:
+
+- with a TPM present and such a PEM installed, nothing is sealed (SealUnavailable, with the
+  reason): no store is created and no re-seal happens until the PEM is gone or the root seal
+  service is selected (docs/security.md, G1);
+- after sealing, the credential header's key type is read back (`key_type`), and that - not
+  a probe - is what keys.json records; an unscoped, null, TPM-only or public-key-bound type
+  is refused.
 
 Fallback (if G1 fails in the hardened unit): a root oneshot does system-scope sealing for the
-daemon over a socket (`SealServiceBackend`). It is selected with PEAR_SEAL_BACKEND=seal-service
-in the unit's environment, which only root can set; everything above it is unchanged, so the
-UX states stay the same.
+daemon over a socket (`SealServiceBackend`), where the flags do apply: it runs
+`--with-key=host` or `--with-key=host+tpm2` explicitly, `--tpm2-pcrs=` and an empty
+`--tpm2-public-key=`. It is selected with PEAR_SEAL_BACKEND=seal-service in the unit's
+environment, which only root can set; everything above it is unchanged, so the UX states stay
+the same.
+
+A failed decrypt is told apart from a failed mechanism: only when the tool demonstrably
+works (a throwaway value still round-trips) is a non-zero exit a refusal of this blob
+(UnsealRefused, which becomes a seal state). A tool that cannot reach its service, a busy or
+locked-out TPM, ENOMEM: SealUnavailable, transient, never a seal state.
 
 Sealing is lazy: nothing here runs at daemon start, only at unlock, so a missing or replaced
 TPM shows up as a state in the app instead of a service that will not start.
@@ -46,6 +65,27 @@ BACKEND_ENV = "PEAR_SEAL_BACKEND"
 BACKEND_USER_CREDS = "user-creds"
 BACKEND_SEAL_SERVICE = "seal-service"
 
+# A signed PCR policy systemd-creds would pick up on its own (systemd-creds(1), --tpm2-public-key).
+PCR_PUBLIC_KEY_PATHS = ("/etc/systemd/tpm2-pcr-public-key.pem",
+                        "/run/systemd/tpm2-pcr-public-key.pem",
+                        "/usr/local/lib/systemd/tpm2-pcr-public-key.pem",
+                        "/usr/lib/systemd/tpm2-pcr-public-key.pem")
+
+# Credential key types (the sd_id128 at the start of a credential, systemd's creds-util.h).
+CRED_BY_HOST = bytes.fromhex("5a1c6a86df9d4096b1d5a65e0862f19a")          # system scope
+CRED_BY_HOST_SCOPED = bytes.fromhex("55b9ed1d38594d43a8319d2ebb332ac6")   # uid scope
+CRED_BY_HOST_AND_TPM2 = bytes.fromhex("93a894094874449090caf2fc93cab553")  # system scope
+CRED_BY_TPM2 = bytes.fromhex("0c7cc07b117645919c4b0bea08bc20fe")          # no host key
+CRED_BY_TPM2_WITH_PK = bytes.fromhex("faf7eb9341e3412ca1a436f95a29362f")  # signed PCR policy
+CRED_BY_NULL = bytes.fromhex("058469daf6f54324800549da0f8ea2fb")          # no encryption
+
+# stderr of a mechanism failure, not a refusal of the blob (lowercase).
+_TRANSIENT = ("failed to connect to io.systemd.credentials", "varlink", "connection refused",
+              "connection reset", "transport endpoint", "timed out", "timer expired",
+              "resource temporarily unavailable", "cannot allocate memory", "try again",
+              "dictionarylockout", "dictionary lockout", "rc_retry", "rc_yielded",
+              "rc_testing", "device or resource busy", "too many")
+
 # A child gets nothing of the daemon's environment: no locale tricks, no LD_*, no PATH search.
 _CHILD_ENV = {"PATH": "/usr/bin", "LANG": "C.UTF-8", "SYSTEMD_LOG_LEVEL": "warning"}
 
@@ -63,6 +103,7 @@ class UnsealRefused(Exception):
 class SealBackend(Protocol):
     def encrypt(self, name: str, plaintext: bytes) -> bytes: ...
     def decrypt(self, name: str, blob: bytes) -> bytes: ...
+    def key_type(self, blob: bytes) -> str: ...        # "host" | "host+tpm2", or SealUnavailable
     def tpm_present(self) -> bool: ...
     def srk_fingerprint(self) -> str | None: ...
 
@@ -85,6 +126,24 @@ def tpm_present() -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0
+
+
+def pcr_public_key_present() -> str | None:
+    """The tpm2-pcr-public-key.pem systemd-creds would bind a blob to on its own, if any."""
+    for p in PCR_PUBLIC_KEY_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def credential_header(blob: bytes) -> bytes:
+    """The 16-byte key type id at the start of a credential (base64 text or raw)."""
+    data = bytes(blob or b"")
+    try:
+        raw = base64.b64decode(b"".join(data.split()), validate=True)
+    except (ValueError, TypeError):
+        raw = data
+    return raw[:16]
 
 
 def srk_fingerprint() -> str | None:
@@ -110,9 +169,12 @@ def srk_fingerprint() -> str | None:
 class SystemdCredsBackend:
     """`systemd-creds --user` as the daemon's own uid (gate G1)."""
 
+    CANARY_NAME = "pear.canary"
+
     def encrypt_argv(self, name: str) -> list[str]:
-        return [SYSTEMD_CREDS, "--user", "encrypt", "--with-key=auto", "--tpm2-pcrs=",
-                "--tpm2-public-key=", f"--name={name}", "-", "-"]
+        # No --with-key / --tpm2-* flags: in uid scope they never reach the service (module
+        # docstring); what the blob is bound to is checked afterwards with key_type().
+        return [SYSTEMD_CREDS, "--user", "encrypt", f"--name={name}", "-", "-"]
 
     def decrypt_argv(self, name: str) -> list[str]:
         return [SYSTEMD_CREDS, "--user", "decrypt", f"--name={name}", "-", "-"]
@@ -130,19 +192,57 @@ class SystemdCredsBackend:
             raise SealUnavailable(f"systemd-creds could not run ({e.strerror})") from None
 
     def encrypt(self, name: str, plaintext: bytes) -> bytes:
+        if self.tpm_present():
+            pem = pcr_public_key_present()
+            if pem:
+                raise SealUnavailable(
+                    f"{pem} exists: systemd-creds would bind the keys to a signed PCR policy, "
+                    "and a boot without a matching signature could never open them")
         r = self._run(self.encrypt_argv(name), plaintext)
         if r.returncode != 0 or not r.stdout:
             # Sealing failing is never a statement about existing blobs.
             raise SealUnavailable(f"systemd-creds encrypt failed ({_why(r.stderr)})")
+        self.key_type(r.stdout)                  # refuses a blob bound to the wrong thing
         return r.stdout
+
+    def key_type(self, blob: bytes) -> str:
+        """What a uid-scope blob is bound to, from its header: "host" or "host+tpm2"."""
+        h = credential_header(blob)
+        if h == CRED_BY_HOST_SCOPED:
+            return "host"
+        if h in (CRED_BY_HOST, CRED_BY_HOST_AND_TPM2, CRED_BY_TPM2, CRED_BY_TPM2_WITH_PK,
+                 CRED_BY_NULL) or len(h) != 16:
+            raise SealUnavailable(f"systemd-creds produced a credential of key type {h.hex()}, "
+                                  "not one bound to the host key and this uid")
+        if not self.tpm_present():
+            raise SealUnavailable(f"unknown credential key type {h.hex()} without a TPM")
+        return "host+tpm2"
 
     def decrypt(self, name: str, blob: bytes) -> bytes:
         r = self._run(self.decrypt_argv(name), blob)
         if r.returncode < 0:
             raise SealUnavailable(f"systemd-creds killed by signal {-r.returncode}")
         if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", "replace").lower()
+            if any(m in err for m in _TRANSIENT):
+                raise SealUnavailable(f"systemd-creds decrypt could not run ({_why(r.stderr)})")
+            if not self._works():
+                raise SealUnavailable(f"systemd-creds is not working ({_why(r.stderr)})")
             raise UnsealRefused(_why(r.stderr))
         return r.stdout
+
+    def _works(self) -> bool:
+        """Round-trip a throwaway value. If that fails too, the mechanism is down and the
+        failed decrypt says nothing about the blob."""
+        canary = os.urandom(16)
+        try:
+            e = self._run(self.encrypt_argv(self.CANARY_NAME), canary)
+            if e.returncode != 0 or not e.stdout:
+                return False
+            d = self._run(self.decrypt_argv(self.CANARY_NAME), e.stdout)
+        except SealUnavailable:
+            return False
+        return d.returncode == 0 and d.stdout == canary
 
     def tpm_present(self) -> bool:
         return tpm_present()
@@ -162,14 +262,18 @@ class SealServiceBackend:
         {"b64":"..."}  |  {"error":"refused"|"bad-request"|"internal","detail":"..."}
 
     The service accepts only SO_PEERCRED uid `pear-passwords` and names matching
-    pear.(list|secret).u<digits>; it holds nothing between requests."""
+    pear.(list|secret).u<digits>; it holds nothing between requests. An encrypt carries
+    "with": "host" | "host+tpm2", which the service passes as an explicit --with-key (system
+    scope runs locally, so the flags apply there)."""
 
     def __init__(self, path: str = SEAL_SERVICE_SOCKET):
         self.path = path
 
-    def _call(self, op: str, name: str, data: bytes) -> bytes:
-        req = json.dumps({"op": op, "name": name,
-                          "b64": base64.b64encode(bytes(data)).decode()}).encode() + b"\n"
+    def _call(self, op: str, name: str, data: bytes, with_key: str | None = None) -> bytes:
+        body = {"op": op, "name": name, "b64": base64.b64encode(bytes(data)).decode()}
+        if with_key is not None:
+            body["with"] = with_key
+        req = json.dumps(body).encode() + b"\n"
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC) as s:
                 s.settimeout(TIMEOUT_S)
@@ -200,10 +304,24 @@ class SealServiceBackend:
         raise SealUnavailable(f"seal service error {reply.get('error')!r}")
 
     def encrypt(self, name: str, plaintext: bytes) -> bytes:
-        return self._call("encrypt", name, plaintext)
+        want = "host+tpm2" if self.tpm_present() else "host"
+        blob = self._call("encrypt", name, plaintext, want)
+        if self.key_type(blob) != want:
+            raise SealUnavailable("the seal service sealed with another key than asked")
+        return blob
 
     def decrypt(self, name: str, blob: bytes) -> bytes:
         return self._call("decrypt", name, blob)
+
+    def key_type(self, blob: bytes) -> str:
+        """What a system-scope blob is bound to, from its header."""
+        h = credential_header(blob)
+        if h == CRED_BY_HOST:
+            return "host"
+        if h in (CRED_BY_HOST_SCOPED, CRED_BY_TPM2, CRED_BY_TPM2_WITH_PK, CRED_BY_NULL) \
+                or len(h) != 16:
+            raise SealUnavailable(f"the seal service produced key type {h.hex()}")
+        return "host+tpm2"
 
     def tpm_present(self) -> bool:
         return tpm_present()
@@ -238,24 +356,24 @@ def set_backend(backend: SealBackend | None) -> None:
 
 # --- what a failed unseal means --------------------------------------------------------------
 
-def sealed_with_now(backend: SealBackend) -> str:
-    """What `--with-key=auto` picks at this moment."""
-    return "host+tpm2" if backend.tpm_present() else "host"
-
-
 def classify(backend: SealBackend, sealed_with: str | None, recorded_srk: str | None) -> str:
-    """The seal state for an unseal the backend refused (spec section 6):
+    """The seal state for an unseal the backend refused (spec section 6). Only reached when
+    the mechanism itself works (a transient failure is SealUnavailable, never a state):
 
     - blobs sealed with host+tpm2 and no TPM now: "tpm-missing" (turn PTT back on);
     - blobs sealed with host+tpm2, a TPM present, and its SRK differs from the one recorded
       at sealing time: "tpm-cleared" (the keys are gone for good);
+    - the same, but no SRK to compare: systemd-tpm2-setup writes the SRK's PEM only on a
+      measured (UKI) boot, so on Limine/GRUB without a UKI there never is one. A working TPM
+      that refuses a host+tpm2 blob then almost always means it was cleared or replaced:
+      "tpm-cleared" as well, whose screen says so with "probably";
     - anything else (host-only blob refused, same SRK and still refused): "damaged".
     """
     if sealed_with == "host+tpm2":
         if not backend.tpm_present():
             return "tpm-missing"
         now = backend.srk_fingerprint()
-        if recorded_srk and now and now != recorded_srk:
+        if not recorded_srk or not now or now != recorded_srk:
             return "tpm-cleared"
     return "damaged"
 

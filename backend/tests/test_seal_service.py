@@ -3,6 +3,7 @@ own client for it (seal.SealServiceBackend), over a real unix socket. systemd-cr
 runner; nothing here is root or touches a real credential.
 """
 
+import base64
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from icp.daemon import paths
 from icp.vstore import seal, seal_service
@@ -34,10 +36,16 @@ class FakeCreds:
         if self.rc:
             return self.rc, b"", b"failed"
         if argv[1] == "encrypt":
-            return 0, b"SEALED:" + name + b":" + data, b""
-        if self.refuse or not data.startswith(b"SEALED:" + name + b":"):
+            head = {"--with-key=host": seal.CRED_BY_HOST,
+                    "--with-key=host+tpm2": seal.CRED_BY_HOST_AND_TPM2}[argv[2]]
+            return 0, base64.b64encode(head + b"SEALED:" + name + b":" + data), b""
+        try:
+            raw = base64.b64decode(data, validate=True)[16:]
+        except ValueError:
+            raw = b""
+        if self.refuse or not raw.startswith(b"SEALED:" + name + b":"):
             return 1, b"", b"Failed to decrypt the credential."
-        return 0, data[len(b"SEALED:" + name + b":"):], b""
+        return 0, raw[len(b"SEALED:" + name + b":"):], b""
 
 
 class ServiceCase(unittest.TestCase):
@@ -74,14 +82,25 @@ class ServiceCase(unittest.TestCase):
 
 
 class RoundTripTests(ServiceCase):
+    def setUp(self):
+        super().setUp()
+        self._tpm = mock.patch.object(seal, "tpm_present", return_value=False)
+        self._tpm.start()
+
+    def tearDown(self):
+        self._tpm.stop()
+        super().tearDown()
+
     def test_encrypt_then_decrypt_through_the_daemons_client(self):
         client = seal.SealServiceBackend(self.path)
         blob = self.call(client.encrypt, "pear.list.u1000", b"k" * 32)
         self.assertNotEqual(blob, b"k" * 32)
+        self.assertEqual(client.key_type(blob), "host")
         self.assertEqual(self.call(client.decrypt, "pear.list.u1000", blob), b"k" * 32)
         enc, dec = self.creds.argvs
-        # The primary path's flags, in system scope: no --user, empty PCRs and public key.
-        self.assertEqual(enc, [seal.SYSTEMD_CREDS, "encrypt", "--with-key=auto",
+        # System scope, where the flags apply: an explicit key type (never auto), no PCRs,
+        # and an empty public key so no signed PCR policy is picked up.
+        self.assertEqual(enc, [seal.SYSTEMD_CREDS, "encrypt", "--with-key=host",
                                "--tpm2-pcrs=", "--tpm2-public-key=",
                                "--name=pear.list.u1000", "-", "-"])
         self.assertEqual(dec, [seal.SYSTEMD_CREDS, "decrypt", "--name=pear.list.u1000",
@@ -89,6 +108,27 @@ class RoundTripTests(ServiceCase):
         for argv in (enc, dec):
             self.assertNotIn("--user", argv)
             self.assertNotIn("k" * 32, " ".join(argv))          # the secret never in argv
+
+    def test_with_a_tpm_it_asks_for_host_and_tpm2_explicitly(self):
+        # crypto-user-scope-drops-tpm-flags: never auto, so a tpm2-pcr-public-key.pem can
+        # never bind the blob; and sealed_with comes from the blob, not a guess.
+        client = seal.SealServiceBackend(self.path)
+        with mock.patch.object(seal, "tpm_present", return_value=True):
+            blob = self.call(client.encrypt, "pear.list.u1000", b"k" * 32)
+        self.assertEqual(self.creds.argvs[0][2], "--with-key=host+tpm2")
+        self.assertEqual(client.key_type(blob), "host+tpm2")
+        for bad in (seal.CRED_BY_TPM2_WITH_PK, seal.CRED_BY_NULL, seal.CRED_BY_HOST_SCOPED):
+            with self.assertRaises(seal.SealUnavailable):
+                client.key_type(base64.b64encode(bad + b"x"))
+
+    def test_with_is_only_a_key_type_and_only_for_encrypt(self):
+        for req in ({"op": "encrypt", "name": "pear.list.u1", "b64": "eA==", "with": "auto"},
+                    {"op": "encrypt", "name": "pear.list.u1", "b64": "eA==",
+                     "with": "host+tpm2-with-public-key"},
+                    {"op": "decrypt", "name": "pear.list.u1", "b64": "eA==", "with": "host"}):
+            self.assertEqual(seal_service.handle(json.dumps(req).encode(), self.creds)["error"],
+                             "bad-request", req)
+        self.assertEqual(self.creds.argvs, [])
 
     def test_a_refused_decrypt_is_unseal_refused_not_unavailable(self):
         client = seal.SealServiceBackend(self.path)

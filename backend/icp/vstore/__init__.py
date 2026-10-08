@@ -194,8 +194,6 @@ class UserStore:
         kd = _fmt.ensure_dir(store._keys_dir())
         _entries.EntryFiles(store._dir).ensure()
 
-        sealed_with = _seal.sealed_with_now(backend)
-        srk = backend.srk_fingerprint() if sealed_with == "host+tpm2" else None
         rk = _keys.new_root()
         sk, pk = _keys.new_keypair()
         written: list = []
@@ -207,6 +205,11 @@ class UserStore:
             # (Not counted in unseal_count: SK_secret was generated here, nothing is released.)
             store._verify_blob(backend, "list", blobs["list"], rk)
             store._verify_blob(backend, "secret", blobs["secret"], sk)
+            # What the blobs are bound to, read from their headers - not a guess from a probe.
+            sealed_with = backend.key_type(blobs["list"])
+            if backend.key_type(blobs["secret"]) != sealed_with:
+                raise _seal.SealUnavailable("the two key blobs were sealed differently")
+            srk = backend.srk_fingerprint() if sealed_with == "host+tpm2" else None
             sub = _keys.derive(rk)
             for tier in _TIERS:
                 written.append(kd / store._cred_file(tier))

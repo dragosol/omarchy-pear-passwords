@@ -4107,7 +4107,7 @@ ShellRoot {
         case "abi-mismatch": return "Python was upgraded";
         case "empty": return "No passwords yet";
         case "tpm-missing": return "The security chip is switched off";
-        case "tpm-cleared": return "The security chip was reset";
+        case "tpm-cleared": return "The security chip refused the keys";
         case "damaged": return "Pear Passwords can't read its data";
         }
         return "";
@@ -4133,14 +4133,18 @@ ShellRoot {
             return "The security chip (PTT) is switched off. Turn it back on in the BIOS and your "
                  + "passwords come back.";
         case "tpm-cleared":
-            return "The security chip was reset, so the keys can't be recovered. Starting over makes new keys "
+            return "A working security chip refused the keys: it was most likely reset (\"Clear TPM\") or "
+                 + "replaced, and then the keys can't be recovered. If you changed nothing, try again after "
+                 + "a restart first. Starting over makes new keys "
                  + "and signs you in to iCloud again. If this computer's place in your keychain was lost too, "
                  + "that needs your Apple Account password, a verification code and one device-passcode attempt "
                  + "(out of about 10). Local password history and nicknames are lost.";
         case "damaged":
-            return "The keys opened but the stored data didn't check out. Nothing has been deleted; the files "
-                 + "are kept for diagnosis. Starting over moves them aside, makes new keys and signs you in to "
-                 + "iCloud again. Local password history and nicknames are lost.";
+            return "Pear's keys or its stored data no longer open on this computer. Nothing has been deleted; "
+                 + "the files are kept for diagnosis. Starting over moves them aside, makes new keys and signs "
+                 + "you in to iCloud again. If this computer's place in your keychain was lost too, that needs "
+                 + "your Apple Account password, a verification code and one device-passcode attempt (out of "
+                 + "about 10). Local password history and nicknames are lost.";
         }
         return "";
     }

@@ -61,7 +61,7 @@ Per user, in `/var/lib/pear-passwords/u<uid>/` (0700 `pear-passwords`; your uid 
 
 | File | What it is |
 |---|---|
-| `keys/list.cred` | `RK_list`, 32 random bytes, sealed by `systemd-creds --user` under uid `pear-passwords`, `--with-key=auto --tpm2-pcrs= --tpm2-public-key=` |
+| `keys/list.cred` | `RK_list`, 32 random bytes, sealed by `systemd-creds --user` under uid `pear-passwords`. In uid scope the request goes through systemd's credentials service, which takes no PCR, public-key or (on systemd 261) key-type choice, so it always uses `auto`: host key, plus TPM2 when one is usable, no PCRs. Pear reads the key type back from the credential header and records that; it refuses an unscoped, TPM-only, null or public-key-bound blob, and seals nothing with a TPM while a `tpm2-pcr-public-key.pem` exists (that would bind the keys to a signed PCR policy) |
 | `keys/secret.cred` | `SK_secret`, the X25519 private key that opens entries, sealed the same way |
 | `keys/secret.pub` | `PK_secret` plus a MAC under the metadata key, so it cannot be swapped |
 | `meta.v2`, `aliases.v2`, `nicknames.v2`, `session.v2` | XChaCha20-Poly1305 under subkeys of `RK_list` (HKDF-SHA256), with the file kind, uid and name in the associated data |
@@ -77,14 +77,21 @@ Per user, in `/var/lib/pear-passwords/u<uid>/` (0700 `pear-passwords`; your uid 
   `test_grants.py`, `test_logind_lock.py`.
 - Re-sealing to host+TPM2 happens at the first unlock after a TPM appears; the old blobs stay
   as `*.prev` until the next successful unlock, and a missing TPM is told apart from a cleared
-  one. Tests: `test_seal_reseal.py`.
+  one. A cleared TPM is recognised by its storage key fingerprint where systemd-tpm2-setup
+  writes one (measured, UKI boots); on other boots (Limine or GRUB without a UKI) a working
+  TPM that refuses the keys is reported as `tpm-cleared` too, with "most likely" wording. A
+  failure of the mechanism itself (the credentials service unreachable, a busy or locked-out
+  TPM) is transient and never becomes a seal state: a non-zero exit counts as a refusal only
+  when a throwaway value still round-trips. Tests: `test_seal_reseal.py`,
+  `test_seal_service.py`.
 
 ## 3. Peer verification
 
 On every accept the daemon reads `SO_PEERCRED` (gid must be `pear-client`, uid at least
 1000), takes `SO_PEERPIDFD` for the life of the connection, checks `/proc/<pid>/status`
 (real gid = the user's, effective = `pear-client`, real = effective uid), records the start
-time and confirms the pid with `pidfd_send_signal(pidfd, 0)`. One `ui` connection per uid;
+time and confirms the pid is still that process by polling the pidfd (it turns readable when
+the process exits; a signal 0 would be EPERM for another uid's process). One `ui` connection per uid;
 `clip` and `migrate` need a single-use ticket issued on that uid's UI connection within 10 s,
 and must be children of that UI process. Tests: `test_daemon_peer.py`, `test_tickets.py`,
 `test_protocol_limits.py`.
