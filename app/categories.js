@@ -48,7 +48,9 @@ function fold(t) {
 // and, finally, to the daemon, which checks every tag again.
 function canonTag(raw) {
     const t = String(raw).replace(/^#/, "").normalize("NFC").toLowerCase();
-    if (t.length < 1 || t.length > MAX_TAG_LEN) return "";
+    // Code points, as the daemon's len() counts them, not UTF-16 units.
+    const n = [...t].length;
+    if (n < 1 || n > MAX_TAG_LEN) return "";
     if (/[\s#:,\u0000-\u001f\u007f-\u009f]/.test(t)) return "";
     return t;
 }

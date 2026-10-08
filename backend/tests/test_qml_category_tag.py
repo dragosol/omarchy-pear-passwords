@@ -198,12 +198,27 @@ class TagsRowTests(unittest.TestCase):
     def test_the_editor_says_tags_are_not_secret(self):
         editor = CODE[CODE.index("visible: root.tagEditing\n"):]
         editor = editor[:editor.index("visible: root.changing || root.confirming")]
-        sentence = ('"Whatever is on a note\'s final Tags: line is list metadata, not a secret: it is "\n'
-                    '                                          + "visible to anyone who passes the first '
-                    'dialog, like titles and usernames. "\n'
-                    '                                          + "Do not put secrets on that line."')
+        # The owner's short form; docs/security.md keeps the full sentence (test_docs_claims).
+        sentence = ('text: "Tags show after the first unlock, like names and usernames \u2014 '
+                    'don\'t put secrets in them."')
         self.assertIn(sentence, editor)
-        self.assertIn("color: Theme.dim", editor[editor.index("Whatever is on"):][:400])
+        self.assertIn("color: Theme.dim", editor[editor.index("Tags show after"):][:300])
+
+    def test_the_create_form_says_why_tags_stop_add(self):
+        hint = CODE[CODE.index("text: root.tagsProblem(crTags.text)") - 300:][:600]
+        self.assertIn("visible: root.createMore && text !== \"\"", hint)
+        self.assertIn("Layout.row: 9; Layout.column: 1", hint)
+        body = function_body("tagsProblem")
+        self.assertIn('"a tag is 1 to 32 letters, digits, - or _"', body)
+        self.assertIn('"at most 16 tags"', body)
+
+    def test_the_detail_tags_wrap_and_are_never_cut(self):
+        flow = element_of("chipFlow")
+        self.assertIn("Layout.fillWidth: true", flow)
+        self.assertNotIn("clip:", flow)
+        self.assertIn("implicitHeight: chipFlow.visible ? Math.max(48, chipFlow.implicitHeight + 22) : 48",
+                      CODE)
+        self.assertRegex(CODE[CODE.rfind("{", 0, CODE.index("id: chipFlow")) - 8:], r"^\s*Flow \{")
 
     def test_the_tag_field_takes_the_grammars_characters_only(self):
         field = element_of("tagInput")
@@ -741,6 +756,10 @@ Item {
             compare(Cat.canonTag("##a"), "");
             compare(Cat.canonTag("x".repeat(32)), "x".repeat(32));
             compare(Cat.canonTag("x".repeat(33)), "");
+            // Code points, as the daemon counts them: 20 Deseret letters are 40 UTF-16 units.
+            compare(Cat.canonTag("\\ud801\\udc28".repeat(20)), "\\ud801\\udc28".repeat(20));
+            compare(Cat.canonTag("\\ud801\\udc28".repeat(32)).length, 64);
+            compare(Cat.canonTag("\\ud801\\udc28".repeat(33)), "");
             compare(Cat.fold("Stra\\u00dfe"), Cat.fold("STRASSE"));
             compare(Cat.fold("\\uff57\\uff4f\\uff52\\uff4b"), "work");
         }
@@ -755,13 +774,15 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             shutil.copy(SEARCH_QML, d)
             shutil.copy(CATS_JS, d)
+            shutil.copy(os.path.join(qmlscan.APP, "AppScrollBar.qml"), d)
             with open(os.path.join(d, "Theme.qml"), "w") as f:
                 f.write(THEME)
             with open(os.path.join(d, "qmldir"), "w") as f:
-                f.write("singleton Theme 1.0 Theme.qml\nCategorySearch 1.0 CategorySearch.qml\n")
+                f.write("singleton Theme 1.0 Theme.qml\nCategorySearch 1.0 CategorySearch.qml\n"
+                        "AppScrollBar 1.0 AppScrollBar.qml\n")
             path = os.path.join(d, "tst_categorytag.qml")
             with open(path, "w") as f:
-                f.write(TEST_QML % {"fixture": FIXTURE})
+                f.write(TEST_QML.replace("%(fixture)s", FIXTURE))
             env = {"PATH": "/usr/bin", "QT_QPA_PLATFORM": "offscreen", "HOME": d,
                    "XDG_RUNTIME_DIR": d, "QT_QUICK_CONTROLS_STYLE": "Basic"}
             r = subprocess.run([QMLTESTRUNNER, "-input", path], capture_output=True, text=True,
@@ -899,7 +920,8 @@ class TagEditorRuntimeTests(unittest.TestCase):
 
     def test_the_tag_field(self):
         funcs = "\n    ".join(function_text(n) for n in
-                              ("commitTagInput", "removeDraftTag", "saveTags", "closeTagEditor"))
+                              ("commitTagInput", "removeDraftTag", "saveTags", "closeTagEditor",
+                               "parseTags", "tagsProblem"))
         m = re.search(r"\bid: tagInput\n", CODE)
         start = CODE.rfind("{", 0, m.start())
         field = "TextInput " + qmlscan.element_body(CODE, start)
@@ -918,6 +940,7 @@ class TagEditorRuntimeTests(unittest.TestCase):
                                timeout=120, env=env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("PASS   : qmltestrunner::TagEditor::test_editor()", r.stdout)
+        self.assertIn("PASS   : qmltestrunner::TagEditor::test_create_form_tags_problem()", r.stdout)
 
 
 if __name__ == "__main__":

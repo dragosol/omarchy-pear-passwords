@@ -1814,6 +1814,13 @@ ShellRoot {
         }
         return out.length > 16 ? null : out;
     }
+    // What is wrong with the create form's Tags text, in commitTagInput's words; "" when nothing.
+    function tagsProblem(text) {
+        if (String(text).trim() === "" || root.parseTags(text) !== null) return "";
+        for (const raw of String(text).split(/[\s,]+/))
+            if (raw !== "" && raw !== "#" && !Cat.canonTag(raw)) return "a tag is 1 to 32 letters, digits, - or _";
+        return "at most 16 tags";
+    }
     function removeDraftTag(i) {
         const d = root.tagDraft.slice();
         d.splice(i, 1);
@@ -2643,7 +2650,8 @@ ShellRoot {
                                     required property int index
                                     readonly property bool keyed: root.fieldFocused(index)
                                     Layout.fillWidth: true
-                                    implicitHeight: 48
+                                    // Grows with the tag chips when they wrap onto more lines.
+                                    implicitHeight: chipFlow.visible ? Math.max(48, chipFlow.implicitHeight + 22) : 48
 
                                     HoverHandler { id: hRow }
                                     Rectangle {
@@ -2692,32 +2700,29 @@ ShellRoot {
                                             font.pixelSize: Theme.fBody
                                             elide: Text.ElideRight
                                         }
-                                        // Tags as chips, the way the search field shows one.
-                                        Item {
+                                        // Tags as chips, the way the search field shows one. They wrap
+                                        // onto more lines (up to 16 tags): none is ever cut off.
+                                        Flow {
+                                            id: chipFlow
                                             visible: !!frow.modelData.chips && frow.modelData.chips.length > 0
                                             Layout.fillWidth: true
-                                            implicitHeight: 26
-                                            clip: true
-                                            Row {
-                                                anchors.verticalCenter: parent.verticalCenter
-                                                spacing: 6
-                                                Repeater {
-                                                    model: frow.modelData.chips || []
-                                                    delegate: Rectangle {
-                                                        required property var modelData
-                                                        width: tagChip.implicitWidth + 16
-                                                        height: tagChip.implicitHeight + 6
-                                                        radius: 9
-                                                        color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
-                                                        Text {
-                                                            id: tagChip
-                                                            textFormat: Text.PlainText
-                                                            anchors.centerIn: parent
-                                                            text: "#" + modelData
-                                                            color: Theme.fg
-                                                            font.family: Theme.uiFont
-                                                            font.pixelSize: Theme.fBody - 1
-                                                        }
+                                            spacing: 6
+                                            Repeater {
+                                                model: frow.modelData.chips || []
+                                                delegate: Rectangle {
+                                                    required property var modelData
+                                                    width: tagChip.implicitWidth + 16
+                                                    height: tagChip.implicitHeight + 6
+                                                    radius: 9
+                                                    color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
+                                                    Text {
+                                                        id: tagChip
+                                                        textFormat: Text.PlainText
+                                                        anchors.centerIn: parent
+                                                        text: "#" + modelData
+                                                        color: Theme.fg
+                                                        font.family: Theme.uiFont
+                                                        font.pixelSize: Theme.fBody - 1
                                                     }
                                                 }
                                             }
@@ -2882,13 +2887,11 @@ ShellRoot {
                                         }
                                     }
                                 }
-                                // The same words as docs/security.md 2: what a tag is not.
+                                // What a tag is not, in short: docs/security.md 2 has the full sentence.
                                 Text {
                                     textFormat: Text.PlainText
                                     Layout.fillWidth: true
-                                    text: "Whatever is on a note's final Tags: line is list metadata, not a secret: it is "
-                                          + "visible to anyone who passes the first dialog, like titles and usernames. "
-                                          + "Do not put secrets on that line."
+                                    text: "Tags show after the first unlock, like names and usernames — don't put secrets in them."
                                     color: Theme.dim
                                     font.family: Theme.uiFont
                                     font.pixelSize: Theme.fSmall
@@ -3679,6 +3682,15 @@ ShellRoot {
                             placeholderText: "work family (optional)"
                             // The grammar's characters, and the spaces, commas and '#' between tags.
                             validator: RegularExpressionValidator { regularExpression: /^[#\p{L}\p{M}\p{N}_, -]*$/ }
+                        }
+                        // Why Add is off when the Tags field is what stops it: the chip editor's words.
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.row: 9; Layout.column: 1; Layout.fillWidth: true
+                            visible: root.createMore && text !== ""
+                            text: root.tagsProblem(crTags.text)
+                            color: Theme.danger; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall
+                            wrapMode: Text.Wrap
                         }
                     }
 
