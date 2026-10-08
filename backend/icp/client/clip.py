@@ -9,24 +9,35 @@ The rules, in the order a request meets them:
 
 1. `x-kde-passwordManagerHint` (offered only for a sensitive value) is always served the word
    `secret`, which asks history managers not to keep the entry.
-2. Every other request hands over a pipe. The process(es) at the other end are found in /proc.
-   If every one of them is a known clipboard-history watcher (watchers.py), the pipe is closed
-   unwritten and the request does not count.
-3. Anything else, including a live reader that cannot be identified, gets the value and is
-   the one paste - but only once the value was actually delivered. A pipe nobody holds any
-   more (a history watcher's child that exited without reading, faster than the /proc scan)
-   is not a paste, and neither is a write that hit EPIPE: the offer stays up for the real one. For CLIP_REREQUEST_GRACE_S afterwards the same set of holder processes may ask again
-   (XWayland and some toolkits read twice); nobody else gets anything. Then the source is
-   destroyed.
+2. Every other request hands over a pipe. The process(es) at the other end are found in /proc,
+   among this user's processes whose /proc/<pid>/fd can be read.
+   - If none is found there, the request is refused: the pipe is closed unwritten, it does not
+     count, and the offer stays up. That covers a pipe nobody holds any more (a history
+     watcher's child that exited without reading, faster than the scan) and a reader that
+     cannot be inspected: a non-dumpable process, Pear's own window first of all. The window
+     is set-gid and non-dumpable, and Qt Quick reads the clipboard text itself the moment the
+     selection changes (every editable TextField re-checks "can paste"); counting that read
+     took the one paste before the user pasted anything. So a copied secret cannot be pasted
+     into a non-dumpable program, Pear's window included, and an unidentifiable reader gets
+     nothing.
+   - If every holder is a known clipboard-history watcher (watchers.py), the request is
+     refused the same way and does not count.
+3. Any other identified reader gets the value and is the one paste - but only once the value
+   was actually delivered: a write that hit EPIPE, or took no byte, is not a paste and the
+   offer stays up for the real one. For CLIP_REREQUEST_GRACE_S afterwards the same set of
+   holder processes may ask again (XWayland and some toolkits read twice); nobody else gets
+   anything. Then the source is destroyed.
 4. With no paste by `timeout` seconds the source is destroyed. Destroying a source clears the
    clipboard only if it is still the selection: a copy you made since is never touched, and
    set_selection(null) is never sent.
 
 Gate G5 decides rule 2. If the VM shows that /proc/<pid>/fd cannot be read from this set-gid
 process, the release flips READER_POLICY to "timing" (spec section 1.4, proposal 2's fallback,
-explicitly weaker): nobody is identified, the requests in the first WATCHER_WINDOW_S after the
-offer goes up are taken to be the history watcher (which reads the moment the selection
-changes) and get nothing, and the first request after that is the paste. A switch in this
+explicitly weaker): nobody is identified, so rule 2's refusal of unidentified readers cannot
+apply (nothing could ever be pasted). Instead the requests in the first WATCHER_WINDOW_S after
+the offer goes up are taken to be the history watcher and Pear's own window (both read the
+moment the selection changes) and get nothing, and the first request after that is the paste,
+whoever makes it - including the window re-reading when it gets focus back. A switch in this
 root-owned file, not the environment, because pear-exec passes no environment through.
 
 The outcome goes back to the daemon (`clip-result`), which tells the window. The window also
@@ -90,6 +101,8 @@ def _set_fsgid(gid: int) -> None:
 
 def pipe_holders(fd: int, exclude: set, proc: str = "/proc") -> set:
     """Pids of our own uid's processes that hold the pipe behind `fd` (either end).
+    A process whose /proc/<pid>/fd cannot be read (non-dumpable: its /proc entry is owned by
+    root, or the listing is EACCES) is skipped, so a pipe only it holds has no holder here.
 
     /proc/<pid>/fd is checked against our fs credentials, and our fsgid is pear-client, which
     no user process has. For the scan only, the fsgid drops to our real gid, so the access
@@ -178,6 +191,7 @@ class Offer:
     served: int = 0                         # writes of the value
     refused_watchers: int = 0
     refused_others: int = 0
+    refused_unknown: int = 0                # live readers nobody could identify
     offered: bool = False                   # the compositor answered after set_selection
     error: str = ""                         # why it failed, for the window (never the value)
     log: list = field(default_factory=list)  # (mime, verdict) - never the value
@@ -199,12 +213,18 @@ class Offer:
                 return
             readers = self.identify(fd)
             if not readers.pids and self.watcher_window == 0.0:
-                # Nobody seen: maybe a reader forked after the scan listed /proc. Look again;
-                # if the pipe has no reader left at all, this was no paste.
+                # Nobody seen: maybe a reader forked after the scan listed /proc. Look again.
+                # Still nobody: either the pipe has no reader left, or its reader cannot be
+                # inspected (non-dumpable, such as Pear's own window re-checking "can paste").
+                # Neither gets a byte, and neither is the paste: the offer stays up.
                 readers = self.identify(fd)
-                if not readers.pids and _reader_gone(fd):
-                    self.refused_watchers += 1
-                    self.log.append((mime, "gone"))
+                if not readers.pids:
+                    if _reader_gone(fd):
+                        self.refused_watchers += 1
+                        self.log.append((mime, "gone"))
+                    else:
+                        self.refused_unknown += 1
+                        self.log.append((mime, "unidentified"))
                     return
             if self.pasted_at is not None:
                 # Only the paste that already happened may ask again, and only briefly.

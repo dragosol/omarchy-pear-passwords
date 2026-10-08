@@ -78,12 +78,18 @@ a locked computer does not sync.
   `test_qml_grant_flow.py`, `test_qml_secret_copy.py`, `test_qml_no_atspi.py`,
   `test_pear_exec_env.py`.
 - **pear-clip** speaks the Wayland data-control protocol itself and holds the value in memory.
-  It identifies each reader by the pipe it hands over: Omarchy's history watcher gets nothing,
-  any other reader is the one counted paste (as soon as one byte of the value reaches its
-  pipe, so a reader that stalls part-way has used it up; a request whose pipe has no reader
-  left, or takes no byte, is not a paste), and the offer is withdrawn after that paste or
-  30 s. It never uses `wl-copy` (which stages its input in `/tmp`). Tests:
-  `test_clip_policy.py`, `test_repo_guards.py::ClipboardGuardTests`.
+  It identifies each reader by the pipe it hands over, looking for it among your processes
+  whose `/proc/<pid>/fd` it can read: Omarchy's history watcher gets nothing, any other
+  reader it finds is the one counted paste (as soon as one byte of the value reaches its
+  pipe, so a reader that stalls part-way has used it up; a write that takes no byte is not a
+  paste), and the offer is withdrawn after that paste or 30 s. A reader it cannot find gets
+  nothing and does not count: a pipe with no reader left, and any non-dumpable process,
+  whose fds it cannot list. Pear's own window is one (set-gid, non-dumpable), and Qt reads
+  the clipboard text the moment the selection changes to decide whether Paste is possible;
+  before this rule that read used up the one paste. The cost: **a copied secret cannot be
+  pasted into a non-dumpable program, Pear's own window included**, and an unidentifiable
+  reader gets nothing. It never uses `wl-copy` (which stages its input in `/tmp`). Tests:
+  `test_clip_policy.py` (including real non-dumpable readers), `test_repo_guards.py::ClipboardGuardTests`.
 
 ## 2. Key hierarchy
 

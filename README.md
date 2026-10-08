@@ -116,7 +116,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "27c38d21994a2af8cd748df0e6047cf8ac79214adc88583667fde250c9cc7832  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "899ac32af6bde3f2a41e44f36dceafb020e52293da1c2448bc5262af750813d7  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -314,8 +314,12 @@ What to know before you turn it on:
   or a setup key, which goes to the same writer with the same one paste or 30 seconds. Cut
   does nothing there, and the Apple ID password, Apple's code and the 1.x passphrase fields
   copy nothing at all.
-- While a copy is on offer, any program that can read your clipboard can read it. If one reads
-  it first, your own paste comes up empty, which at least tells you.
+- Pear gives the copy only to a program it can identify as your own: one whose open files
+  it can see. A program that hides them (a non-dumpable one, as some security-minded apps
+  are, and Pear's own window) gets nothing, and that does not use up the paste. So a
+  copied password cannot be pasted back into Pear itself, or into such a program.
+- While a copy is on offer, any other program that can read your clipboard can read it. If
+  one reads it first, your own paste comes up empty, which at least tells you.
 - Settings can check your clipboard history for passwords copied by older versions (it asks
   first and shows only a count) and points you at Omarchy's clipboard panel to remove them.
 

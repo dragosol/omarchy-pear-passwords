@@ -321,12 +321,20 @@ class ReaderRuleTests(unittest.TestCase):
         self.assertEqual([n for _, n, a in h.fc.names() if n == "destroy" and a == h.fc.source],
                          ["destroy"])
 
-    def test_unidentified_reader_is_counted(self):
-        # No holder could be seen (another uid, a process gone already): still the one paste.
+    def test_unidentified_reader_is_refused_and_not_counted(self):
+        # c-vm: Pear's own window (non-dumpable, so its fds cannot be listed) reads the offer
+        # through Qt's "can paste" check. A live reader nobody can identify gets nothing, and
+        # the offer stays up for the real paste.
         h = ClipHarness(self)
-        self.assertEqual(h.paste(set()), b"hunter2-secret")
+        self.assertEqual(h.paste(set()), b"")
+        self.assertEqual(h.offer.log[-1][1], "unidentified")
+        self.assertEqual(h.offer.refused_unknown, 1)
+        self.assertIsNone(h.offer.pasted_at)
+        self.assertEqual(h.offer.served, 0)
+        self.assertEqual(h.paste({200}), b"hunter2-secret")
+        self.assertEqual(h.paste(set()), b"")                  # not even inside the grace
         self.assertEqual(h.finish(), "pasted")
-        self.assertIsNotNone(h.offer.pasted_at)
+        self.assertEqual(h.offer.served, 1)
 
     def test_a_request_with_no_reader_left_is_not_the_paste(self):
         # clipboard_ui-1: the watcher's child exited before the /proc scan found it.
@@ -650,6 +658,128 @@ class ProcScanTests(unittest.TestCase):
         finally:
             os.close(w)
             child.wait(5)
+
+
+PR_SET_DUMPABLE = 4
+BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(clip.__file__))))
+
+# A reader that makes itself non-dumpable (like Pear's set-gid window), says so, then reads its
+# stdin (the paste pipe) to EOF and prints how many bytes it got.
+NON_DUMPABLE_READER = f"""
+import ctypes, sys
+assert ctypes.CDLL(None, use_errno=True).prctl({PR_SET_DUMPABLE}, 0, 0, 0, 0) == 0
+print("ready", flush=True)
+print(len(sys.stdin.buffer.read()), flush=True)
+"""
+ECHO_READER = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"
+
+# pear-clip's Offer with the real identifier, excluding only itself (as in production, where
+# the compositor is excluded too but the window, its parent, is not). One request per fd in
+# argv, each when a line arrives on stdin; prints [verdict, counted as the paste].
+CLIP_CHILD = """
+import json, os, sys
+from icp.client import clip
+offer = clip.Offer(bytearray(b"hunter2-secret"), True, 30.0, clip.make_identifier({os.getpid()}))
+offer.start()
+for fd in sys.argv[1:]:
+    sys.stdin.readline()
+    offer.on_send("text/plain;charset=utf-8", int(fd))
+    print(json.dumps([offer.log[-1][1], offer.pasted_at is not None]), flush=True)
+"""
+
+# The window-like process: non-dumpable, it starts the clip as its own child and holds the read
+# end of the first request itself. Then an ordinary process pastes, then another. Prints JSON.
+WINDOW = f"""
+import ctypes, json, os, subprocess, sys
+assert ctypes.CDLL(None, use_errno=True).prctl({PR_SET_DUMPABLE}, 0, 0, 0, 0) == 0
+pipes = [os.pipe() for _ in range(3)]
+clip = subprocess.Popen([sys.executable, "-c", sys.argv[1]] + [str(w) for _, w in pipes],
+                        pass_fds=[w for _, w in pipes], stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, text=True)
+for _, w in pipes:
+    os.close(w)
+
+def step():
+    clip.stdin.write("go\\n")
+    clip.stdin.flush()
+    return json.loads(clip.stdout.readline())
+
+out = {{"window": step()}}
+got = b""
+while True:
+    b = os.read(pipes[0][0], 4096)
+    if not b:
+        break
+    got += b
+out["window_got"] = len(got)
+for name, (r, _) in (("paste", pipes[1]), ("second", pipes[2])):
+    reader = subprocess.Popen([sys.executable, "-c", {ECHO_READER!r}], stdin=r,
+                              stdout=subprocess.PIPE)
+    os.close(r)
+    out[name] = step()
+    out[name + "_got"] = reader.communicate(timeout=10)[0].decode()
+clip.stdin.close()
+clip.wait(10)
+print(json.dumps(out))
+"""
+
+
+class NonDumpableReaderTests(unittest.TestCase):
+    """c-vm "the window takes the one paste itself": real processes and the real /proc scan.
+    A non-dumpable holder's fds cannot be listed, so it is never identified."""
+
+    def reader(self, src, r):
+        p = subprocess.Popen([sys.executable, "-c", src], stdin=r, stdout=subprocess.PIPE)
+        os.close(r)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        return p
+
+    def send(self, h, w):
+        n = len(h.offer.log)
+        h.fc._event(h.fc.source, 0, _string("text/plain;charset=utf-8"), fd=w)
+        os.close(w)
+        deadline = time.monotonic() + 5
+        while len(h.offer.log) == n:
+            self.assertLess(time.monotonic(), deadline, "the request was never handled")
+            time.sleep(0.01)
+        return h.offer.log[-1][1]
+
+    def test_a_non_dumpable_child_gets_nothing_and_does_not_use_the_paste(self):
+        h = ClipHarness(self, timeout=10, grace=0.5)
+        h.offer.identify = clip.make_identifier({os.getpid()})
+        r, w = os.pipe()
+        hidden = self.reader(NON_DUMPABLE_READER, r)
+        self.assertEqual(hidden.stdout.readline().strip(), b"ready")
+        self.assertEqual(self.send(h, w), "unidentified")
+        self.assertEqual(hidden.communicate(timeout=10)[0].strip(), b"0")
+        self.assertIsNone(h.offer.pasted_at)
+        self.assertEqual(h.offer.served, 0)
+        # An ordinary process pasting afterwards gets the value...
+        r, w = os.pipe()
+        paste = self.reader(ECHO_READER, r)
+        self.assertEqual(self.send(h, w), "pasted")
+        self.assertEqual(paste.communicate(timeout=10)[0], b"hunter2-secret")
+        # ...and a second paste gets nothing.
+        r, w = os.pipe()
+        second = self.reader(ECHO_READER, r)
+        self.assertEqual(self.send(h, w), "refused")
+        self.assertEqual(second.communicate(timeout=10)[0], b"")
+        self.assertEqual(h.finish(), "pasted")
+        self.assertEqual(h.offer.served, 1)
+        self.assertEqual(h.offer.refused_unknown, 1)
+
+    def test_the_non_dumpable_parent_of_the_clip_gets_nothing(self):
+        env = dict(os.environ, PYTHONPATH=BACKEND, PYTHONDONTWRITEBYTECODE="1")
+        done = subprocess.run([sys.executable, "-c", WINDOW, CLIP_CHILD], env=env,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout)
+        self.assertEqual(out["window"], ["unidentified", False])
+        self.assertEqual(out["window_got"], 0)
+        self.assertEqual(out["paste"], ["pasted", True])
+        self.assertEqual(out["paste_got"], "hunter2-secret")
+        self.assertEqual(out["second"], ["refused", True])
+        self.assertEqual(out["second_got"], "")
 
 
 class FakeDaemon:

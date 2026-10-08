@@ -3,7 +3,9 @@
 A Wayland clipboard has no idea who asks for its contents; the compositor just hands the offer
 a pipe. pear-clip finds out by looking for the other end of that pipe in /proc (spec gate G5)
 and then asks this module whether every process holding it is a history watcher. Those get
-nothing and do not count as the one paste; anything else does.
+nothing and do not count as the one paste; any other identified reader does. A reader that
+cannot be found at all (gone, or non-dumpable like Pear's own window) also gets nothing and
+does not count; that rule lives in clip.py.
 
 The list is deliberately short and matched on the whole command line:
 
