@@ -598,6 +598,12 @@ Item {
             keyClick(Qt.Key_Backspace);                // a selection: default Backspace
             compare(search.text, "b");
             verify(host.catTag !== null);
+            search.text = "ab";
+            search.select(1, 0);                       // a selection with the caret at 0
+            compare(search.cursorPosition, 0);
+            keyClick(Qt.Key_Backspace);                // still the selection that goes
+            compare(search.text, "b");
+            verify(host.catTag !== null);
         }
 
         // ---- the tags grammar the window's editor uses
