@@ -38,7 +38,8 @@ import sys
 from typing import Callable
 
 from ..daemon import paths as system_paths
-from .seal import SYSTEMD_CREDS, TIMEOUT_S, _CHILD_ENV, _why
+from .seal import (SYSTEM_ALLOWED, SYSTEMD_CREDS, TIMEOUT_S, _CHILD_ENV, SealRefused,
+                   _why, allowed_key_type)
 
 NAME_RE = re.compile(r"pear\.(list|secret)\.u[0-9]{1,10}")
 MAX_REQUEST = 256 * 1024            # a sealed 32-byte key is well under 4 KiB; this is slack
@@ -108,6 +109,16 @@ def handle(line: bytes, run: Runner = _run) -> dict:
         if op == "decrypt" and rc != 0:
             return {"error": "refused", "detail": _why(err)}
         return {"error": "internal", "detail": f"systemd-creds {op} failed ({_why(err)})"}
+    if op == "encrypt":
+        # The same allowlist as the daemon's: exactly the key type asked for, from the types
+        # confirmed on a real TPM. Anything else is never handed out.
+        try:
+            got = allowed_key_type(out, SYSTEM_ALLOWED)
+        except SealRefused as e:
+            return {"error": "internal", "detail": str(e)[:200]}
+        if got != with_key:
+            return {"error": "internal",
+                    "detail": f"sealed as {got}, not the {with_key} that was asked for"}
     return {"b64": base64.b64encode(out).decode()}
 
 

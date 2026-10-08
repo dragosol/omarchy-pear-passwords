@@ -726,6 +726,7 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
 | `tpm-cleared` | see section 4.1 |
 | `damaged` | see section 4.1 |
 | `seal-unavailable` | `systemd-creds` (or the G1 seal service) could not run at all; transient, never a seal state; try again |
+| `seal-refused` | sealing ran but bound the keys to something Pear refuses, so nothing was kept: `reason` is `pcr-policy` (a `tpm2-pcr-public-key.pem` exists, so systemd binds new keys to a signed PCR policy) or `key-type` (a credential key type not on the allowlist confirmed on a real TPM). Not transient and not a seal state |
 | `dismissed` | the user closed the dialog |
 | `denied` | polkit refused (wrong password, failed fingerprint, policy) |
 | `no-agent` | no polkit agent; not counted against the rate limit |

@@ -167,6 +167,8 @@ ERRORS: dict[str, str] = {
     "tpm-cleared": "seal state",
     "damaged": "seal state",
     "seal-unavailable": "systemd-creds or the seal service could not run; transient, retry",
+    "seal-refused": "sealing bound the keys to a signed PCR policy or an unknown key type; "
+                    "nothing kept; 'reason' is pcr-policy or key-type",
     # prompts
     "dismissed": "the user closed the polkit dialog",
     "denied": "polkit said no (wrong password, fingerprint failure, policy)",

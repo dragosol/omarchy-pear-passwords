@@ -112,7 +112,11 @@ def _store_error(e: BaseException) -> OpError | None:
         return OpError("not-found")
     if isinstance(e, vstore.SealError):
         return OpError(e.kind)
-    from ..vstore.seal import SealUnavailable
+    from ..vstore.seal import SealRefused, SealUnavailable
+    if isinstance(e, SealRefused):
+        # Sealing worked but bound the keys to something Pear refuses (a signed PCR policy,
+        # or a key type it does not know). Not transient: the window says what it is.
+        return OpError("seal-refused", reason=e.reason)
     if isinstance(e, SealUnavailable):
         # systemd-creds (or the seal service) could not run at all: says nothing about the
         # blobs, so it is never reported as a seal state. Try again later.

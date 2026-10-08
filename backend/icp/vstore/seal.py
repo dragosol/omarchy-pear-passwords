@@ -22,8 +22,10 @@ fallback, another kernel). So:
   reason): no store is created and no re-seal happens until the PEM is gone or the root seal
   service is selected (docs/security.md, G1);
 - after sealing, the credential header's key type is read back (`key_type`), and that - not
-  a probe - is what keys.json records; an unscoped, null, TPM-only or public-key-bound type
-  is refused.
+  a probe - is what keys.json records. It is an allowlist: the scoped host type, and the
+  scoped host+TPM2 type of systemd 261 and of 262, each confirmed by a real encryption on the
+  gate VM. Every other type (unscoped, null, TPM-only, public-key-bound, or one a later
+  systemd introduces) is refused with SealRefused, which the window explains.
 
 Fallback (if G1 fails in the hardened unit): a root oneshot does system-scope sealing for the
 daemon over a socket (`SealServiceBackend`), where the flags do apply: it runs
@@ -71,13 +73,42 @@ PCR_PUBLIC_KEY_PATHS = ("/etc/systemd/tpm2-pcr-public-key.pem",
                         "/usr/local/lib/systemd/tpm2-pcr-public-key.pem",
                         "/usr/lib/systemd/tpm2-pcr-public-key.pem")
 
-# Credential key types (the sd_id128 at the start of a credential, systemd's creds-util.h).
-CRED_BY_HOST = bytes.fromhex("5a1c6a86df9d4096b1d5a65e0862f19a")          # system scope
-CRED_BY_HOST_SCOPED = bytes.fromhex("55b9ed1d38594d43a8319d2ebb332ac6")   # uid scope
-CRED_BY_HOST_AND_TPM2 = bytes.fromhex("93a894094874449090caf2fc93cab553")  # system scope
-CRED_BY_TPM2 = bytes.fromhex("0c7cc07b117645919c4b0bea08bc20fe")          # no host key
-CRED_BY_TPM2_WITH_PK = bytes.fromhex("faf7eb9341e3412ca1a436f95a29362f")  # signed PCR policy
+# Credential key types: the sd_id128 at the start of a credential. Every value below was
+# read from a real `systemd-creds encrypt` on the gate VM (Arch, OVMF, swtpm), under systemd
+# 261.2 and 262, with and without a TPM and with a tpm2-pcr-public-key.pem in place
+# (docs/security.md section 8). systemd 262 gave its TPM2 types new ids; the host-only ones
+# did not change. ONLY the types in the two ALLOWED tables are ever accepted: anything else -
+# a type a future systemd introduces, an unscoped, TPM-only, null or public-key-bound one - is
+# refused (SealRefused), never guessed at.
+CRED_BY_HOST = bytes.fromhex("5a1c6a86df9d4096b1d5a65e0862f19a")          # system, 261 + 262
+CRED_BY_HOST_SCOPED = bytes.fromhex("55b9ed1d38594d43a8319d2ebb332ac6")   # uid, 261 + 262
+CRED_BY_HOST_AND_TPM2 = bytes.fromhex("93a894094874449090caf2fc93cab553")  # system, 261
+CRED_BY_HOST_AND_TPM2_262 = bytes.fromhex("1414258818a240cd900bce862db5c7b9")  # system, 262
+CRED_BY_HOST_SCOPED_AND_TPM2 = bytes.fromhex("ef4ac13679a9480ea7db68897f9f165d")  # uid, 261
+CRED_BY_HOST_SCOPED_AND_TPM2_262 = bytes.fromhex("2a1f877a4275431ab3f9ed1f5d8f6601")  # uid, 262
+CRED_BY_TPM2 = bytes.fromhex("0c7cc07b117645919c4b0bea08bc20fe")          # no host key, 261
+CRED_BY_TPM2_262 = bytes.fromhex("d4062dfb71ad4c86804b40ef1180f1fc")      # no host key, 262
 CRED_BY_NULL = bytes.fromhex("058469daf6f54324800549da0f8ea2fb")          # no encryption
+# Bound to a signed PCR policy (a tpm2-pcr-public-key.pem): refused, and said so by name.
+CRED_BY_TPM2_WITH_PK = bytes.fromhex("faf7eb9341e3412ca1a436f95a29362f")             # 261
+CRED_BY_TPM2_WITH_PK_262 = bytes.fromhex("5e2d5c7603724eaf843c6fb5f64098f5")         # 262
+CRED_BY_HOST_AND_TPM2_WITH_PK = bytes.fromhex("af4950a849134eb1a73846304ff30c05")    # 261
+CRED_BY_HOST_AND_TPM2_WITH_PK_262 = bytes.fromhex("afbfeaaceb6a4a3795419d135c47f37b")  # 262
+CRED_BY_HOST_SCOPED_AND_TPM2_WITH_PK = bytes.fromhex("adbc4ca3efb64201ba881b6f2e4095ea")  # 261
+CRED_BY_HOST_SCOPED_AND_TPM2_WITH_PK_262 = bytes.fromhex(
+    "16e492949f94400286758f94b7c52bc7")                                             # 262
+
+# The allowlists. uid scope (SystemdCredsBackend), and system scope (the seal service).
+USER_ALLOWED = {CRED_BY_HOST_SCOPED: "host",
+                CRED_BY_HOST_SCOPED_AND_TPM2: "host+tpm2",
+                CRED_BY_HOST_SCOPED_AND_TPM2_262: "host+tpm2"}
+SYSTEM_ALLOWED = {CRED_BY_HOST: "host",
+                  CRED_BY_HOST_AND_TPM2: "host+tpm2",
+                  CRED_BY_HOST_AND_TPM2_262: "host+tpm2"}
+PK_BOUND = frozenset({CRED_BY_TPM2_WITH_PK, CRED_BY_TPM2_WITH_PK_262,
+                      CRED_BY_HOST_AND_TPM2_WITH_PK, CRED_BY_HOST_AND_TPM2_WITH_PK_262,
+                      CRED_BY_HOST_SCOPED_AND_TPM2_WITH_PK,
+                      CRED_BY_HOST_SCOPED_AND_TPM2_WITH_PK_262})
 
 # stderr of a mechanism failure, not a refusal of the blob (lowercase).
 _TRANSIENT = ("failed to connect to io.systemd.credentials", "varlink", "connection refused",
@@ -93,6 +124,31 @@ _CHILD_ENV = {"PATH": "/usr/bin", "LANG": "C.UTF-8", "SYSTEMD_LOG_LEVEL": "warni
 class SealUnavailable(StoreError):
     """The sealing mechanism itself could not run (binary missing, timeout, service down).
     Transient: it says nothing about the blobs, so it never becomes a seal state."""
+
+
+class SealRefused(SealUnavailable):
+    """systemd-creds ran and sealed, but to something Pear does not accept: `reason` is
+    "pcr-policy" (bound to a signed PCR policy, because a tpm2-pcr-public-key.pem exists) or
+    "key-type" (any key type not in the allowlist). Nothing is kept. Not a seal state, and not
+    transient either: it repeats until the machine changes, so the window says what it is."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+
+
+def allowed_key_type(blob: bytes, allowed: dict) -> str:
+    """"host" or "host+tpm2" for a credential whose key type is in `allowed`; SealRefused
+    for every other type, named when it is a public-key-bound one."""
+    h = credential_header(blob)
+    kind = allowed.get(h) if len(h) == 16 else None
+    if kind is not None:
+        return kind
+    if h in PK_BOUND:
+        raise SealRefused("pcr-policy", f"systemd-creds bound the credential to a signed PCR "
+                                        f"policy (key type {h.hex()}); refused")
+    raise SealRefused("key-type", f"credential key type {h.hex() or 'none'} is not one Pear "
+                                  "accepts; refused")
 
 
 class UnsealRefused(Exception):
@@ -195,7 +251,8 @@ class SystemdCredsBackend:
         if self.tpm_present():
             pem = pcr_public_key_present()
             if pem:
-                raise SealUnavailable(
+                raise SealRefused(
+                    "pcr-policy",
                     f"{pem} exists: systemd-creds would bind the keys to a signed PCR policy, "
                     "and a boot without a matching signature could never open them")
         r = self._run(self.encrypt_argv(name), plaintext)
@@ -206,17 +263,9 @@ class SystemdCredsBackend:
         return r.stdout
 
     def key_type(self, blob: bytes) -> str:
-        """What a uid-scope blob is bound to, from its header: "host" or "host+tpm2"."""
-        h = credential_header(blob)
-        if h == CRED_BY_HOST_SCOPED:
-            return "host"
-        if h in (CRED_BY_HOST, CRED_BY_HOST_AND_TPM2, CRED_BY_TPM2, CRED_BY_TPM2_WITH_PK,
-                 CRED_BY_NULL) or len(h) != 16:
-            raise SealUnavailable(f"systemd-creds produced a credential of key type {h.hex()}, "
-                                  "not one bound to the host key and this uid")
-        if not self.tpm_present():
-            raise SealUnavailable(f"unknown credential key type {h.hex()} without a TPM")
-        return "host+tpm2"
+        """What a uid-scope blob is bound to, from its header: "host" or "host+tpm2", from
+        USER_ALLOWED only. Anything else raises SealRefused."""
+        return allowed_key_type(blob, USER_ALLOWED)
 
     def decrypt(self, name: str, blob: bytes) -> bytes:
         r = self._run(self.decrypt_argv(name), blob)
@@ -314,14 +363,9 @@ class SealServiceBackend:
         return self._call("decrypt", name, blob)
 
     def key_type(self, blob: bytes) -> str:
-        """What a system-scope blob is bound to, from its header."""
-        h = credential_header(blob)
-        if h == CRED_BY_HOST:
-            return "host"
-        if h in (CRED_BY_HOST_SCOPED, CRED_BY_TPM2, CRED_BY_TPM2_WITH_PK, CRED_BY_NULL) \
-                or len(h) != 16:
-            raise SealUnavailable(f"the seal service produced key type {h.hex()}")
-        return "host+tpm2"
+        """What a system-scope blob is bound to, from its header, from SYSTEM_ALLOWED only.
+        Anything else raises SealRefused."""
+        return allowed_key_type(blob, SYSTEM_ALLOWED)
 
     def tpm_present(self) -> bool:
         return tpm_present()

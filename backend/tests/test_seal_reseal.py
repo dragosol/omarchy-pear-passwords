@@ -110,11 +110,52 @@ class CommandLineTests(unittest.TestCase):
             self.head(bad)
             with self.assertRaises(seal.SealUnavailable, msg=bad.hex()):
                 b.encrypt("pear.list.u1000", b"k" * 32)
-        self.head(bytes.fromhex("af4950a849134eb1a73846304ff30c05"))   # a scoped TPM type
-        with self.assertRaises(seal.SealUnavailable):
-            b.encrypt("pear.list.u1000", b"k" * 32)           # ...but there is no TPM
         with mock.patch.object(seal, "tpm_present", return_value=True):
-            self.assertEqual(b.key_type(b.encrypt("pear.list.u1000", b"k" * 32)), "host+tpm2")
+            for good in (seal.CRED_BY_HOST_SCOPED_AND_TPM2, seal.CRED_BY_HOST_SCOPED_AND_TPM2_262):
+                self.head(good)
+                self.assertEqual(b.key_type(b.encrypt("pear.list.u1000", b"k" * 32)),
+                                 "host+tpm2")
+
+    def test_key_type_is_an_allowlist(self):
+        # audit: the user-scope key type was a deny-list, so any other id (including the
+        # public-key-bound ones) read as host+tpm2 when a TPM was present. Now only the ids
+        # confirmed on the swtpm VM (systemd 261.2 and 262) are accepted.
+        b = seal.SystemdCredsBackend()
+        ok = {"55b9ed1d38594d43a8319d2ebb332ac6": "host",
+              "ef4ac13679a9480ea7db68897f9f165d": "host+tpm2",        # 261, swtpm VM
+              "2a1f877a4275431ab3f9ed1f5d8f6601": "host+tpm2"}        # 262, swtpm VM
+        pk = ["adbc4ca3efb64201ba881b6f2e4095ea", "16e492949f94400286758f94b7c52bc7",
+              "af4950a849134eb1a73846304ff30c05", "afbfeaaceb6a4a3795419d135c47f37b",
+              "faf7eb9341e3412ca1a436f95a29362f", "5e2d5c7603724eaf843c6fb5f64098f5"]
+        unknown = ["a219cb0785b24c04b16d18cab9d2ee01",                  # in 261's table
+                   "93a894094874449090caf2fc93cab553",                  # system scope
+                   "1414258818a240cd900bce862db5c7b9", "d4062dfb71ad4c86804b40ef1180f1fc",
+                   "00" * 16, os.urandom(16).hex()]
+        with mock.patch.object(seal, "tpm_present", return_value=True):
+            for h, kind in ok.items():
+                self.assertEqual(b.key_type(base64.b64encode(bytes.fromhex(h) + b"x")), kind)
+            for h in pk:
+                with self.assertRaises(seal.SealRefused, msg=h) as cm:
+                    b.key_type(base64.b64encode(bytes.fromhex(h) + b"x"))
+                self.assertEqual(cm.exception.reason, "pcr-policy", h)
+            for h in unknown:
+                with self.assertRaises(seal.SealRefused, msg=h) as cm:
+                    b.key_type(base64.b64encode(bytes.fromhex(h) + b"x"))
+                self.assertEqual(cm.exception.reason, "key-type", h)
+            for short in (b"", b"abc"):
+                with self.assertRaises(seal.SealRefused):
+                    b.key_type(short)
+            # An unknown type straight from systemd-creds is refused at encrypt time.
+            self.head(bytes.fromhex(unknown[0]))
+            with self.assertRaises(seal.SealRefused):
+                b.encrypt("pear.list.u1000", b"k" * 32)
+
+    def test_a_refused_seal_is_reported_by_name(self):
+        from icp.daemon import handlers
+        e = handlers._store_error(seal.SealRefused("pcr-policy", "x"))
+        self.assertEqual((e.code, e.extra), ("seal-refused", {"reason": "pcr-policy"}))
+        e = handlers._store_error(seal.SealUnavailable("down"))
+        self.assertEqual(e.code, "seal-unavailable")
 
     def test_a_pcr_public_key_blocks_tpm_sealing(self):
         b = seal.SystemdCredsBackend()
@@ -122,9 +163,10 @@ class CommandLineTests(unittest.TestCase):
         pem.write_text("-----BEGIN PUBLIC KEY-----\n")
         with mock.patch.object(seal, "PCR_PUBLIC_KEY_PATHS", (str(pem),)):
             with mock.patch.object(seal, "tpm_present", return_value=True):
-                with self.assertRaises(seal.SealUnavailable) as cm:
+                with self.assertRaises(seal.SealRefused) as cm:
                     b.encrypt("pear.list.u1000", b"k" * 32)
                 self.assertIn(str(pem), str(cm.exception))
+                self.assertEqual(cm.exception.reason, "pcr-policy")
                 self.assertFalse(self.log.exists(), "systemd-creds ran anyway")
             # without a TPM, auto cannot use the public key: host sealing goes ahead
             self.assertEqual(b.key_type(b.encrypt("pear.list.u1000", b"k" * 32)), "host")

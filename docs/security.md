@@ -78,7 +78,7 @@ Per user, in `/var/lib/pear-passwords/u<uid>/` (0700 `pear-passwords`; your uid 
 
 | File | What it is |
 |---|---|
-| `keys/list.cred` | `RK_list`, 32 random bytes, sealed by `systemd-creds --user` under uid `pear-passwords`. In uid scope the request goes through systemd's credentials service, which takes no PCR, public-key or (on systemd 261) key-type choice, so it always uses `auto`: host key, plus TPM2 when one is usable, no PCRs. Pear reads the key type back from the credential header and records that; it refuses an unscoped, TPM-only, null or public-key-bound blob, and seals nothing with a TPM while a `tpm2-pcr-public-key.pem` exists (that would bind the keys to a signed PCR policy) |
+| `keys/list.cred` | `RK_list`, 32 random bytes, sealed by `systemd-creds --user` under uid `pear-passwords`. In uid scope the request goes through systemd's credentials service, which takes no PCR, public-key or (on systemd 261) key-type choice, so it always uses `auto`: host key, plus TPM2 when one is usable, no PCRs. Pear reads the key type back from the credential header and records that. It is an **allowlist** of the ids a real encryption produced on the gate VM (uid-scoped host `55b9ed1d…`, uid-scoped host+TPM2 `ef4ac136…` on systemd 261.2 and `2a1f877a…` on 262; the seal service: host `5a1c6a86…`, host+TPM2 `93a89409…` / `14142588…`); every other type is refused (`seal-refused`): a public-key-bound one by name (`pcr-policy`), anything else as `key-type`. With a TPM and a `tpm2-pcr-public-key.pem` nothing is sealed (that would bind the keys to a signed PCR policy): an existing host-sealed store stays host-sealed, and a new store cannot be created there |
 | `keys/secret.cred` | `SK_secret`, the X25519 private key that opens entries, sealed the same way |
 | `keys/secret.pub` | `PK_secret` plus a MAC under the metadata key, so it cannot be swapped |
 | `meta.v2`, `aliases.v2`, `nicknames.v2`, `session.v2` | XChaCha20-Poly1305 under subkeys of `RK_list` (HKDF-SHA256), with the file kind, uid and name in the associated data |
@@ -112,6 +112,7 @@ Per user, in `/var/lib/pear-passwords/u<uid>/` (0700 `pear-passwords`; your uid 
   failure of the mechanism itself (the credentials service unreachable, a busy or locked-out
   TPM) is transient and never becomes a seal state: a non-zero exit counts as a refusal only
   when a throwaway value still round-trips. Tests: `test_seal_reseal.py`,
+  `test_seal_reseal.py::CommandLineTests::test_key_type_is_an_allowlist`,
   `test_seal_service.py`.
 
 ## 3. Peer verification

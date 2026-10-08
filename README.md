@@ -107,7 +107,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "3376f91395e805cc01e3ac36c065fa6c82fa98589f85b238c8571692cffa983e  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "a323966da90621e0df44fa351dc19b4c0b7d47c96750a1ca43ea87cc5e09a6f5  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -322,8 +322,21 @@ the firmware must boot in UEFI mode, which exposes the TPM to Linux).
 The next unlock after you turn PTT on moves the vault to **new** keys sealed with the TPM, with
 no action from you: everything is re-encrypted, checked to read back, swapped in at once, and
 the old keys are deleted. No PCRs and no TPM PIN are used, so firmware, bootloader and kernel
-updates never lock you out. (If a `tpm2-pcr-public-key.pem` exists, as with a signed UKI,
-`systemd-creds` would tie the keys to it; Pear then keeps host sealing rather than risk that.)
+updates never lock you out.
+
+Pear checks what every new key blob is actually sealed to and accepts only the key types it
+has seen a real TPM produce (systemd 261 and 262: host key, or host key plus TPM). Anything
+else is refused and nothing is saved:
+
+- **A `tpm2-pcr-public-key.pem`** (a signed UKI setup): with a TPM present, `systemd-creds`
+  would tie new keys to that signed boot policy, and a boot without a matching signature
+  (another kernel, a fallback entry) could never open them. Pear does not seal anything that
+  way. A vault that is already host-sealed stays host-sealed and keeps working. A **new**
+  vault (first setup, the move from 1.x, Start over) cannot be created on such a computer:
+  the window says "this computer has a signed boot policy" and nothing is saved. Removing the
+  PEM makes setup work.
+- **A key type Pear does not know** (a future systemd that changes them): the same refusal,
+  with its own message, until Pear is updated.
 
 **What turning PTT on buys:** a copy of the whole disk, or a backup of `/`, taken after the
 switch can no longer decrypt your passwords on another machine. Without it, the host key is in

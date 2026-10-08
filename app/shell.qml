@@ -969,6 +969,13 @@ ShellRoot {
         case "apple": return "iCloud refused it" + (d.detail ? ": " + d.detail : "");
         case "busy-sync": return "a sync is running — try again in a moment";
         case "seal-unavailable": return "the system key service didn't answer — try again in a moment";
+        case "seal-refused":
+            return d.reason === "pcr-policy"
+                ? "this computer has a signed boot policy (tpm2-pcr-public-key.pem), and systemd would tie new keys "
+                  + "to it, so a boot without that signature could never open them. Pear refuses: nothing was saved. "
+                  + "See \"TPM\" in the README"
+                : "systemd sealed the keys in a way Pear doesn't recognise, so nothing was saved. "
+                  + "See \"TPM\" in the README";
         case "migration-pending": return "the move from 1.x isn't finished — finish it or start fresh first";
         case "invalid": return "that " + (d.field || "value") + " isn't valid";
         case "dismissed": case "cancelled": return "cancelled";

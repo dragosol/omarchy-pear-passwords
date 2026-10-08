@@ -121,6 +121,33 @@ class RoundTripTests(ServiceCase):
             with self.assertRaises(seal.SealUnavailable):
                 client.key_type(base64.b64encode(bad + b"x"))
 
+    def test_system_key_type_is_an_allowlist(self):
+        # audit: the seal service's key type was a deny-list too.
+        client = seal.SealServiceBackend(self.path)
+        for h, kind in (("5a1c6a86df9d4096b1d5a65e0862f19a", "host"),
+                        ("93a894094874449090caf2fc93cab553", "host+tpm2"),      # 261
+                        ("1414258818a240cd900bce862db5c7b9", "host+tpm2")):     # 262
+            self.assertEqual(client.key_type(base64.b64encode(bytes.fromhex(h) + b"x")), kind)
+        for h in ("af4950a849134eb1a73846304ff30c05", "afbfeaaceb6a4a3795419d135c47f37b",
+                  "a219cb0785b24c04b16d18cab9d2ee01", "ef4ac13679a9480ea7db68897f9f165d",
+                  "d4062dfb71ad4c86804b40ef1180f1fc", "ff" * 16):
+            with self.assertRaises(seal.SealRefused, msg=h):
+                client.key_type(base64.b64encode(bytes.fromhex(h) + b"x"))
+
+    def test_the_root_side_never_hands_out_another_key_type(self):
+        def creds(head):
+            def run(argv, data):
+                return 0, base64.b64encode(head + b"blob"), b""
+            return run
+        req = json.dumps({"op": "encrypt", "name": "pear.list.u1000",
+                          "b64": base64.b64encode(b"k" * 32).decode(), "with": "host"}).encode()
+        for head in (seal.CRED_BY_HOST_AND_TPM2_WITH_PK, bytes.fromhex("a219cb0785b24c04b16d18cab9d2ee01"),
+                     seal.CRED_BY_HOST_AND_TPM2):           # the last: not what was asked
+            r = seal_service.handle(req, creds(head))
+            self.assertEqual(r.get("error"), "internal", head.hex())
+            self.assertNotIn("b64", r)
+        self.assertIn("b64", seal_service.handle(req, creds(seal.CRED_BY_HOST)))
+
     def test_with_is_only_a_key_type_and_only_for_encrypt(self):
         for req in ({"op": "encrypt", "name": "pear.list.u1", "b64": "eA==", "with": "auto"},
                     {"op": "encrypt", "name": "pear.list.u1", "b64": "eA==",
