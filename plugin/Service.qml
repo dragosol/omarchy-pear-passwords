@@ -6,62 +6,66 @@ import Quickshell.Io
 
 // Shell-side half of Pear Passwords.
 //
-// The app itself is NOT loaded into omarchy-shell. It runs as its own Quickshell process
-// (app/shell.qml), launched from its desktop entry, because plugins inside the shell share
-// one QML scene and can reach each other's objects - no place for decrypted passwords.
+// The app itself is NOT loaded into omarchy-shell. It runs as its own Quickshell process,
+// started by pear-exec from the root-owned copy in /usr/local/lib/pear-passwords/app, because
+// plugins inside the shell share one QML scene and can reach each other's objects - no place
+// for decrypted passwords. Nothing here copies QML anywhere or installs anything: since 2.0 the
+// window is installed by the system step, which needs sudo and so is never run from here.
 //
-// What this does is make `omarchy plugin add` produce something you can actually open. It
-// lays down the window and its launcher by running the repository's own installer in its
-// --app-only mode, which installs no virtualenv, no services and needs no privileges. The
-// backend is deliberately NOT installed here: the window asks before doing that, because
-// building it downloads pinned wheels and that should be a decision, not a side effect of
-// enabling a plugin.
+// What this does is tell you when that step is missing or out of date. pear-exec must exist,
+// be owned by root, belong to group pear-client and carry the set-gid bit (2755); without that
+// the window cannot reach its service. If the installed window differs from this checkout's,
+// an update is waiting for the same step.
 QtObject {
   id: root
 
-  readonly property string home: Quickshell.env("HOME")
-  readonly property string data: home + "/.local/share/pear-passwords"
+  readonly property string prefix: "/usr/local/lib/pear-passwords"
+  readonly property string pearExec: prefix + "/libexec/pear-exec"
   readonly property string checkout: decodeURIComponent(
       Qt.resolvedUrl("..").toString().replace(/^file:\/\//, "").replace(/\/$/, ""))
 
-  // The version this checkout is, so an update re-lays the window instead of leaving the old
-  // one in place. Written beside the installed copy by the provisioning run below.
-  readonly property string stamp: data + "/app/.plugin-version"
+  // "missing", "broken" (exists but not root:pear-client 2755), "outdated" or "ok";
+  // "" until the checks have run.
+  property string systemState: ""
+  readonly property string hint: systemState === "missing"
+      ? "Pear Passwords needs its one-time system step. Run ./install.sh in " + checkout
+        + ", then paste the command it prints."
+      : systemState === "broken"
+      ? "Pear Passwords' system step looks damaged (pear-exec is not root-owned and set-gid). "
+        + "Run ./install.sh in " + checkout + " and the command it prints again."
+      : systemState === "outdated"
+      ? "A Pear Passwords update is ready. Run ./install.sh in " + checkout
+        + ", then paste the command it prints."
+      : ""
 
-  property bool provisioning: false
-
-  // Is the installed window missing, or older than this checkout?
-  property Process check: Process {
-    command: ["sh", "-c",
-      "test -x " + root.data + "/app/launch.sh && " +
-      "test -f " + root.stamp + " && " +
-      "cmp -s " + root.stamp + " " + root.checkout + "/manifest.json"]
+  property Process ownership: Process {
+    command: ["stat", "-c", "%u %G %a", root.pearExec]
     running: true
-    onExited: function (code) {
-      if (code !== 0)
-        root.provision.running = true
-    }
-  }
-
-  // install.sh --app-only: copies app/, links Omarchy's Ui and Commons beside it so the
-  // window follows the theme, and writes the desktop entry. User-level, no sudo, no services.
-  property Process provision: Process {
-    running: false
-    command: [root.checkout + "/install.sh", "--app-only"]
-    onRunningChanged: root.provisioning = running
-    onExited: function (code) {
-      if (code === 0) {
-        root.stampIt.running = true
-        return
+    stdout: StdioCollector {
+      onStreamFinished: {
+        const t = this.text.trim();
+        if (t === "") { root.systemState = "missing"; root.tell(); return; }
+        if (t !== "0 pear-client 2755") { root.systemState = "broken"; root.tell(); return; }
+        root.compare.running = true;
       }
-      Quickshell.execDetached(["notify-send", "-a", "Pear Passwords",
-        "Pear Passwords could not finish setting up",
-        "Run ./install.sh in " + root.checkout + " to see what went wrong."])
     }
   }
 
-  property Process stampIt: Process {
+  // The installed window against this checkout's: a difference means the plugin was updated
+  // and the system step has not been re-run yet.
+  property Process compare: Process {
+    command: ["cmp", "-s", root.checkout + "/app/shell.qml", root.prefix + "/app/shell.qml"]
     running: false
-    command: ["cp", root.checkout + "/manifest.json", root.stamp]
+    onExited: function (code) {
+      root.systemState = code === 0 ? "ok" : "outdated";
+      root.tell();
+    }
+  }
+
+  function tell() {
+    if (hint === "") return;
+    Quickshell.execDetached(["notify-send", "-a", "Pear Passwords",
+      systemState === "outdated" ? "Pear Passwords update ready" : "Pear Passwords isn't set up yet",
+      hint]);
   }
 }

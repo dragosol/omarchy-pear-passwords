@@ -1,0 +1,439 @@
+"""pear-migrate (the v1 importer) against a fake daemon and a fake 1.3.2 agent.
+
+Everything runs in a scratch HOME and runtime directory with made-up files: no real vault, no
+real agent, no real systemctl and no Secret Service (both are injected fakes, and the session
+bus address is pointed at nothing for good measure).
+"""
+
+import base64
+import datetime
+import hashlib
+import io
+import json
+import os
+import socket
+import tempfile
+import threading
+import unittest
+from unittest import mock
+
+from icp.client import migrate
+from icp.daemon import protocol
+
+KEY = bytes(range(32))
+RIGHT_PASSPHRASE = "correct horse"
+TICKET = "T" * 43
+
+
+class FakeDaemon:
+    def __init__(self, test, root, purpose="import", commit_error=None, hello_extra=None):
+        self.path = os.path.join(root, "client.sock")
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        self.srv.listen(1)
+        test.addCleanup(self.srv.close)
+        self.purpose = purpose
+        self.commit_error = commit_error
+        self.hello_extra = hello_extra or {}
+        self.seen = []
+        self.files = {}
+        self.chunks = {}
+        self.key_ok = False
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _reply(self, req):
+        op, rid = req["op"], req["rid"]
+        if op == "hello":
+            return {"rid": rid, "proto": 2, "version": "2.0.0", "purpose": self.purpose,
+                    **self.hello_extra}
+        if op == "import-file":
+            name = req["name"]
+            self.chunks.setdefault(name, []).append((req["seq"], len(req["b64"]), req["eof"]))
+            self.files[name] = self.files.get(name, b"") + base64.b64decode(req["b64"])
+            if req["eof"]:
+                return {"rid": rid, "ok": True, "size": len(self.files[name]),
+                        "sha256": hashlib.sha256(self.files[name]).hexdigest()}
+            return {"rid": rid, "ok": True}
+        if op == "import-key":
+            if "check.enc" not in self.files:
+                return {"rid": rid, "error": "incomplete"}
+            ok = (req.get("key_b64") == base64.b64encode(KEY).decode()
+                  or req.get("passphrase") == RIGHT_PASSPHRASE)
+            self.key_ok = self.key_ok or ok
+            return {"rid": rid, "ok": True} if ok else {"rid": rid, "error": "wrong-passphrase"}
+        if op == "import-commit":
+            if self.commit_error:
+                return {"rid": rid, "error": self.commit_error}
+            if not self.key_ok:
+                return {"rid": rid, "error": "incomplete"}
+            return {"rid": rid, "counts": {"credentials": 3, "history": 1, "nicknames": 0,
+                                           "aliases": 0, "session_keys": 2}, "digest": "ab" * 32}
+        return {"rid": rid, "ok": True}
+
+    def _serve(self):
+        conn, _ = self.srv.accept()
+        f = conn.makefile("rwb")
+        for line in f:
+            req = json.loads(line)
+            self.seen.append(req)
+            f.write(json.dumps(self._reply(req)).encode() + b"\n")
+            f.flush()
+        conn.close()
+
+    def ops(self):
+        return [r["op"] for r in self.seen]
+
+
+class FakeAgent:
+    """The 1.3.2 agent's socket: records every command, answers PEEK from its 'grace window'."""
+
+    def __init__(self, test, runtime, warm=True):
+        d = os.path.join(runtime, "icp")
+        os.makedirs(d, mode=0o700)
+        self.path = os.path.join(d, "agent.sock")
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        self.srv.listen(8)
+        test.addCleanup(self.srv.close)
+        self.warm = warm
+        self.commands = []
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return
+            with conn:
+                cmd = conn.makefile("rb").readline().decode().strip()
+                self.commands.append(cmd)
+                if cmd in ("GET", "PEEK"):
+                    conn.sendall(b"OK " + KEY.hex().encode() + b"\n" if self.warm
+                                 else b"LOCKED\n")
+                else:
+                    conn.sendall(b"OK\n")
+
+
+class Scratch:
+    def __init__(self, test):
+        self.tmp = tempfile.TemporaryDirectory()
+        test.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.home = os.path.join(self.root, "home")
+        self.runtime = os.path.join(self.root, "run")
+        os.makedirs(self.runtime, mode=0o700)
+        self.config = os.path.join(self.home, ".config", "icp")
+        os.makedirs(self.config, mode=0o700)
+        self.files = {"kdf.json": b'{"salt":"00","alg":"argon2id"}',
+                      "check.enc": b"C" * 40,
+                      "vault.enc": os.urandom(100 * 1024),
+                      "session.enc": b"S" * 300,
+                      "history.enc": b"H" * 50}
+        for name, data in self.files.items():
+            with open(os.path.join(self.config, name), "wb") as f:
+                f.write(data)
+        with open(os.path.join(self.config, "vault.key"), "wb") as f:
+            f.write(b"stray key copy")
+        self.units = []
+        self.secret_service_calls = 0
+        p = mock.patch.dict(os.environ, {"DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent"})
+        p.start()
+        test.addCleanup(p.stop)
+
+    def fake_run(self, argv, **kw):
+        self.units.append(argv)
+        return mock.Mock(returncode=0)
+
+    def fake_secret_service(self):
+        self.secret_service_calls += 1
+        return 0
+
+    def run(self, daemon, stdin_lines):
+        out = io.StringIO()
+        rc = migrate.run(io.StringIO("".join(line + "\n" for line in stdin_lines)), out,
+                         daemon.path, self.home, self.runtime,
+                         subprocess_run=self.fake_run, secret_service=self.fake_secret_service)
+        msgs = [json.loads(line) for line in out.getvalue().splitlines()]
+        return rc, msgs
+
+    def write_manifest(self, rel, path=None, ext=migrate.LEGACY_EXTENSION_ID):
+        d = os.path.join(self.home, rel)
+        os.makedirs(d, exist_ok=True)
+        m = {"name": "org.icp.native", "description": "Apple Passwords native messaging host",
+             "path": path or os.path.join(self.home, "icp/host/icp-host.sh"),
+             "type": "stdio", "allowed_extensions": [ext]}
+        p = os.path.join(d, "org.icp.native.json")
+        with open(p, "w") as f:
+            json.dump(m, f)
+        return p
+
+
+OPTS = json.dumps({"move_manifests": True})
+
+
+class ImportTests(unittest.TestCase):
+    def test_peek_path_imports_and_cleans_up_after_verification(self):
+        s = Scratch(self)
+        d = FakeDaemon(self, s.root)
+        agent = FakeAgent(self, s.runtime, warm=True)
+        rc, msgs = s.run(d, [TICKET, OPTS])
+        self.assertEqual(rc, 0, msgs)
+        self.assertEqual(d.seen[0]["role"], "migrate")
+        self.assertEqual(d.seen[0]["ticket"], TICKET)
+        # Every file arrived intact.
+        for name, data in s.files.items():
+            self.assertEqual(d.files[name], data, name)
+        # The key came from PEEK; no passphrase was asked for.
+        self.assertFalse(any("need" in m for m in msgs))
+        key_reqs = [r for r in d.seen if r["op"] == "import-key"]
+        self.assertEqual(len(key_reqs), 1)
+        self.assertIn("key_b64", key_reqs[0])
+        # Only PEEK before the import; LOCK and QUIT after it; never GET.
+        self.assertEqual(agent.commands, ["PEEK", "LOCK", "QUIT"])
+        done = msgs[-1]
+        self.assertTrue(done["done"])
+        self.assertEqual(done["counts"]["credentials"], 3)
+        backup = done["backup_dir"]
+        self.assertEqual(os.path.basename(backup),
+                         "icp.v1-backup-" + datetime.date.today().strftime("%Y%m%d"))
+        commit = [r for r in d.seen if r["op"] == "import-commit"][0]
+        self.assertEqual(commit["backup_dir"], backup)
+        self.assertFalse(os.path.exists(s.config))
+        self.assertTrue(os.path.isdir(backup))
+        self.assertEqual(os.stat(backup).st_mode & 0o777, 0o700)
+        self.assertFalse(os.path.exists(os.path.join(backup, "vault.key")))
+        self.assertTrue(os.path.exists(os.path.join(backup, "vault.enc")))
+        self.assertFalse(os.path.exists(agent.path))
+        self.assertEqual([a[-1] for a in s.units], list(migrate.LEGACY_UNITS))
+        self.assertTrue(all(a[:4] == ["/usr/bin/systemctl", "--user", "disable", "--now"]
+                            for a in s.units))
+        self.assertEqual(s.secret_service_calls, 1)
+        self.assertEqual([m.get("stage") for m in msgs if "stage" in m],
+                         ["reading", "peek", "converting", "cleanup"])
+
+    def test_never_sends_get(self):
+        # Mutation guard: the importer must only PEEK. A cold agent answers LOCKED to PEEK;
+        # a GET would have been the call that can raise a legacy prompt.
+        s = Scratch(self)
+        d = FakeDaemon(self, s.root)
+        agent = FakeAgent(self, s.runtime, warm=False)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"passphrase": RIGHT_PASSPHRASE})])
+        self.assertEqual(rc, 0, msgs)
+        self.assertNotIn("GET", agent.commands)
+        self.assertEqual(agent.commands[0], "PEEK")
+
+    def test_large_file_is_chunked(self):
+        s = Scratch(self)
+        d = FakeDaemon(self, s.root)
+        FakeAgent(self, s.runtime)
+        s.run(d, [TICKET, OPTS])
+        chunks = d.chunks["vault.enc"]
+        self.assertEqual([c[0] for c in chunks], [0, 1, 2, 3])
+        self.assertEqual([c[2] for c in chunks], [False, False, False, True])
+        for req in d.seen:
+            if req["op"] == "import-file":
+                self.assertLessEqual(len(base64.b64decode(req["b64"])), protocol.IMPORT_CHUNK_MAX)
+                self.assertLess(len(json.dumps(req)) + 1, protocol.MAX_REQUEST_LINE)
+
+    def test_cold_agent_asks_for_the_passphrase_and_retries(self):
+        s = Scratch(self)
+        d = FakeDaemon(self, s.root)
+        FakeAgent(self, s.runtime, warm=False)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"passphrase": "wrong"}),
+                             json.dumps({"passphrase": RIGHT_PASSPHRASE})])
+        self.assertEqual(rc, 0, msgs)
+        needs = [m for m in msgs if "need" in m]
+        self.assertEqual(needs, [{"need": "passphrase", "retry": False},
+                                 {"need": "passphrase", "retry": True}])
+        self.assertTrue(msgs[-1]["done"])
+        # The passphrase never appears on stdout.
+        self.assertNotIn(RIGHT_PASSPHRASE, json.dumps(msgs))
+
+    def test_no_agent_at_all(self):
+        s = Scratch(self)
+        d = FakeDaemon(self, s.root)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"passphrase": RIGHT_PASSPHRASE})])
+        self.assertEqual(rc, 0, msgs)
+        self.assertEqual([m for m in msgs if "need" in m], [{"need": "passphrase",
+                                                             "retry": False}])
+
+    def test_cancel_changes_nothing(self):
+        s = Scratch(self)
+        d = FakeDaemon(self, s.root)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"cancel": True})])
+        self.assertEqual(rc, 4)
+        self.assertNotIn("import-commit", d.ops())
+        self.assertTrue(os.path.isdir(s.config))
+        self.assertTrue(os.path.exists(os.path.join(s.config, "vault.key")))
+        self.assertEqual(s.units, [])
+
+    def test_mismatch_changes_nothing(self):
+        s = Scratch(self)
+        d = FakeDaemon(self, s.root, commit_error="mismatch")
+        agent = FakeAgent(self, s.runtime)
+        rc, msgs = s.run(d, [TICKET, OPTS])
+        self.assertEqual(rc, 1)
+        self.assertEqual(msgs[-1]["error"], "mismatch")
+        self.assertTrue(os.path.isdir(s.config))
+        self.assertTrue(os.path.exists(os.path.join(s.config, "vault.key")))
+        self.assertEqual(agent.commands, ["PEEK"])
+        self.assertEqual(s.units, [])
+        self.assertEqual(s.secret_service_calls, 0)
+
+    def test_bad_ticket(self):
+        s = Scratch(self)
+        out = io.StringIO()
+        rc = migrate.run(io.StringIO("nope\n"), out, "/nonexistent", s.home, s.runtime)
+        self.assertEqual(rc, 2)
+
+
+class FileHygieneTests(unittest.TestCase):
+    def _expect(self, s, code):
+        d = FakeDaemon(self, s.root)
+        rc, msgs = s.run(d, [TICKET, OPTS])
+        self.assertEqual(rc, 1, msgs)
+        self.assertEqual(msgs[-1]["error"], code)
+        self.assertNotIn("import-commit", d.ops())
+        return msgs
+
+    def test_symlinked_directory_refused(self):
+        s = Scratch(self)
+        real = os.path.join(s.root, "elsewhere")
+        os.rename(s.config, real)
+        os.symlink(real, s.config)
+        self._expect(s, "unsafe-file")
+
+    def test_symlinked_file_refused(self):
+        s = Scratch(self)
+        target = os.path.join(s.root, "planted")
+        with open(target, "wb") as f:
+            f.write(b"x")
+        os.unlink(os.path.join(s.config, "vault.enc"))
+        os.symlink(target, os.path.join(s.config, "vault.enc"))
+        self._expect(s, "unsafe-file")
+
+    def test_fifo_refused_without_hanging(self):
+        s = Scratch(self)
+        os.unlink(os.path.join(s.config, "check.enc"))
+        os.mkfifo(os.path.join(s.config, "check.enc"))
+        self._expect(s, "unsafe-file")
+
+    def test_oversize_refused(self):
+        s = Scratch(self)
+        with open(os.path.join(s.config, "history.enc"), "wb") as f:
+            f.truncate(protocol.IMPORT_FILE_MAX + 1)
+        self._expect(s, "unsafe-file")
+
+    def test_missing_required_is_no_v1(self):
+        s = Scratch(self)
+        os.unlink(os.path.join(s.config, "kdf.json"))
+        self._expect(s, "no-v1")
+
+    def test_no_directory_is_no_v1(self):
+        s = Scratch(self)
+        os.rename(s.config, s.config + ".gone")
+        self._expect(s, "no-v1")
+
+
+class ManifestTests(unittest.TestCase):
+    def test_matching_manifests_move_with_consent_others_stay(self):
+        s = Scratch(self)
+        good = s.write_manifest(".mozilla/native-messaging-hosts")
+        other = s.write_manifest(".zen/native-messaging-hosts", path="/opt/someone-else")
+        foreign_ext = s.write_manifest(".config/zen/native-messaging-hosts", ext="{other}")
+        d = FakeDaemon(self, s.root)
+        FakeAgent(self, s.runtime)
+        rc, msgs = s.run(d, [TICKET, OPTS])
+        self.assertEqual(rc, 0, msgs)
+        done = msgs[-1]
+        self.assertFalse(os.path.exists(good))
+        moved = os.path.join(done["backup_dir"], migrate.MANIFESTS_SUBDIR,
+                             "firefox-org.icp.native.json")
+        self.assertTrue(os.path.exists(moved))
+        self.assertTrue(os.path.exists(other))
+        self.assertTrue(os.path.exists(foreign_ext))
+        self.assertEqual(sorted(done["kept_manifests"]), sorted([other, foreign_ext]))
+        # ~/icp is never touched (it does not even need to exist), and no new host is
+        # registered: no io.github.dragosol manifest anywhere.
+        for root, _, files in os.walk(s.home):
+            self.assertNotIn("io.github.dragosol.pearpasswords.json", files)
+
+    def test_without_consent_nothing_moves(self):
+        s = Scratch(self)
+        good = s.write_manifest(".mozilla/native-messaging-hosts")
+        d = FakeDaemon(self, s.root)
+        FakeAgent(self, s.runtime)
+        rc, msgs = s.run(d, [TICKET, json.dumps({"move_manifests": False})])
+        self.assertEqual(rc, 0, msgs)
+        self.assertTrue(os.path.exists(good))
+        self.assertEqual(msgs[-1]["kept_manifests"], [good])
+        # The legacy units are stopped regardless of the checkbox.
+        self.assertEqual(len(s.units), len(migrate.LEGACY_UNITS))
+
+    def test_matcher(self):
+        home = "/home/u"
+        ok = json.dumps({"name": "org.icp.native", "description": "x",
+                         "path": "/home/u/icp/host/icp-host.sh", "type": "stdio",
+                         "allowed_extensions": [migrate.LEGACY_EXTENSION_ID]}).encode()
+        self.assertTrue(migrate.legacy_manifest_matches(ok, home))
+        self.assertFalse(migrate.legacy_manifest_matches(ok, "/home/v"))
+        extra = json.loads(ok)
+        extra["allowed_origins"] = ["chrome-extension://x/"]
+        self.assertFalse(migrate.legacy_manifest_matches(json.dumps(extra).encode(), home))
+        self.assertFalse(migrate.legacy_manifest_matches(b"not json", home))
+
+
+class PurgeTests(unittest.TestCase):
+    def _backup(self, s):
+        b = os.path.join(s.home, ".config", "icp.v1-backup-20261008")
+        os.rename(s.config, b)
+        return b
+
+    def test_removes_only_matching_recorded_files(self):
+        s = Scratch(self)
+        b = self._backup(s)
+        recorded = [{"name": n, "sha256": hashlib.sha256(d).hexdigest()}
+                    for n, d in s.files.items()]
+        with open(os.path.join(b, "session.enc"), "wb") as f:
+            f.write(b"edited since the import")
+        d = FakeDaemon(self, s.root, purpose="purge",
+                       hello_extra={"files": recorded, "dir": b})
+        rc, msgs = s.run(d, [TICKET])
+        self.assertEqual(rc, 0, msgs)
+        done = msgs[-1]
+        self.assertEqual(done["kept"], ["session.enc"])
+        self.assertEqual(sorted(done["removed"]),
+                         sorted(n for n in s.files if n != "session.enc"))
+        self.assertTrue(os.path.exists(os.path.join(b, "session.enc")))
+        self.assertTrue(os.path.exists(os.path.join(b, "vault.key")))   # not recorded: kept
+        self.assertFalse(os.path.exists(os.path.join(b, "vault.enc")))
+        result = [r for r in d.seen if r["op"] == "purge-result"][0]
+        self.assertEqual(result["kept"], ["session.enc"])
+
+    def test_refuses_a_directory_pear_did_not_make(self):
+        s = Scratch(self)
+        recorded = [{"name": "vault.enc",
+                     "sha256": hashlib.sha256(s.files["vault.enc"]).hexdigest()}]
+        d = FakeDaemon(self, s.root, purpose="purge",
+                       hello_extra={"files": recorded, "dir": s.config})
+        rc, msgs = s.run(d, [TICKET])
+        self.assertEqual(rc, 1)
+        self.assertEqual(msgs[-1]["error"], "unsafe-file")
+        self.assertTrue(os.path.exists(os.path.join(s.config, "vault.enc")))
+
+    def test_refuses_unknown_names(self):
+        s = Scratch(self)
+        b = self._backup(s)
+        with open(os.path.join(b, "keepme"), "wb") as f:
+            f.write(b"k")
+        d = FakeDaemon(self, s.root, purpose="purge", hello_extra={
+            "files": [{"name": "keepme", "sha256": hashlib.sha256(b"k").hexdigest()},
+                      {"name": "../.bashrc", "sha256": "00"}], "dir": b})
+        rc, msgs = s.run(d, [TICKET])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(os.path.join(b, "keepme")))
+
+
+if __name__ == "__main__":
+    unittest.main()

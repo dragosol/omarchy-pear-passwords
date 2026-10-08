@@ -418,19 +418,15 @@ class QmlTextFormatTests(unittest.TestCase):
         self.assertEqual(missing, [], "on the AutoText default:\n" + "\n".join(missing))
 
     def test_markup_is_only_rendered_for_fixed_text(self):
-        """StyledText and RichText fetch remote <img> just as AutoText does, so the only
-        elements allowed to use them must not render anything that came off the network."""
+        """StyledText and RichText fetch remote <img> just as AutoText does. 2.0 has no markup
+        element at all: the one fixed escrow warning that used StyledText is plain text now
+        (test_qml_text_plain.py holds the full rule)."""
         rich = []
         for name, lines in self._files():
             for i, line in enumerate(lines):
                 if re.search(r"textFormat:\s*\w+\.(RichText|StyledText|AutoText)", line):
-                    rich.append((name, i + 1, lines[max(0, i - 8):i + 2]))
-        self.assertEqual(len(rich), 1, f"expected one markup element, got {[(n, l) for n, l, _ in rich]}")
-        name, lineno, block = rich[0]
-        joined = "\n".join(block)
-        self.assertIn("This can't be undone", joined,
-                      f"the markup element at {name}:{lineno} is no longer the fixed warning")
-        self.assertNotIn("modelData", joined, "it renders model data")
+                    rich.append((name, i + 1))
+        self.assertEqual(rich, [], "a markup element came back")
 
     def test_secret_word_is_clamped(self):
         """secretWord() is interpolated into that one markup element and takes its value from
@@ -467,26 +463,27 @@ class OneCommandInstallTest(unittest.TestCase):
                          "app-only still demands podman/systemctl it does not use")
 
     def test_the_plugin_provisions_the_window(self):
+        # 2.0: the window is installed root-owned by the system step, so the plugin copies
+        # nothing; it checks that pear-exec is installed set-gid and says what to run.
         qml = self._read("plugin", "Service.qml")
-        self.assertIn("--app-only", qml, "the plugin no longer lays the window down")
-        self.assertIn("manifest.json", qml,
-                      "nothing re-provisions when the plugin is updated")
+        self.assertNotIn("--app-only", qml, "the plugin still lays a user copy of the window down")
+        self.assertIn('"0 pear-client 2755"', qml, "the plugin no longer checks pear-exec")
         self.assertNotIn("venv", qml,
-                         "the plugin must not build the backend; the window asks first")
+                         "the plugin must not build the backend")
 
     def test_the_window_gates_on_the_backend(self):
+        # 2.0: the window gates on reaching the daemon, and says what is missing.
         qml = self._read("app", "shell.qml")
-        self.assertIn("property bool backendReady", qml, "the setup gate is gone")
-        self.assertRegex(qml, r'command: \["test", "-x", root\.icp\]',
-                         "nothing checks whether the backend is actually there")
-        self.assertIn("root.refresh();", qml)
+        for state in ('"not-installed"', '"daemon-failed"', '"abi-mismatch"'):
+            self.assertIn(state, qml, f"the {state} screen is gone")
+        self.assertNotIn("root.icp", qml, "the window still runs the 1.x backend")
 
     def test_installer_output_is_stripped_before_display(self):
-        """install.sh colours its output for a terminal; a Text renders the escape codes."""
+        """2.0: the window never runs the installer (it needs sudo), so no installer output
+        can reach a Text; it only shows the command to run."""
         qml = self._read("app", "shell.qml")
-        self.assertIn("function plain(", qml, "the ANSI stripper is gone")
-        self.assertRegex(qml, r'root\.setupLog = root\.plain\(line\)',
-                         "the installer's output reaches the gate unstripped")
+        self.assertNotIn("install.sh\"", qml, "the window runs the installer again")
+        self.assertNotIn("setupProc", qml)
 
 
 class AnisetteProvenanceTest(unittest.TestCase):
@@ -636,9 +633,10 @@ class AnisetteProvenanceTest(unittest.TestCase):
         self.assertIn("--adi-path", body, "the gate no longer refuses to be pointed elsewhere")
 
     def test_build_output_is_not_shown_as_an_error(self):
-        """podman writes build progress to stderr; the gate used to paint all of it red."""
+        """podman writes build progress to stderr. 2.0's window never runs the build, so none
+        of it can be painted as an error there."""
         qml = self._read("app", "shell.qml")
-        self.assertIn("root.setupTail", qml, "stderr is no longer buffered")
+        self.assertNotIn("setupError", qml, "the window shows installer output again")
         self.assertNotRegex(qml, r"onRead: function \(line\) \{ if \(line\.trim\(\)\) root\.setupError",
                             "a single stderr line still becomes an error")
 

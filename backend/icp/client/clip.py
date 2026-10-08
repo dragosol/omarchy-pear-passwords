@@ -1,0 +1,360 @@
+"""pear-clip: put one value on the Wayland clipboard for one paste, then take it away.
+
+Started by the Pear window as `pear-exec clip`, with a ticket on stdin (never argv or the
+environment). It redeems the ticket with the daemon for `{value, sensitive, timeout}` and owns
+the regular selection through wayland.py. Spec section 4.6 and docs/protocol.md sections 7 and
+10.1.
+
+The rules, in the order a request meets them:
+
+1. `x-kde-passwordManagerHint` (offered only for a sensitive value) is always served the word
+   `secret`, which asks history managers not to keep the entry.
+2. Every other request hands over a pipe. The process(es) at the other end are found in /proc.
+   If every one of them is a known clipboard-history watcher (watchers.py), the pipe is closed
+   unwritten and the request does not count.
+3. Anything else, including a reader that cannot be identified, gets the value and is the one
+   paste. For CLIP_REREQUEST_GRACE_S afterwards the same set of holder processes may ask again
+   (XWayland and some toolkits read twice); nobody else gets anything. Then the source is
+   destroyed.
+4. With no paste by `timeout` seconds the source is destroyed. Destroying a source clears the
+   clipboard only if it is still the selection: a copy you made since is never touched, and
+   set_selection(null) is never sent.
+
+The outcome goes back to the daemon (`clip-result`), which tells the window. The value lives in
+a bytearray that is zeroed before exit; Python may have copied it on the way in (the JSON
+reply), which is why the real boundary is that this process is non-dumpable.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import errno
+import os
+import re
+import select
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+from ..daemon import protocol
+from . import watchers
+from .channel import Channel, ChannelError, stdin_line
+from .wayland import (DataControl, Connection, Event, Reader, Selection, SOURCE_CANCELLED,
+                      SOURCE_SEND, WaylandError)
+
+HINT_MIME = "x-kde-passwordManagerHint"
+TEXT_MIMES = ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "TEXT", "STRING")
+TICKET_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+WRITE_DEADLINE_S = 2.0
+
+
+# --- who holds the pipe (gate G5) ------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Readers:
+    pids: frozenset
+    watchers: frozenset
+
+    @property
+    def only_watchers(self) -> bool:
+        return bool(self.pids) and self.pids == self.watchers
+
+
+def _set_fsgid(gid: int) -> None:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.setfsgid(ctypes.c_uint(gid))
+    except (OSError, AttributeError):
+        pass
+
+
+def pipe_holders(fd: int, exclude: set, proc: str = "/proc") -> set:
+    """Pids of our own uid's processes that hold the pipe behind `fd` (either end).
+
+    /proc/<pid>/fd is checked against our fs credentials, and our fsgid is pear-client, which
+    no user process has. For the scan only, the fsgid drops to our real gid, so the access
+    check sees an ordinary process of this user (Yama limits attaching, not this read)."""
+    st = os.fstat(fd)
+    target = f"pipe:[{st.st_ino}]"
+    uid = os.getuid()
+    holders = set()
+    egid = os.getegid()
+    _set_fsgid(os.getgid())
+    try:
+        for name in os.listdir(proc):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid in exclude:
+                continue
+            try:
+                if os.stat(f"{proc}/{name}").st_uid != uid:
+                    continue
+                fds = os.listdir(f"{proc}/{name}/fd")
+            except OSError:
+                continue
+            for f in fds:
+                try:
+                    if os.readlink(f"{proc}/{name}/fd/{f}") == target:
+                        holders.add(pid)
+                        break
+                except OSError:
+                    continue
+    finally:
+        _set_fsgid(egid)
+    return holders
+
+
+def make_identifier(exclude: set, describe=watchers.describe_proc) -> Callable[[int], Readers]:
+    def identify(fd: int) -> Readers:
+        pids = frozenset(pipe_holders(fd, exclude))
+        found = frozenset(p for p in pids if watchers.is_watcher(p, describe))
+        return Readers(pids, found)
+    return identify
+
+
+# --- the offer ----------------------------------------------------------------------------------
+
+@dataclass
+class Offer:
+    """What has happened to one clipboard offer. Pure bookkeeping plus the fd writes, so the
+    rules above can be tested against a fake compositor."""
+
+    value: bytearray
+    sensitive: bool
+    timeout: float
+    identify: Callable[[int], Readers]
+    now: Callable[[], float] = time.monotonic
+    grace: float = protocol.CLIP_REREQUEST_GRACE_S
+    started: float = 0.0
+    pasted_at: float | None = None
+    paste_holders: frozenset | None = None
+    outcome: str | None = None              # set once the offer is over
+    served: int = 0                         # writes of the value
+    refused_watchers: int = 0
+    refused_others: int = 0
+    log: list = field(default_factory=list)  # (mime, verdict) - never the value
+
+    def mimes(self) -> list[str]:
+        return list(TEXT_MIMES) + ([HINT_MIME] if self.sensitive else [])
+
+    def start(self) -> None:
+        self.started = self.now()
+
+    def on_send(self, mime: str | None, fd: int) -> None:
+        try:
+            if mime == HINT_MIME and self.sensitive:
+                _write_all(fd, b"secret")
+                self.log.append((mime, "hint"))
+                return
+            if mime not in TEXT_MIMES or self.outcome is not None:
+                self.log.append((mime, "refused"))
+                return
+            readers = self.identify(fd)
+            if self.pasted_at is not None:
+                # Only the paste that already happened may ask again, and only briefly.
+                if (readers.pids == self.paste_holders
+                        and self.now() - self.pasted_at <= self.grace):
+                    _write_all(fd, self.value)
+                    self.served += 1
+                    self.log.append((mime, "re-served"))
+                else:
+                    self.refused_others += 1
+                    self.log.append((mime, "refused"))
+                return
+            if readers.only_watchers:
+                self.refused_watchers += 1
+                self.log.append((mime, "watcher"))
+                return
+            _write_all(fd, self.value)
+            self.served += 1
+            self.pasted_at = self.now()
+            self.paste_holders = readers.pids
+            self.log.append((mime, "pasted"))
+        finally:
+            os.close(fd)
+
+    def on_cancelled(self) -> None:
+        if self.outcome is None:
+            self.outcome = "pasted" if self.pasted_at is not None else "replaced"
+
+    def on_withdraw(self) -> None:
+        if self.outcome is None:
+            self.outcome = "pasted" if self.pasted_at is not None else "withdrawn"
+
+    def tick(self) -> None:
+        """Advance the clocks: end the offer after the paste grace or at the timeout."""
+        if self.outcome is not None:
+            return
+        t = self.now()
+        if self.pasted_at is not None:
+            if t - self.pasted_at > self.grace:
+                self.outcome = "pasted"
+        elif t - self.started >= self.timeout:
+            self.outcome = "expired"
+
+    def next_wakeup(self) -> float:
+        t = self.now()
+        if self.pasted_at is not None:
+            return max(0.0, self.pasted_at + self.grace - t) + 0.01
+        return max(0.0, self.started + self.timeout - t) + 0.01
+
+    def wipe(self) -> None:
+        for i in range(len(self.value)):
+            self.value[i] = 0
+
+
+def _write_all(fd: int, data) -> None:
+    """Write without ever blocking the loop for long: a reader that never reads loses."""
+    os.set_blocking(fd, False)
+    view = memoryview(data)
+    deadline = time.monotonic() + WRITE_DEADLINE_S
+    try:
+        while view:
+            try:
+                n = os.write(fd, view)
+                view = view[n:]
+            except BlockingIOError:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return
+                select.select([], [fd], [], left)
+            except OSError as e:
+                if e.errno in (errno.EPIPE, errno.EBADF):
+                    return
+                raise
+    finally:
+        view.release()
+
+
+# --- the loop ---------------------------------------------------------------------------------
+
+def serve(dc: DataControl, offer: Offer, daemon: Channel | None) -> str:
+    """Own the selection until the offer is over. Returns the outcome. Never raises for a
+    compositor failure: that is the outcome "failed"."""
+    conn: Connection = dc.conn
+    try:
+        sel: Selection = dc.offer(offer.mimes())
+    except WaylandError:
+        offer.outcome = "failed"
+        return "failed"
+    offer.start()
+    daemon_gone = False
+    try:
+        while offer.outcome is None:
+            waits = [conn.sock]
+            if daemon is not None and not daemon_gone:
+                waits.append(daemon)
+            buffered = daemon is not None and not daemon_gone and daemon.has_pending()
+            ready, _, _ = select.select(waits, [], [], 0 if buffered else offer.next_wakeup())
+            if conn.sock in ready:
+                for ev in conn.read_events(0):
+                    _dispatch(dc, sel, offer, ev)
+            if daemon is not None and not daemon_gone and (buffered or daemon in ready):
+                try:
+                    for msg in daemon.read_messages(0):
+                        if msg.get("event") == "withdraw":
+                            offer.on_withdraw()
+                except ChannelError:
+                    # The daemon is gone (lock, crash, UI closed): nobody may paste any more.
+                    daemon_gone = True
+                    offer.on_withdraw()
+            offer.tick()
+        # Also after `cancelled`: a cancelled source is dead and destroying it changes nothing.
+        dc.destroy_source(sel)
+        _flush(conn)
+    except WaylandError:
+        # The compositor went away, and the selection with it.
+        if offer.outcome is None:
+            offer.outcome = "pasted" if offer.pasted_at is not None else "failed"
+    return offer.outcome or "failed"
+
+
+def _dispatch(dc: DataControl, sel: Selection, offer: Offer, ev: Event) -> None:
+    if ev.obj == sel.source:
+        if ev.opcode == SOURCE_SEND:
+            mime = Reader(ev.args).string()
+            offer.on_send(mime, dc.conn.take_fd())
+        elif ev.opcode == SOURCE_CANCELLED:
+            offer.on_cancelled()
+        return
+    if not dc.handle_device_event(sel, ev):
+        offer.outcome = offer.outcome or "failed"
+
+
+def _flush(conn: Connection) -> None:
+    # Let the compositor see the destroy before we disconnect; a roundtrip proves it did.
+    try:
+        conn.roundtrip(lambda ev: None, timeout=1.0)
+    except WaylandError:
+        pass
+
+
+# --- entry point ---------------------------------------------------------------------------------
+
+def run(stdin, socket_path: str, wayland_path: str, identify=None) -> int:
+    try:
+        ticket = stdin_line(stdin, 256)
+    except ValueError:
+        ticket = None
+    if not ticket or not TICKET_RE.match(ticket):
+        print("pear-clip: no ticket on stdin", file=sys.stderr)
+        return 2
+    try:
+        daemon = Channel.connect(socket_path)
+        daemon.hello("clip", ticket)
+        reply = daemon.request("redeem", timeout=10)
+    except ChannelError as e:
+        print(f"pear-clip: {e}", file=sys.stderr)
+        return 3
+    if "error" in reply or not isinstance(reply.get("value"), str):
+        print("pear-clip: the ticket could not be redeemed", file=sys.stderr)
+        daemon.close()
+        return 3
+    value = bytearray(reply["value"].encode("utf-8"))
+    sensitive = bool(reply.get("sensitive", True))
+    timeout = reply.get("timeout", protocol.CLIP_TIMEOUT_S_DEFAULT)
+    lo, hi = protocol.CLIP_TIMEOUT_S_RANGE
+    if not isinstance(timeout, (int, float)) or not lo <= timeout <= hi:
+        timeout = protocol.CLIP_TIMEOUT_S_DEFAULT
+    reply.clear()
+    del reply
+    daemon.wipe()
+
+    offer = None
+    outcome = "failed"
+    try:
+        try:
+            conn = Connection.connect(wayland_path)
+            dc = DataControl(conn)
+        except WaylandError as e:
+            print(f"pear-clip: {e}", file=sys.stderr)
+        else:
+            if identify is None:
+                identify = make_identifier({os.getpid(), conn.peer_pid or -1})
+            offer = Offer(value, sensitive, float(timeout), identify)
+            outcome = serve(dc, offer, daemon)
+            conn.close()
+    finally:
+        for i in range(len(value)):
+            value[i] = 0
+    try:
+        daemon.request("clip-result", timeout=5, outcome=outcome)
+    except ChannelError:
+        pass
+    daemon.close()
+    return 0
+
+
+def main() -> int:
+    from ..daemon import paths
+    wayland = os.environ.get("WAYLAND_DISPLAY", "")
+    if not wayland.startswith("/"):
+        print("pear-clip: run through pear-exec", file=sys.stderr)
+        return 2
+    return run(sys.stdin, paths.SOCKET_PATH, wayland)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
