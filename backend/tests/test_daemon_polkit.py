@@ -1,0 +1,308 @@
+"""The daemon's polkit client against a fake system bus, and the registry's prompt rules
+(docs/protocol.md 5): subject, flags, details, outcome classification, cancel, rate limits."""
+
+import array
+import asyncio
+import os
+import threading
+import unittest
+
+from daemon_fakes import FakeAuthority, FakeClock, Harness
+from jeepney import HeaderFields, Message, MessageType, new_error, new_method_return
+
+from icp.daemon import paths, polkit, protocol
+from icp.daemon.polkit import Authority, Subject, classify, sanitize
+
+
+class FakeBus:
+    """Answers CheckAuthorization with a scripted (result, seconds) and records every message
+    after a real serialise/parse round trip, so fd passing is exercised."""
+
+    def __init__(self, clock, script):
+        self.clock = clock
+        self.script = script
+        self.sent: list[tuple[Message, list]] = []
+
+    def call(self, msg, timeout=None):
+        fds = array.array("i")
+        data = msg.serialise(serial=len(self.sent) + 1, fds=fds)
+        parsed = Message.from_buffer(data, fds=[int(fd) for fd in fds])
+        self.sent.append((parsed, list(fds)))
+        member = msg.header.fields[HeaderFields.member]
+        if member == "CancelCheckAuthorization":
+            return new_method_return(parsed)
+        reply, seconds = self.script(parsed)
+        self.clock.advance(seconds)
+        if isinstance(reply, str):
+            return new_error(parsed, reply)
+        return new_method_return(parsed, "(bba{ss})", (reply,))
+
+
+SUBJECT = Subject(pid=4321, pidfd=0, uid=1000, start_time=99)
+
+
+class AuthorityTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        self.pidfd = os.pidfd_open(os.getpid())
+        self.subject = Subject(pid=os.getpid(), pidfd=self.pidfd, uid=1000, start_time=99)
+
+    def tearDown(self):
+        os.close(self.pidfd)
+
+    def run_check(self, reply, seconds=2.0, action=paths.ACTION_UNLOCK, details=None,
+                  mode=polkit.SUBJECT_PIDFD):
+        bus = FakeBus(self.clock, lambda m: (reply, seconds))
+        auth = Authority(bus=bus, clock=self.clock, mode=mode)
+        out = auth.check(self.subject, action, details or {}, "pear-1")
+        return out, bus
+
+    def test_message_shape_with_pidfd_subject(self):
+        out, bus = self.run_check((True, False, {}), details={"account": "GitHub\n— me"})
+        self.assertEqual(out, polkit.AUTHORIZED)
+        msg, fds = bus.sent[0]
+        f = msg.header.fields
+        self.assertEqual((f[HeaderFields.destination], f[HeaderFields.path],
+                          f[HeaderFields.interface], f[HeaderFields.member]),
+                         ("org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
+                          "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization"))
+        (kind, props), action, details, flags, cancel_id = msg.body
+        self.assertEqual(kind, "unix-process")
+        self.assertEqual(set(props), {"pidfd", "uid"})
+        self.assertEqual(props["pidfd"][0], "h")
+        self.assertEqual(fds, [self.pidfd])                # the fd itself went over the bus
+        self.assertEqual(props["uid"], ("i", 1000))
+        self.assertEqual(action, paths.ACTION_UNLOCK)
+        self.assertEqual(details, {"account": "GitHub — me"})
+        self.assertEqual(flags, polkit.ALLOW_USER_INTERACTION)
+        self.assertEqual(cancel_id, "pear-1")
+
+    def test_fallback_subject(self):
+        out, bus = self.run_check((True, False, {}), mode=polkit.SUBJECT_PID_START_TIME)
+        msg, fds = bus.sent[0]
+        _, props = msg.body[0]
+        self.assertEqual(props, {"pid": ("u", os.getpid()), "start-time": ("t", 99),
+                                 "uid": ("i", 1000)})
+        self.assertEqual(fds, [])
+
+    def test_mode_from_environment(self):
+        old = os.environ.get(polkit.SUBJECT_ENV)
+        try:
+            os.environ[polkit.SUBJECT_ENV] = "pid-start-time"
+            self.assertEqual(polkit.subject_mode(), polkit.SUBJECT_PID_START_TIME)
+            os.environ[polkit.SUBJECT_ENV] = "anything else"
+            self.assertEqual(polkit.subject_mode(), polkit.SUBJECT_PIDFD)
+        finally:
+            if old is None:
+                os.environ.pop(polkit.SUBJECT_ENV, None)
+            else:
+                os.environ[polkit.SUBJECT_ENV] = old
+
+    def test_outcomes(self):
+        cases = [
+            ((True, False, {}), 3.0, polkit.AUTHORIZED),
+            ((False, True, {"polkit.dismissed": "true"}), 3.0, polkit.DISMISSED),
+            ((False, True, {}), 3.0, polkit.DENIED),
+            ((False, False, {}), 0.01, polkit.DENIED),            # not a challenge: policy
+            ((False, True, {}), 0.01, polkit.NO_AGENT),           # G7: nobody saw a dialog
+            ((False, True, {"polkit.dismissed": "true"}), 0.01, polkit.BUSY),
+            ("org.freedesktop.PolicyKit1.Error.Failed", 0.01, polkit.NO_AGENT),
+            ("org.freedesktop.PolicyKit1.Error.Cancelled", 0.01, polkit.BUSY),
+        ]
+        for reply, seconds, expected in cases:
+            self.assertEqual(self.run_check(reply, seconds)[0], expected, (reply, seconds))
+
+    def test_no_bus_means_no_agent(self):
+        class Dead:
+            def call(self, msg, timeout=None):
+                raise ConnectionRefusedError()
+        auth = Authority(bus=Dead(), clock=self.clock)
+        with self.assertLogs("icp.daemon.polkit", "WARNING"):
+            self.assertEqual(auth.check(self.subject, paths.ACTION_UNLOCK, {}, "x"),
+                             polkit.NO_AGENT)
+
+    def test_cancel_uses_the_same_id_and_wins(self):
+        release = threading.Event()
+
+        def script(msg):
+            release.wait(5)
+            return (False, True, {"polkit.dismissed": "true"}), 1.0
+        bus = FakeBus(self.clock, script)
+        auth = Authority(bus=bus, clock=self.clock)
+        result = []
+        t = threading.Thread(target=lambda: result.append(
+            auth.check(self.subject, paths.ACTION_REVEAL, {}, "pear-7")))
+        t.start()
+        auth.cancel("pear-7")
+        release.set()
+        t.join(5)
+        self.assertEqual(result, [polkit.CANCELLED])
+        cancel = [m for m, _ in bus.sent
+                  if m.header.fields[HeaderFields.member] == "CancelCheckAuthorization"]
+        self.assertEqual(cancel[0].body, ("pear-7",))
+
+    def test_only_pear_actions(self):
+        auth = Authority(bus=FakeBus(self.clock, lambda m: ((True, False, {}), 0)),
+                         clock=self.clock)
+        with self.assertRaises(ValueError):
+            auth.check(self.subject, "org.freedesktop.systemd1.manage-units", {}, "x")
+
+    def test_classify_error_and_cancel(self):
+        self.assertEqual(classify(None, error="x", elapsed=9, cancelled=True), polkit.CANCELLED)
+        self.assertEqual(classify((True, False, {}), error=None, elapsed=0, cancelled=True),
+                         polkit.CANCELLED)
+
+
+class SanitizeTests(unittest.TestCase):
+    def test_strips_controls_bidi_and_zero_width(self):
+        self.assertEqual(sanitize("Bank‮ lanoitaN​ — me\x00\x1b[31m"),
+                         "Bank lanoitaN — me[31m")
+        self.assertEqual(sanitize("a\nb\tc d"), "a b c d")
+        self.assertEqual(sanitize("  many    spaces  "), "many spaces")
+
+    def test_length(self):
+        out = sanitize("x" * 500)
+        self.assertEqual(len(out), protocol.DETAIL_MAX_CHARS)
+        self.assertTrue(out.endswith("…"))
+        self.assertEqual(sanitize("é" * 64), "é" * 64)
+
+    def test_non_strings(self):
+        self.assertEqual(sanitize(12), "12")
+
+
+class PromptRuleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.clock = FakeClock()
+        self.auth = FakeAuthority()
+        self.h = await Harness(authority=self.auth, clock=self.clock).start()
+        self.st = self.h.seed()
+        self.ui, self.peer = await self.h.ui()
+
+    async def asyncTearDown(self):
+        self.auth.release()
+        await self.h.stop()
+
+    async def test_subject_is_the_connections_pidfd(self):
+        await self.ui.call("unlock")
+        subject, action, details, cancel_id = self.auth.calls[0]
+        self.assertEqual((subject.pid, subject.pidfd, subject.uid, subject.start_time),
+                         (self.peer.pid, self.peer.pidfd, self.peer.uid, self.peer.start_time))
+        self.assertEqual((action, details), (paths.ACTION_UNLOCK, {}))
+        self.assertTrue(cancel_id.startswith("pear-"))
+
+    async def test_three_answered_per_minute(self):
+        self.auth.outcome = polkit.DENIED
+        for _ in range(3):
+            r = await self.ui.call("unlock")
+            self.assertEqual(r["reason"], "denied")
+        r = await self.ui.call("unlock")
+        self.assertEqual((r["locked"], r["reason"]), (True, "rate-limited"))
+        self.assertTrue(1 <= r["retry_after"] <= 60)
+        self.assertEqual(len(self.auth.calls), 3)          # no fourth dialog
+        self.clock.advance(60)
+        self.auth.outcome = polkit.AUTHORIZED
+        self.assertIn("entries", await self.ui.call("unlock"))
+
+    async def test_no_agent_and_busy_are_not_counted(self):
+        for outcome in (polkit.NO_AGENT, polkit.BUSY) * 3:
+            self.auth.outcome = outcome
+            self.assertEqual((await self.ui.call("unlock"))["reason"], outcome)
+        self.auth.outcome = polkit.AUTHORIZED
+        self.assertIn("entries", await self.ui.call("unlock"))
+
+    async def test_rate_limit_error_shape_for_other_ops(self):
+        await self.ui.call("unlock")
+        self.auth.outcome = polkit.DISMISSED
+        for _ in range(2):
+            self.assertEqual((await self.ui.call("grant", id="e.0"))["error"], "dismissed")
+        r = await self.ui.call("grant", id="e.0")
+        self.assertEqual(r["error"], "rate-limited")
+        self.assertIn("retry_after", r)
+
+    async def test_one_outstanding_dialog_per_bucket(self):
+        await self.ui.call("unlock")
+        self.auth.block = True
+        self.auth.started.clear()
+        pending = self.ui.send("create", fields={"domain": "a.example", "password": "p"})
+        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.assertEqual((await self.ui.call("delete", id="e.1"))["error"], "prompt-pending")
+        self.assertEqual((await self.ui.call("cancel", target=self.ui.rid - 1))["cancelled"],
+                         True)
+        self.assertEqual((await asyncio.wait_for(pending, 5))["error"], "cancelled")
+        self.assertEqual(len(self.auth.cancels), 1)
+
+    async def test_new_grant_supersedes_a_pending_one(self):
+        await self.ui.call("unlock")
+        self.auth.block = True
+        self.auth.started.clear()
+        first = self.ui.send("grant", id="e.0")
+        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.auth.block = False
+        second = await self.ui.call("grant", id="e.1")
+        self.assertEqual(second["id"], "e.1")
+        self.assertEqual((await asyncio.wait_for(first, 5))["error"], "cancelled")
+
+    async def test_release_cancels_a_pending_grant(self):
+        await self.ui.call("unlock")
+        self.auth.block = True
+        self.auth.started.clear()
+        pending = self.ui.send("grant", id="e.0")
+        await asyncio.to_thread(self.auth.started.wait, 5)
+        await self.ui.call("release")
+        self.assertEqual((await asyncio.wait_for(pending, 5))["error"], "cancelled")
+
+    async def test_eof_cancels_the_dialog(self):
+        self.auth.block = True
+        self.auth.started.clear()
+        self.ui.send("unlock")
+        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.ui.close()
+        for _ in range(50):
+            if self.auth.cancels:
+                break
+            await asyncio.sleep(0.05)
+        self.assertEqual(len(self.auth.cancels), 1)
+        self.assertFalse(self.st.keys)
+
+    async def test_buckets_are_separate(self):
+        await self.ui.call("unlock")
+        self.auth.block = True
+        self.auth.started.clear()
+        pending = self.ui.send("delete", id="e.1")
+        await asyncio.to_thread(self.auth.started.wait, 5)
+        af, _ = await self.h.hello("autofill")
+        reg = self.h.reg
+        self.assertTrue(reg.prompt_pending(4242, "ui"))
+        self.assertFalse(reg.prompt_pending(4242, "autofill"))
+        conn = reg.connections(4242, "autofill")[0]
+        self.auth.block = False
+        await reg.authorize(conn, paths.ACTION_AUTOFILL, {"account": "a", "origin": "b.c"})
+        self.assertEqual(self.auth.calls[-1][1], paths.ACTION_AUTOFILL)
+        self.auth.release()
+        await asyncio.wait_for(pending, 5)
+
+    async def test_lock_cancels_pending_dialogs(self):
+        await self.ui.call("unlock")
+        self.auth.block = True
+        self.auth.started.clear()
+        pending = self.ui.send("grant", id="e.0")
+        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.h.reg.lock(4242, "screen-locked")
+        self.assertEqual((await asyncio.wait_for(pending, 5))["error"], "cancelled")
+
+    async def test_only_prompt_ops_raise_dialogs(self):
+        await self.ui.call("unlock")
+        n = len(self.auth.calls)
+        for op, extra in (("lock", {}), ("unlock", {}), ("sync", {}), ("settings", {"get": True}),
+                          ("release", {}), ("copy", {"id": "e.1", "field": "username"}),
+                          ("totp-preview", {"setup": "JBSWY3DPEHPK3PXP"})):
+            await self.ui.call(op, **extra)
+            if op == "lock":
+                n += 1                                # the unlock after it prompts again
+        self.assertEqual(len(self.auth.calls), n)
+        for _, action, _, _ in self.auth.calls:
+            self.assertIn(action, paths.ACTIONS)
+
+
+if __name__ == "__main__":
+    unittest.main()
