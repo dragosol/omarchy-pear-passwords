@@ -538,6 +538,22 @@ class SettingsTests(StoreCase):
         s.save_settings({**s.load_settings(), "migration_pending": "yes"})   # only True counts
         self.assertNotIn("migration_pending", s.load_settings())
 
+    def test_feature_flags_round_trip(self):
+        # op features keeps the Passkeys / Recently Deleted flags here; the gate VM found the
+        # real store dropping them (the fake one keeps any key), so they never outlived the
+        # daemon.
+        s = vstore.UserStore.open(UID)
+        s.save_settings({**s.load_settings(), "features": {"passkeys": False, "apple_deleted": True}})
+        self.assertEqual(s.load_settings()["features"], {"passkeys": False, "apple_deleted": True})
+        # Only the known flags, and only a real True is on.
+        s.save_settings({**s.load_settings(),
+                         "features": {"passkeys": "yes", "apple_deleted": 1, "other": True}})
+        self.assertEqual(s.load_settings()["features"], {"passkeys": False, "apple_deleted": False})
+        fmt.atomic_write(self.udir / "state.json", b'{"features": {"passkeys": true}, "grant_s": 60}')
+        self.assertEqual(s.load_settings()["features"], {"passkeys": True, "apple_deleted": False})
+        fmt.atomic_write(self.udir / "state.json", b'{"features": ["passkeys"]}')
+        self.assertNotIn("features", s.load_settings())
+
     def test_garbage_state_file_gives_defaults_and_is_kept(self):
         s = vstore.UserStore.open(UID)
         fmt.ensure_dir(self.udir)

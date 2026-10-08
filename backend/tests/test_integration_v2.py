@@ -255,6 +255,25 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.ui.call("reveal", id=gh, field="password"))["error"],
                          "locked")
 
+    async def test_feature_flags_outlive_the_daemon_session(self):
+        """op features through the real store: state.json keeps the flags, so a new daemon
+        session (a restart) still has them. FakeStore keeps any key; only the real one could
+        drop them, which the gate VM found it doing."""
+        await self.import_fixture()
+        await self.ui.call("unlock", timeout=30)
+        await self.h.syncs_done()
+        r = await self.ui.call("features", set={"apple_deleted": True}, timeout=30)
+        self.assertEqual(r["features"], {"passkeys": False, "apple_deleted": True})
+        self.assertEqual(self.authority.actions()[-1], paths.ACTION_MANAGE)
+        self.ui.close()
+        await asyncio.sleep(0.05)
+        self.h.reg.sessions.clear()
+        ui2, _ = await self.h.ui()
+        self.assertEqual((await ui2.call("features", get=True))["features"],
+                         {"passkeys": False, "apple_deleted": True})
+        r = await ui2.call("unlock", timeout=30)
+        self.assertEqual(r["features"], {"passkeys": False, "apple_deleted": True})
+
     async def test_a_failed_import_can_be_started_over(self):
         m = await self.migrate()
         bad = dict(self.files)

@@ -122,13 +122,16 @@ def save_device(directory: Path, d: dict) -> None:
 def _state_keys(src: dict, out: dict) -> None:
     """The daemon's bookkeeping beside the settings: the v1 backup record (old_copy) and the
     marker of a migrate-begin that has not committed yet (migration_pending, only ever True),
-    and browser autofill turned on in the window (autofill_enabled, only ever True)."""
+    browser autofill turned on in the window (autofill_enabled, only ever True), and the
+    categories that wait for a check (features: the known flags, booleans, the rest off)."""
     if isinstance(src.get("old_copy"), dict):
         out["old_copy"] = src["old_copy"]
     if src.get("migration_pending") is True:
         out["migration_pending"] = True
     if src.get("autofill_enabled") is True:
         out["autofill_enabled"] = True
+    if isinstance(src.get("features"), dict):
+        out["features"] = {k: src["features"].get(k) is True for k in protocol.FEATURES}
 
 
 def load_settings(directory: Path) -> dict:

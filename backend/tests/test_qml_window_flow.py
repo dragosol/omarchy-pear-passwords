@@ -162,7 +162,11 @@ DRIVER = r'''
                 clickRow(rowIndex("tag", "work"));
                 check(root.catTag && root.catTag.kind === "tag" && root.catTag.key === "work", "tag work");
                 check(root.filtered.length === 2, "work rows " + root.filtered.length);
-                search.text = "slack";
+                search.forceActiveFocus();
+                for (const ch of "slackx") tc.keyClick(ch);
+                tc.keyClick(Qt.Key_Backspace);            // mid-query: a character, not the chip
+                check(search.text === "slack" && root.catTag && root.catTag.key === "work",
+                      "Backspace in the query: " + search.text + " / " + JSON.stringify(root.catTag));
                 check(root.filtered.length === 1 && root.filtered[0].id === "e.sl", "the query narrows the tag");
                 search.text = "";
                 say(step);
