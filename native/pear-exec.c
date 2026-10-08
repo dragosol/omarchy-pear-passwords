@@ -67,6 +67,14 @@
     "zwp_text_input_manager_v1,zwp_text_input_manager_v2,zwp_text_input_manager_v3," \
     "qt_text_input_method_manager_v1"
 
+/* The window's session bus: an address nothing can listen on (the empty directory is root's).
+ * Qt starts its AT-SPI bridge from the session bus, and any program of yours can switch
+ * org.a11y.Status IsEnabled on there - after which every field and label of the window,
+ * revealed passwords included, could be read and its buttons pressed over the accessibility
+ * bus. Without a session bus the bridge never starts. The window uses no D-Bus service; the
+ * clip and migrate roles it starts get the real bus back from their own pear-exec. */
+#define PEAR_NO_SESSION_BUS     "unix:path=/usr/local/lib/pear-passwords/empty/no-session-bus"
+
 #define COMPOSITOR_COMM         "Hyprland"
 
 #define EX_USAGE_   64      /* not exactly one known role */
@@ -473,7 +481,9 @@ int main(int argc, char **argv)
     if (asprintf(&bus, "unix:path=%s/bus", rt) < 0)
         die(EX_REFUSED, "out of memory");
     dbus = getenv("DBUS_SESSION_BUS_ADDRESS");
-    if (dbus != NULL && strcmp(dbus, bus) != 0)
+    /* The window's own dead address is accepted from the window: a clip or migrate started
+     * by it is given the real bus below. */
+    if (dbus != NULL && strcmp(dbus, bus) != 0 && strcmp(dbus, PEAR_NO_SESSION_BUS) != 0)
         die(EX_REFUSED, "DBUS_SESSION_BUS_ADDRESS must be %s", bus);
 
     /* From scratch: who you are, where your session is, and nothing else of yours. */
@@ -483,7 +493,7 @@ int main(int argc, char **argv)
     env_put("PATH", "/usr/bin");
     env_put("XDG_RUNTIME_DIR", rt);
     env_put("WAYLAND_DISPLAY", wayland);
-    env_put("DBUS_SESSION_BUS_ADDRESS", bus);
+    env_put("DBUS_SESSION_BUS_ADDRESS", module == NULL ? PEAR_NO_SESSION_BUS : bus);
     pass_if_safe("HYPRLAND_INSTANCE_SIGNATURE");
     pass_if_safe("LANG");
     pass_if_safe("XCURSOR_SIZE");

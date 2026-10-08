@@ -42,7 +42,8 @@ a locked computer does not sync.
 - **pear-exec** takes exactly one argument (`ui`, `clip`, `migrate` or `autofill`), refuses
   root, builds the environment from scratch (no `LD_*`, `PYTHON*`, `QT_PLUGIN_PATH`, `QML*`
   import paths; XDG homes pointed at an empty root-owned directory; `QML_DISABLE_DISK_CACHE=1`;
-  a system-only fontconfig), checks that `WAYLAND_DISPLAY` is the user's oldest Hyprland, and
+  a system-only fontconfig; for the window, a session-bus address nothing can listen on),
+  checks that `WAYLAND_DISPLAY` is the user's oldest Hyprland, and
   executes a fixed root-owned argv only if every path and parent is root-owned and not group-
   or other-writable. The set-gid exec makes the child non-dumpable whatever `ptrace_scope` is.
   Tests: `test_pear_exec_env.py`.
@@ -52,7 +53,16 @@ a locked computer does not sync.
   holds a secret (notes, setup keys, typed and new passwords, the 1.x passphrase, the Apple
   password, the verification code) off the clipboard (Ctrl+C, Ctrl+X and the context menu do
   nothing there; a copy goes only through pear-clip), and starts only a fixed list of
-  programs. An unsaved edit (a typed new password or notes) stays in the window, out of sight,
+  programs. **It is not on the accessibility bus.** Qt starts its AT-SPI bridge from the
+  session bus, and any program of yours can switch `org.a11y.Status IsEnabled` on there (no
+  privilege needed, even after the window has started); every field and label of the window,
+  revealed passwords included, could then be read over AT-SPI and its buttons pressed through
+  the Action interface (shown on Qt 6.11.2 in round 2 of the audit). pear-exec therefore gives
+  the window a session-bus address in the root-owned empty directory, so the bridge never
+  starts; the clip and migrate processes the window starts get the real bus back from their
+  own pear-exec. As a second layer every secret field and every item that shows a revealed
+  password, code or history value carries `Accessible.ignored: true`. The cost: screen readers
+  cannot read Pear's window. An unsaved edit (a typed new password or notes) stays in the window, out of sight,
   past the 120 s grant until the next approval, a lock or another account is selected. The
   Omarchy components it
   instantiates (Commons `Style`, `Color`, `Util`; Ui `Button`, `TextField`) add exactly
@@ -65,7 +75,8 @@ a locked computer does not sync.
   update that adds to them fails. Quickshell's runtime directory lets the same user kill the
   window (`qs kill`); its log holds no account data. Tests: `test_qml_no_ipc.py`,
   `test_qml_text_plain.py`, `test_qml_no_console_log.py`, `test_qml_process_allowlist.py`,
-  `test_qml_grant_flow.py`, `test_qml_secret_copy.py`, `test_pear_exec_env.py`.
+  `test_qml_grant_flow.py`, `test_qml_secret_copy.py`, `test_qml_no_atspi.py`,
+  `test_pear_exec_env.py`.
 - **pear-clip** speaks the Wayland data-control protocol itself and holds the value in memory.
   It identifies each reader by the pipe it hands over: Omarchy's history watcher gets nothing,
   any other reader is the one counted paste (as soon as one byte of the value reaches its
@@ -230,6 +241,7 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
 | The same with PTT on | Holds | Blobs need this TPM. A pre-PTT copy still opens the data as it was then (the keys were rotated, so nothing written later); delete such snapshots. |
 | Stolen laptop, off, suspended or hibernated | Holds | Keys wiped on PrepareForSleep (and on logind Lock and LockedHint where the locker sends them). |
 | Stolen laptop, awake behind Omarchy's screen lock, Pear unlocked | Does not hold | Omarchy's lock emits neither Lock nor LockedHint and G6 is not built: the keys stay until Lock, window close, idle lock or sleep. |
+| A program running as you, through the accessibility bus (AT-SPI) | Holds | The window has no session bus, so Qt's AT-SPI bridge never starts, whatever `org.a11y.Status` says; secret fields are also `Accessible.ignored`. Screen readers cannot use the window. |
 | A program controlling the compositor (Hyprland plugin load or virtual keyboard/pointer, allowed by Hyprland's default `ecosystem:enforce_permissions = false`) | Does not hold | Sees what the window shows (the unlocked list, revealed values), reads what is typed into it (Apple password, 1.x passphrase, new passwords), can click Copy inside an approved grant and remove `no_screen_share`. Mitigation: `enforce_permissions = true` with `permission` rules denying `plugin` and `keyboard`, screen capture on ask. |
 | Root, the kernel, `empower`, `/etc/polkit-1/rules.d` | Not defended | Same position as systemd-homed. |
 | Old v1 ciphertext in snapshots | Residual | Crackable by guessing the old passphrase. |

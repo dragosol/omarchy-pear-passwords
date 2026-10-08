@@ -2444,6 +2444,10 @@ ShellRoot {
                                             font.pixelSize: Theme.fSmall
                                         }
                                         Text {
+                                            id: fieldValue
+                                            // A revealed password or a TOTP code: never on
+                                            // the accessibility bus (docs/security.md 3).
+                                            Accessible.ignored: true
                                             textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             text: frow.modelData.value
@@ -2525,6 +2529,7 @@ ShellRoot {
                                     spacing: 8
                                     O.TextField {
                                         id: newPw
+                                        Accessible.ignored: true
                                         // A secret leaves this window only through pear-clip (one paste or 30 s, never in
                                         // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
                                         Keys.onPressed: (event) => root.guardSecretKeys(event)
@@ -2720,6 +2725,8 @@ ShellRoot {
                                             font.pixelSize: Theme.fSmall
                                         }
                                         Text {
+                                            id: historyValue
+                                            Accessible.ignored: true
                                             textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             text: root.revealedHistory[hrow.index]
@@ -2948,6 +2955,7 @@ ShellRoot {
                                 TextArea {
                                     textFormat: TextArea.PlainText
                                     id: edArea
+                                    Accessible.ignored: true
                                     // A secret leaves this window only through pear-clip (one paste or 30 s, never in
                                     // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
                                     Keys.onPressed: (event) => root.guardSecretKeys(event)
@@ -2991,6 +2999,7 @@ ShellRoot {
                             spacing: 10
                             O.TextField {
                                 id: edSetup
+                                Accessible.ignored: true
                                 // A secret leaves this window only through pear-clip (one paste or 30 s, never in
                                 // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
                                 Keys.onPressed: (event) => root.guardSecretKeys(event)
@@ -3106,6 +3115,7 @@ ShellRoot {
                             spacing: 10
                             O.TextField {
                                 id: crPass
+                                Accessible.ignored: true
                                 // A secret leaves this window only through pear-clip (one paste or 30 s, never in
                                 // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
                                 Keys.onPressed: (event) => root.guardSecretKeys(event)
@@ -3151,6 +3161,7 @@ ShellRoot {
                         }
                         O.TextField {
                             id: crNotes
+                            Accessible.ignored: true
                             // A secret leaves this window only through pear-clip (one paste or 30 s, never in
                             // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
                             Keys.onPressed: (event) => root.guardSecretKeys(event)
@@ -3176,6 +3187,7 @@ ShellRoot {
                             spacing: 10
                             O.TextField {
                                 id: crSetup
+                                Accessible.ignored: true
                                 // A secret leaves this window only through pear-clip (one paste or 30 s, never in
                                 // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
                                 Keys.onPressed: (event) => root.guardSecretKeys(event)
@@ -3426,6 +3438,7 @@ ShellRoot {
                         }
                         O.TextField {
                             id: signinField
+                            Accessible.ignored: true
                             // A secret leaves this window only through pear-clip (one paste or 30 s, never in
                             // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
                             Keys.onPressed: (event) => root.guardSecretKeys(event)
@@ -3460,6 +3473,7 @@ ShellRoot {
                         visible: root.signinNeed !== "" && root.signinKind === "code"
                         TextInput {
                             id: codeField
+                            Accessible.ignored: true
                             // A secret leaves this window only through pear-clip (one paste or 30 s, never in
                             // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
                             Keys.onPressed: (event) => root.guardSecretKeys(event)
@@ -4011,6 +4025,7 @@ ShellRoot {
                         }
                         O.TextField {
                             id: oldPass
+                            Accessible.ignored: true
                             // A secret leaves this window only through pear-clip (one paste or 30 s, never in
                             // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
                             Keys.onPressed: (event) => root.guardSecretKeys(event)

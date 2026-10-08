@@ -79,6 +79,8 @@ def c_defines():
     return dict(re.findall(r'^#define\s+(PEAR_[A-Z_]+)\s+"([^"]*)"', src, re.M))
 
 
+NO_SESSION_BUS = f"unix:path={paths.EMPTY_DIR}/no-session-bus"
+
 QT_DISABLED = ("zwp_primary_selection_device_manager_v1,gtk_primary_selection_device_manager,"
                "zwp_text_input_manager_v1,zwp_text_input_manager_v2,zwp_text_input_manager_v3,"
                "qt_text_input_method_manager_v1")
@@ -235,7 +237,8 @@ class PearExecTests(unittest.TestCase):
             "HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name, "PATH": "/usr/bin",
             "XDG_RUNTIME_DIR": self.rt,
             "WAYLAND_DISPLAY": os.path.join(self.rt, "wayland-7"),
-            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={self.rt}/bus",
+            # The window gets no session bus, so Qt's AT-SPI bridge never starts.
+            "DBUS_SESSION_BUS_ADDRESS": NO_SESSION_BUS,
             "HYPRLAND_INSTANCE_SIGNATURE": SIG, "LANG": "C.UTF-8", "LC_TIME": "C.UTF-8",
             "XCURSOR_SIZE": "24",
             "QT_QPA_PLATFORM": "wayland", "QT_QPA_PLATFORMTHEME": "",
@@ -286,8 +289,37 @@ class PearExecTests(unittest.TestCase):
         self.assertEqual(res["nnp"], "1")
 
     def test_missing_dbus_gets_the_canonical_address(self):
-        _, res = self.run_exec(env=self.env(DBUS_SESSION_BUS_ADDRESS=None))
+        _, res = self.run_exec("clip", env=self.env(DBUS_SESSION_BUS_ADDRESS=None))
         self.assertEqual(res["env"]["DBUS_SESSION_BUS_ADDRESS"], f"unix:path={self.rt}/bus")
+
+    # --- AT-SPI (audit round 2, problem 1) ----------------------------------------------------
+    def test_the_window_never_gets_the_session_bus(self):
+        # Any program of the user's can set org.a11y.Status IsEnabled on the session bus; Qt
+        # then exposes every field's text over AT-SPI. With a bus nobody can listen on (the
+        # empty directory is root's) the bridge never starts.
+        self.assertEqual(c_defines().get("PEAR_NO_SESSION_BUS"), NO_SESSION_BUS)
+        for dbus in (f"unix:path={self.rt}/bus", None):
+            p, res = self.run_exec("ui", env=self.env(DBUS_SESSION_BUS_ADDRESS=dbus))
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(res["env"]["DBUS_SESSION_BUS_ADDRESS"], NO_SESSION_BUS)
+            self.assertNotIn("AT_SPI_BUS_ADDRESS", res["env"])
+
+    def test_the_other_roles_keep_the_session_bus_even_when_started_by_the_window(self):
+        for role in ("clip", "migrate", "autofill"):
+            for dbus in (f"unix:path={self.rt}/bus", NO_SESSION_BUS):
+                p, res = self.run_exec(role, env=self.env(DBUS_SESSION_BUS_ADDRESS=dbus))
+                self.assertEqual(p.returncode, 0, (role, dbus, p.stderr))
+                self.assertEqual(res["env"]["DBUS_SESSION_BUS_ADDRESS"],
+                                 f"unix:path={self.rt}/bus", role)
+
+    def test_an_atspi_address_from_the_caller_is_dropped(self):
+        p, res = self.run_exec("ui", env=self.env(
+            AT_SPI_BUS_ADDRESS="unix:path=/tmp/evil-a11y", QT_LINUX_ACCESSIBILITY_ALWAYS_ON="1",
+            QT_ACCESSIBILITY="1"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for name in ("AT_SPI_BUS_ADDRESS", "QT_LINUX_ACCESSIBILITY_ALWAYS_ON",
+                     "QT_ACCESSIBILITY"):
+            self.assertNotIn(name, res["env"])
 
     # --- refusals ----------------------------------------------------------------------------
     def test_arguments(self):
@@ -344,6 +376,9 @@ class PearExecTests(unittest.TestCase):
 
     def test_dbus_address_must_be_the_session_bus(self):
         p, res = self.run_exec(env=self.env(DBUS_SESSION_BUS_ADDRESS="unix:path=/tmp/evil"))
+        self.expect_refused(p, res)
+        p, res = self.run_exec("clip", env=self.env(
+            DBUS_SESSION_BUS_ADDRESS=NO_SESSION_BUS + "x"))
         self.expect_refused(p, res)
 
     def test_signature_is_required_and_plain(self):
