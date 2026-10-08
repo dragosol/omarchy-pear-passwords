@@ -1,0 +1,1118 @@
+"""Every op of the `ui`, `clip` and `migrate` roles (docs/protocol.md 6-8), the hello replies,
+the background sync, and the dispatch table the server calls.
+
+Each handler is `await handler(registry, conn, req)` and returns the reply payload without its
+rid, or raises OpError. The two autofill ops are WP6's (daemon/autofill.py); they are reached
+through thin wrappers here so that module is imported only when a browser first asks.
+
+Rules every handler keeps:
+- A dialog is raised only through registry.authorize(), and only by the ops in
+  protocol.PROMPT_ACTION. The checks that can fail without a dialog run before it, and the
+  state a dialog was raised for is checked again after it (a lock may have landed meanwhile).
+- Secrets leave the daemon only in the reply of reveal, history and redeem, and in nothing
+  that is logged.
+- Events a request causes are sent after its reply (sessions.after_reply).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import hashlib
+import logging
+import math
+import re
+
+from .. import vstore
+from . import paths, protocol, wire
+from .context import NeedsLogin, UserContext
+from .frontend import SocketFrontend
+from .grants import wipe_secrets
+from .protocol import OpError
+from .sessions import WorkerCancelled, after_reply, setting_ok, spawn
+from .tickets import TicketError
+
+logger = logging.getLogger(__name__)
+
+VERSION = "2.0.0"
+
+_HOST_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                      r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ‪-‮⁦-⁩]")
+MAX_PASSWORD = 1024
+MAX_NOTES = 16 * 1024
+MAX_TEXT = 256
+MAX_SITES = 32
+MAX_CHECK_ITEMS = 1000
+MAX_CHECK_ITEM = 1024
+MAX_PASSPHRASE = 1024
+SYNC_FAILED_REASONS = ("anisette-unavailable", "network", "needs-login", "apple")
+
+
+# --- small helpers --------------------------------------------------------------------------
+
+def _hello_base() -> dict:
+    return {"proto": protocol.PROTO, "version": VERSION}
+
+
+def _need(req: dict, key: str, typ, *, optional: bool = False, default=None):
+    if key not in req:
+        if optional:
+            return default
+        raise OpError("bad-request")
+    value = req[key]
+    if typ is int and (isinstance(value, bool) or not isinstance(value, int)):
+        raise OpError("bad-request")
+    if not isinstance(value, typ):
+        raise OpError("bad-request")
+    return value
+
+
+def _need_id(req: dict) -> str:
+    value = _need(req, "id", str)
+    if not wire.valid_id(value):
+        raise OpError("not-found")
+    return value
+
+
+def _session(reg, conn):
+    s = reg.get(conn.uid)
+    if s is None:
+        raise OpError("internal")
+    return s
+
+
+def _tier1(reg, conn):
+    """The session, if tier 1 is open on exactly this connection."""
+    s = _session(reg, conn)
+    if not s.unlocked() or s.tier1 is not conn:
+        raise OpError("locked")
+    return s
+
+
+def _still(s, conn, epoch: int) -> None:
+    """After an await: nothing locked the uid and this is still its tier-1 window."""
+    if s.epoch != epoch or not s.unlocked() or s.tier1 is not conn:
+        raise OpError("locked")
+
+
+def _detail(text) -> str:
+    return " ".join(_CONTROL_RE.sub(" ", str(text)).split())[:200]
+
+
+def _store_error(e: BaseException) -> OpError | None:
+    if isinstance(e, OpError):
+        return e
+    if isinstance(e, WorkerCancelled):
+        return OpError("cancelled")
+    if isinstance(e, vstore.StoreLocked):
+        return OpError("locked")
+    if isinstance(e, vstore.EntryNotFound):
+        return OpError("not-found")
+    if isinstance(e, vstore.SealError):
+        return OpError(e.kind)
+    return None
+
+
+async def _store(reg, uid: int, fn, *args):
+    try:
+        return await reg.run_store(uid, fn, *args)
+    except Exception as e:
+        err = _store_error(e)
+        if err is None:
+            logger.exception("uid %d: store call %s failed", uid, getattr(fn, "__name__", fn))
+            raise OpError("internal") from None
+        raise err from None
+
+
+def apple_error(e: BaseException) -> OpError:
+    """Map whatever the Apple pipeline raised to a protocol error (docs/protocol.md 6.6)."""
+    err = _store_error(e)
+    if err is not None:
+        return err
+    if isinstance(e, NeedsLogin):
+        return OpError("needs-login")
+    from ..errors import AppleError
+    try:
+        from ..auth.anisette import AnisetteError
+        if isinstance(e, AnisetteError):
+            return OpError("anisette-unavailable")
+    except ImportError:                             # pragma: no cover - requests missing
+        pass
+    try:
+        import requests
+        if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+            return OpError("network")
+    except ImportError:                             # pragma: no cover
+        pass
+    if isinstance(e, (ConnectionError, TimeoutError)):
+        return OpError("network")
+    if isinstance(e, AppleError):
+        return OpError("apple", detail=_detail(e))
+    logger.error("Apple call failed: %s", type(e).__name__, exc_info=e)
+    return OpError("internal")
+
+
+async def _apple_call(reg, s, fn, *args):
+    try:
+        return await reg.run_store(s.uid, fn, *args)
+    except Exception as e:
+        err = apple_error(e)
+        if err.code == "needs-login":
+            await _mark_needs_login(reg, s)
+        raise err from None
+
+
+async def _mark_needs_login(reg, s) -> None:
+    try:
+        await reg.run_store(s.uid, lambda: s.store.set_sync_status(needs_login=True))
+    except Exception:
+        logger.debug("uid %d: could not record needs_login", s.uid, exc_info=True)
+    after_reply(lambda: reg.notify_ui(s.uid, {"event": "needs-login"}))
+
+
+async def _wire_list(reg, s) -> tuple[list, dict]:
+    metas = await _store(reg, s.uid, s.store.list_meta)
+    st = await _store(reg, s.uid, s.store.status)
+    return wire.entries(metas, s.show_all), st
+
+
+def _notify_list_after(reg, s) -> None:
+    """After an edit: send the fresh list as a `synced` event once the reply has gone."""
+    epoch = s.epoch
+
+    async def send():
+        if s.epoch != epoch or not s.unlocked():
+            return
+        try:
+            entries, st = await _wire_list(reg, s)
+        except OpError:
+            return
+        if s.epoch == epoch and s.unlocked():
+            reg.notify_ui(s.uid, {"event": "synced", "entries": entries,
+                                  "synced_at": st.get("synced_at"),
+                                  "counts": {"added": 0, "changed": 0, "deleted": 0,
+                                             "unchanged": len(entries)}})
+    after_reply(lambda: spawn(send()))
+
+
+def _totp_now(reg, secrets_) -> tuple[str, float, int]:
+    from .. import totp
+    params = getattr(secrets_, "totp_params", None) or {}
+    period = int(params.get("period") or totp.DEFAULT_PERIOD)
+    now = reg.wall()
+    code = totp.code(secrets_.totp_secret, digits=int(params.get("digits") or 6),
+                     period=period, algorithm=int(params.get("algorithm") or 0), at=now)
+    return code, (math.floor(now / period) + 1) * period, period
+
+
+def _clean_text(value, field: str, max_len: int, *, allow_newlines: bool = False) -> str:
+    if not isinstance(value, str):
+        raise OpError("bad-request")
+    if len(value) > max_len or "\x00" in value:
+        raise OpError("invalid", field=field)
+    if not allow_newlines and _CONTROL_RE.search(value):
+        raise OpError("invalid", field=field)
+    return value
+
+
+def _clean_host(value, field: str) -> str:
+    if not isinstance(value, str):
+        raise OpError("bad-request")
+    host = value.strip().lower()
+    if not _HOST_RE.match(host):
+        raise OpError("invalid", field=field)
+    return host
+
+
+def validate_fields(fields: dict, generate, allowed: frozenset) -> dict:
+    """The `fields` (and `generate`) of set or create, checked and normalized."""
+    if not isinstance(fields, dict):
+        raise OpError("bad-request")
+    if generate is not None and not isinstance(generate, dict):
+        raise OpError("bad-request")
+    out: dict = {}
+    for key, value in fields.items():
+        if key not in allowed:
+            raise OpError("invalid", field=str(key)[:64])
+        if key == "password":
+            v = _clean_text(value, key, MAX_PASSWORD, allow_newlines=True)
+            if not v:
+                raise OpError("invalid", field=key)
+            out[key] = v
+        elif key == "notes":
+            out[key] = _clean_text(value, key, MAX_NOTES, allow_newlines=True)
+        elif key in ("nickname", "title", "username"):
+            out[key] = _clean_text(value, key, MAX_TEXT).strip()
+        elif key == "domain":
+            out[key] = "" if value == "" else _clean_host(value, key)
+        elif key == "sites":
+            if not isinstance(value, list) or len(value) > MAX_SITES:
+                raise OpError("invalid", field=key)
+            out[key] = [_clean_host(v, key) for v in value]
+        elif key == "totp":
+            out[key] = _clean_totp(value)
+    if generate is not None:
+        if "password" in out:
+            raise OpError("invalid", field="generate")
+        from ..vault.generate import generate as make_password
+        out["password"] = make_password()
+    return out
+
+
+def _clean_totp(value) -> dict:
+    if not isinstance(value, dict):
+        raise OpError("bad-request")
+    if value.get("remove") is True and "setup" not in value:
+        return {"remove": True}
+    setup = value.get("setup")
+    if not isinstance(setup, str) or len(setup) > 4096:
+        raise OpError("invalid", field="totp")
+    from .. import totp
+    try:
+        totp.parse_setup(setup)
+    except totp.SetupError:
+        raise OpError("invalid", field="totp") from None
+    return {"setup": setup}
+
+
+# --- hello ------------------------------------------------------------------------------------
+
+async def hello(reg, conn, req: dict) -> dict:
+    """The reply to a verified hello whose role the server already set on `conn`."""
+    s = await reg.session_for(conn.uid)
+    if conn.role == "ui":
+        if s.ui is not None and not s.ui.closed:
+            s.ui.send_event({"event": "focus"})
+            raise OpError("already-running")
+        if s.tier1 is not None:
+            reg.lock(conn.uid, None, notify=False)
+        s.ui = conn
+        st = await _store(reg, conn.uid, s.store.status)
+        state = st.get("state") or "locked"
+        if state == "unlocked":            # never: the last window's EOF locked the uid
+            reg.lock(conn.uid, None, notify=False)
+            state = "locked"
+        oc = s.old_copy
+        return {**_hello_base(), "state": state, "signed_in": bool(st.get("signed_in")),
+                "sealed_with": st.get("sealed_with"), "synced_at": None, "needs_login": None,
+                "settings": dict(s.settings),
+                "old_copy": ({"dir": oc.get("dir"), "migrated_at": oc.get("migrated_at")}
+                             if oc else None)}
+    if conn.role in protocol.TICKET_ROLES:
+        try:
+            t = reg.tickets.redeem(req.get("ticket"), uid=conn.uid, role=conn.role,
+                                   ppid=conn.ppid, parent_start_time=reg.parent_start_time)
+        except TicketError as e:
+            logger.warning("uid %d: %s hello refused: %s", conn.uid, conn.role, e)
+            raise OpError("bad-ticket") from None
+        if t.ui_conn is not s.ui:
+            t.wipe()
+            raise OpError("bad-ticket")
+        conn.ticket = t
+        if conn.role == "clip":
+            return {**_hello_base(), "purpose": "copy"}
+        if t.purpose == "purge":
+            return {**_hello_base(), "purpose": "purge", "files": list(t.extra.get("files", [])),
+                    "dir": t.extra.get("dir")}
+        return {**_hello_base(), "purpose": "import"}
+    if conn.role == "autofill":
+        if len(reg.connections(conn.uid, "autofill")) >= protocol.MAX_AUTOFILL_CONNS:
+            raise OpError("too-many")
+        return {**_hello_base(), "state": reg.autofill_state(s)}
+    raise OpError("forbidden")
+
+
+# --- sync --------------------------------------------------------------------------------------
+
+async def background_sync(reg, uid: int) -> str:
+    """One sync for an unlocked uid; never prompts. Returns what happened, for the log and the
+    scheduler: synced, locked, running, signed-out or failed."""
+    s = reg.get(uid)
+    if s is None or not s.unlocked():
+        logger.info("uid %d: locked: skipped", uid)
+        return "locked"
+    if s.busy:
+        return "running"
+    s.busy = "sync"
+    epoch = s.epoch
+    try:
+        st = await reg.run_store(uid, s.store.status)
+        if not st.get("signed_in"):
+            return "signed-out"
+        ctx = UserContext(uid, s.store, reg.anisette_url, None)
+        try:
+            counts = await reg.run_store(uid, reg.apple.sync, ctx) or {}
+        except Exception as e:
+            err = apple_error(e)
+            if s.epoch != epoch:
+                return "locked"
+            reason = err.code if err.code in SYNC_FAILED_REASONS else "apple"
+            if reason == "needs-login":
+                await _mark_needs_login(reg, s)
+            event = {"event": "sync-failed", "reason": reason}
+            if err.extra.get("detail"):
+                event["detail"] = err.extra["detail"]
+            reg.notify_ui(uid, event)
+            return "failed"
+        if s.epoch != epoch or not s.unlocked():
+            return "locked"
+        metas = await reg.run_store(uid, s.store.list_meta)
+        st = await reg.run_store(uid, s.store.status)
+        if s.epoch != epoch or not s.unlocked():
+            return "locked"
+        reg.notify_ui(uid, {
+            "event": "synced", "entries": wire.entries(metas, s.show_all),
+            "synced_at": counts.get("synced_at", st.get("synced_at")),
+            "counts": {k: int(counts.get(k, 0) or 0)
+                       for k in ("added", "changed", "deleted", "unchanged")}})
+        return "synced"
+    except Exception:
+        logger.exception("uid %d: sync failed", uid)
+        return "failed"
+    finally:
+        s.busy = None
+
+
+def _sync_after_reply(reg, uid: int) -> None:
+    after_reply(lambda: spawn(background_sync(reg, uid)))
+
+
+# --- ui: tier 1 ---------------------------------------------------------------------------------
+
+async def op_unlock(reg, conn, req):
+    s = _session(reg, conn)
+    show_all = _need(req, "all", bool, optional=True, default=False)
+    if s.unlocked() and s.tier1 is conn:
+        s.show_all = show_all
+        return await _unlocked_reply(reg, s)
+    if s.ui is not conn:
+        raise OpError("forbidden")
+    state = await _store(reg, conn.uid, s.store.state)
+    if state == "empty":
+        return {"locked": True, "reason": "empty"}
+    try:
+        await reg.authorize(conn, paths.ACTION_UNLOCK, {})
+    except OpError as e:
+        if e.code in protocol.UNLOCK_REFUSALS:
+            return {"locked": True, "reason": e.code, **e.extra}
+        raise
+    epoch = s.epoch
+    try:
+        await reg.run_store(conn.uid, s.store.unlock)
+    except vstore.SealError as e:
+        return {"locked": True, "reason": e.kind}
+    except Exception as e:
+        err = _store_error(e)
+        if err is None:
+            logger.exception("uid %d: unlock failed", conn.uid)
+            raise OpError("internal") from None
+        raise err from None
+    if s.epoch != epoch or conn.closed or s.ui is not conn:
+        reg._wipe_store(s)
+        raise OpError("cancelled")
+    try:
+        if await reg.run_store(conn.uid, s.store.reseal_if_tpm_available):
+            logger.info("uid %d: keys re-sealed with the TPM", conn.uid)
+    except Exception:
+        logger.warning("uid %d: TPM re-seal skipped", conn.uid, exc_info=True)
+    if s.epoch != epoch or conn.closed:
+        reg._wipe_store(s)
+        raise OpError("cancelled")
+    reg.open_tier1(s, conn, show_all)
+    reply = await _unlocked_reply(reg, s)
+    _sync_after_reply(reg, conn.uid)
+    return reply
+
+
+async def _unlocked_reply(reg, s) -> dict:
+    entries, st = await _wire_list(reg, s)
+    return {"entries": entries, "synced_at": st.get("synced_at"),
+            "needs_login": bool(st.get("needs_login"))}
+
+
+async def op_lock(reg, conn, req):
+    reg.lock(conn.uid, "user", notify=False)
+    after_reply(lambda: reg.notify_ui(conn.uid, {"event": "locked", "reason": "user"}))
+    return {"locked": True}
+
+
+async def op_release(reg, conn, req):
+    reg.release_grant(conn.uid)
+    reg.cancel_prompts(conn=conn, action=paths.ACTION_REVEAL)
+    return {"released": True}
+
+
+async def op_cancel(reg, conn, req):
+    target = _need(req, "target", int)
+    n = reg.cancel_prompts(conn=conn, rid=target)
+    s = reg.get(conn.uid)
+    fe = s.signin if s is not None else None
+    if fe is not None and fe.conn is conn and fe.rid == target and not fe.cancelled:
+        fe.cancel()
+        n += 1
+    return {"cancelled": n > 0}
+
+
+# --- ui: one entry ----------------------------------------------------------------------------
+
+async def op_grant(reg, conn, req):
+    id = _need_id(req)
+    s = _tier1(reg, conn)
+    meta = await _store(reg, conn.uid, s.store.get_meta, id)
+    reg.release_grant(conn.uid)
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_REVEAL, {"account": wire.account_label(meta)})
+    _still(s, conn, epoch)
+    secrets_ = await _store(reg, conn.uid, s.store.open_entry, id)
+    if s.epoch != epoch or not s.unlocked():
+        raise OpError("locked")
+    g = reg.put_grant(s, id, secrets_)
+    fields = ["password"]
+    if meta.has_notes:
+        fields.append("notes")
+    if meta.has_totp:
+        fields.append("code")
+    if meta.history_count:
+        fields.append("history")
+    return {"id": id, "expires": g.expires_wall, "grant_s": s.settings["grant_s"],
+            "single_use": g.single_use, "fields": fields}
+
+
+def _use_grant(reg, s, id):
+    """The live grant on `id`; ended is True when this use spent a single-use grant."""
+    return reg.grant_use(s.uid, id)
+
+
+async def op_reveal(reg, conn, req):
+    id = _need_id(req)
+    field = _need(req, "field", str)
+    if field not in protocol.REVEAL_FIELDS:
+        raise OpError("invalid", field="field")
+    s = _tier1(reg, conn)
+    g, ended = _use_grant(reg, s, id)
+    value = g.secrets.password if field == "password" else (g.secrets.notes or "")
+    if ended:
+        reg.end_grant(conn.uid)
+    return {"id": id, "field": field, "value": value,
+            "hide_after": protocol.REVEAL_HIDE_AFTER_S}
+
+
+async def op_totp(reg, conn, req):
+    id = _need_id(req)
+    s = _tier1(reg, conn)
+    g = reg.grant_check(conn.uid, id)
+    if not g.secrets.totp_secret:
+        raise OpError("invalid", field="id")
+    g, ended = _use_grant(reg, s, id)
+    code, valid_until, _ = _totp_now(reg, g.secrets)
+    if ended:
+        reg.end_grant(conn.uid)
+    return {"id": id, "code": code, "valid_until": valid_until}
+
+
+async def op_history(reg, conn, req):
+    id = _need_id(req)
+    s = _tier1(reg, conn)
+    g, ended = _use_grant(reg, s, id)
+    apple = {(h.get("date"), h.get("value")) for h in (g.secrets.apple_history or [])
+             if isinstance(h, dict)}
+    if ended:
+        reg.end_grant(conn.uid)
+    epoch = s.epoch
+    items = await _store(reg, conn.uid, s.store.history, id)
+    _still(s, conn, epoch)
+    return {"id": id, "items": [{"date": d, "value": v,
+                                 "source": "apple" if (d, v) in apple else "local"}
+                                for d, v in items]}
+
+
+async def op_copy(reg, conn, req):
+    id = _need_id(req)
+    field = _need(req, "field", str)
+    if field not in protocol.COPY_FIELDS:
+        raise OpError("invalid", field="field")
+    s = _tier1(reg, conn)
+    if field in protocol.COPY_FIELDS_NEED_GRANT:
+        g = reg.grant_check(conn.uid, id)
+        if field == "code":
+            if not g.secrets.totp_secret:
+                raise OpError("invalid", field="field")
+            value = _totp_now(reg, g.secrets)[0]
+        elif field == "password":
+            value = g.secrets.password
+        else:
+            value = g.secrets.notes or ""
+        _, ended = _use_grant(reg, s, id)
+        if ended:
+            reg.end_grant(conn.uid)
+    else:
+        epoch = s.epoch
+        meta = await _store(reg, conn.uid, s.store.get_meta, id)
+        _still(s, conn, epoch)
+        value = meta.username if field == "username" else meta.domain
+    # One offer at a time: a new copy withdraws the previous one.
+    reg.tickets.revoke_uid(conn.uid, role="clip")
+    reg.withdraw(conn.uid, roles=("clip",))
+    token = reg.tickets.issue(uid=conn.uid, role="clip", purpose="copy", ui_conn=conn, id=id,
+                              field=field, value=value or "",
+                              sensitive=field in protocol.COPY_FIELDS_SENSITIVE)
+    return {"ticket": token, "ttl": protocol.TICKET_TTL_S}
+
+
+async def op_set(reg, conn, req):
+    id = _need_id(req)
+    fields = _need(req, "fields", dict)
+    generate = req.get("generate")
+    clean = validate_fields(fields, generate, protocol.SET_FIELDS)
+    s = _tier1(reg, conn)
+    reg.grant_check(conn.uid, id)
+    if s.busy:
+        raise OpError("busy-sync")
+    g, ended = _use_grant(reg, s, id)
+    epoch = s.epoch
+    push = {k: v for k, v in clean.items() if k != "nickname"}
+    s.busy = "edit"
+    try:
+        if "nickname" in clean:
+            names = dict(await _store(reg, conn.uid, s.store.load_nicknames) or {})
+            if clean["nickname"]:
+                names[id] = clean["nickname"]
+            else:
+                names.pop(id, None)
+            await _store(reg, conn.uid, s.store.save_nicknames, names)
+        if push:
+            ctx = UserContext(conn.uid, s.store, reg.anisette_url, None)
+            await _apple_call(reg, s, reg.apple.push_set, ctx, id, push)
+    finally:
+        s.busy = None
+    if ended:
+        reg.end_grant(conn.uid)
+    elif push and s.epoch == epoch and reg.grants.current(conn.uid) is g:
+        # The grant stays on this entry; its buffer now holds what iCloud has.
+        fresh = await _store(reg, conn.uid, s.store.open_entry, id)
+        if reg.grants.current(conn.uid) is g and s.epoch == epoch:
+            fresh, g.secrets = g.secrets, fresh
+        wipe_secrets(fresh)
+    _notify_list_after(reg, s)
+    return {"id": id, "synced": bool(push)}
+
+
+async def op_create(reg, conn, req):
+    fields = _need(req, "fields", dict)
+    generate = req.get("generate")
+    clean = validate_fields(fields, generate, protocol.CREATE_FIELDS)
+    if "password" not in clean:
+        raise OpError("invalid", field="password")
+    s = _tier1(reg, conn)
+    if s.busy:
+        raise OpError("busy-sync")
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    _still(s, conn, epoch)
+    if s.busy:
+        raise OpError("busy-sync")
+    s.busy = "edit"
+    try:
+        ctx = UserContext(conn.uid, s.store, reg.anisette_url, None)
+        new_id = await _apple_call(reg, s, reg.apple.create, ctx, clean)
+    finally:
+        s.busy = None
+    _notify_list_after(reg, s)
+    return {"id": new_id}
+
+
+async def op_delete(reg, conn, req):
+    id = _need_id(req)
+    s = _tier1(reg, conn)
+    await _store(reg, conn.uid, s.store.get_meta, id)
+    if s.busy:
+        raise OpError("busy-sync")
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    _still(s, conn, epoch)
+    if s.busy:
+        raise OpError("busy-sync")
+    s.busy = "edit"
+    try:
+        ctx = UserContext(conn.uid, s.store, reg.anisette_url, None)
+        await _apple_call(reg, s, reg.apple.delete, ctx, id)
+    finally:
+        s.busy = None
+    g = reg.grants.current(conn.uid)
+    if g is not None and g.id == id:
+        reg.release_grant(conn.uid)
+    _notify_list_after(reg, s)
+    return {"deleted": True}
+
+
+async def op_totp_preview(reg, conn, req):
+    setup = _need(req, "setup", str)
+    _tier1(reg, conn)
+    if len(setup) > 4096:
+        raise OpError("invalid", field="setup")
+    from .. import totp
+    try:
+        cfg = totp.parse_setup(setup)
+    except totp.SetupError:
+        raise OpError("invalid", field="setup") from None
+    now = reg.wall()
+    code = totp.code(cfg["secret"], digits=cfg["digits"], period=cfg["period"],
+                     algorithm=cfg["algorithm"], at=now)
+    return {"code": code, "seconds": totp.seconds_remaining(cfg["period"], at=now),
+            "issuer": cfg.get("issuer", ""), "account": cfg.get("accountName", "")}
+
+
+# --- ui: sign-in --------------------------------------------------------------------------------
+
+async def op_signin(reg, conn, req):
+    mode = _need(req, "mode", str)
+    if mode not in ("login", "relogin"):
+        raise OpError("invalid", field="mode")
+    s = _session(reg, conn)
+    if s.ui is not conn:
+        raise OpError("forbidden")
+    if s.busy:
+        raise OpError("busy-sync")
+    st = await _store(reg, conn.uid, s.store.status)
+    fresh = False
+    if mode == "login":
+        if st.get("state") == "empty":
+            fresh = True
+        elif not (s.unlocked() and s.tier1 is conn):
+            raise OpError("locked")
+        elif st.get("signed_in"):
+            raise OpError("invalid", field="mode")
+    else:
+        if not (s.unlocked() and s.tier1 is conn):
+            raise OpError("locked")
+        if not st.get("signed_in"):
+            raise OpError("not-signed-in")
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    if conn.closed or s.ui is not conn or s.epoch != epoch:
+        raise OpError("cancelled")
+    if s.busy:
+        raise OpError("busy-sync")
+    s.busy = "signin"
+    fe = SocketFrontend(asyncio.get_running_loop(), conn, _rid(req))
+    try:
+        if fresh:
+            if await _store(reg, conn.uid, s.store.state) != "empty":
+                raise OpError("not-locked")
+            s.store = await _store(reg, conn.uid, reg.store_cls.create, conn.uid)
+            reg.open_tier1(s, conn)
+            epoch = s.epoch
+        _still(s, conn, epoch)
+        s.signin = fe
+        ctx = UserContext(conn.uid, s.store, reg.anisette_url, fe)
+        fn = reg.apple.login if mode == "login" else reg.apple.relogin
+        await _apple_call(reg, s, fn, ctx)
+    finally:
+        s.signin = None
+        s.busy = None
+    _still(s, conn, epoch)
+    s.next_sync_at = None
+    _notify_list_after(reg, s)
+    return {"ok": True}
+
+
+def _rid(req) -> int:
+    from .sessions import current_request
+    r = current_request()
+    return r.rid if r is not None else req.get("rid")
+
+
+async def op_answer(reg, conn, req):
+    ask_id = _need(req, "ask_id", int)
+    cancel = _need(req, "cancel", bool, optional=True, default=False)
+    value = req.get("value")
+    if not cancel and not isinstance(value, str):
+        raise OpError("bad-request")
+    if isinstance(value, str) and len(value) > MAX_PASSPHRASE:
+        raise OpError("invalid", field="value")
+    s = _session(reg, conn)
+    fe = s.signin
+    if fe is None or fe.conn is not conn or not fe.answer(ask_id, value, cancel):
+        raise OpError("invalid", field="ask_id")
+    return {"ok": True}
+
+
+async def op_signout(reg, conn, req):
+    s = _tier1(reg, conn)
+    if s.busy:
+        raise OpError("busy-sync")
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    _still(s, conn, epoch)
+    if s.busy:
+        raise OpError("busy-sync")
+    s.busy = "edit"
+    try:
+        ctx = UserContext(conn.uid, s.store, reg.anisette_url, None)
+        await _apple_call(reg, s, reg.apple.signout, ctx)
+    finally:
+        s.busy = None
+    reg.lock(conn.uid, "signout", notify=False)
+    after_reply(lambda: reg.notify_ui(conn.uid, {"event": "locked", "reason": "signout"}))
+    return {"signed_out": True}
+
+
+# --- ui: sync and settings ------------------------------------------------------------------------
+
+async def op_sync(reg, conn, req):
+    s = _session(reg, conn)
+    if not s.unlocked() or s.tier1 is not conn:
+        return {"skipped": "locked"}
+    if s.busy:
+        return {"skipped": "running"}
+    st = await _store(reg, conn.uid, s.store.status)
+    if not st.get("signed_in"):
+        return {"skipped": "signed-out"}
+    _sync_after_reply(reg, conn.uid)
+    return {"queued": True}
+
+
+async def op_settings(reg, conn, req):
+    s = _session(reg, conn)
+    if "set" in req:
+        new = _need(req, "set", dict)
+        for key, value in new.items():
+            if key not in protocol.SETTINGS_KEYS or not setting_ok(key, value):
+                raise OpError("invalid", field=str(key)[:64])
+        merged = {**s.settings, **new}
+        full = dict(await _store(reg, conn.uid, s.store.load_settings) or {})
+        full.update(merged)
+        await _store(reg, conn.uid, s.store.save_settings, full)
+        s.settings = merged
+        if "idle_lock_s" in new:
+            s.last_ui_request = reg.clock()
+    elif req.get("get") is not True:
+        raise OpError("bad-request")
+    return {"settings": dict(s.settings)}
+
+
+# --- ui: migration and cleanup ------------------------------------------------------------------
+
+async def _save_setting_keys(reg, s, **changes) -> None:
+    full = dict(await _store(reg, s.uid, s.store.load_settings) or {})
+    for key, value in changes.items():
+        if value is None:
+            full.pop(key, None)
+        else:
+            full[key] = value
+    await _store(reg, s.uid, s.store.save_settings, full)
+
+
+async def op_migrate_begin(reg, conn, req):
+    s = _session(reg, conn)
+    if s.ui is not conn:
+        raise OpError("forbidden")
+    state = await _store(reg, conn.uid, s.store.state)
+    # A store created by an earlier migrate-begin that never committed is started over, not
+    # refused: it holds keys and nothing else.
+    retry = state != "empty" and await _migration_pending(reg, s)
+    if state != "empty" and not retry:
+        raise OpError("not-locked")
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    if conn.closed or s.ui is not conn or s.epoch != epoch:
+        raise OpError("cancelled")
+    if s.unlocked():
+        reg.lock(conn.uid, None, notify=False)
+    make = reg.store_cls.reset if retry else reg.store_cls.create
+    s.store = await _store(reg, conn.uid, make, conn.uid)
+    if conn.closed or s.ui is not conn:
+        reg._wipe_store(s)
+        raise OpError("cancelled")
+    s.migrating = True
+    try:
+        await _save_setting_keys(reg, s, migration_pending=True)
+    except OpError:
+        logger.warning("uid %d: could not record the pending migration", conn.uid)
+    reg.open_tier1(s, conn)
+    token = reg.tickets.issue(uid=conn.uid, role="migrate", purpose="import", ui_conn=conn)
+    return {"ticket": token, "ttl": protocol.TICKET_TTL_S}
+
+
+async def _migration_pending(reg, s) -> bool:
+    if getattr(s, "migrating", False):
+        return True
+    try:
+        full = await _store(reg, s.uid, s.store.load_settings) or {}
+    except OpError:
+        return False
+    return full.get("migration_pending") is True
+
+
+async def op_purge_old_copy(reg, conn, req):
+    s = _session(reg, conn)
+    if s.ui is not conn:
+        raise OpError("forbidden")
+    oc = s.old_copy
+    if not oc or not oc.get("files") or not oc.get("dir"):
+        raise OpError("not-found")
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    if conn.closed or s.ui is not conn or s.epoch != epoch:
+        raise OpError("cancelled")
+    token = reg.tickets.issue(uid=conn.uid, role="migrate", purpose="purge", ui_conn=conn,
+                              extra={"files": list(oc["files"]), "dir": oc["dir"]})
+    return {"ticket": token, "ttl": protocol.TICKET_TTL_S}
+
+
+async def op_reset(reg, conn, req):
+    s = _session(reg, conn)
+    if s.ui is not conn:
+        raise OpError("forbidden")
+    if await _store(reg, conn.uid, s.store.state) not in ("tpm-cleared", "damaged"):
+        raise OpError("not-locked")
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    if conn.closed or s.ui is not conn or s.epoch != epoch:
+        raise OpError("cancelled")
+    if await _store(reg, conn.uid, s.store.state) not in ("tpm-cleared", "damaged"):
+        raise OpError("not-locked")
+    reg.lock(conn.uid, None, notify=False)
+    s.store = await _store(reg, conn.uid, reg.store_cls.reset, conn.uid)
+    if conn.closed or s.ui is not conn:
+        reg._wipe_store(s)
+        raise OpError("cancelled")
+    # The old keys are gone and the fresh store holds nothing; tier 1 stays open on it so the
+    # sign-in that follows needs only its own dialog.
+    reg.open_tier1(s, conn)
+    return {"state": "empty"}
+
+
+async def op_clip_history_check(reg, conn, req):
+    items = _need(req, "items", list)
+    if len(items) > MAX_CHECK_ITEMS or any(
+            not isinstance(i, str) or len(i) > MAX_CHECK_ITEM for i in items):
+        raise OpError("invalid", field="items")
+    s = _tier1(reg, conn)
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    _still(s, conn, epoch)
+    matches = await _store(reg, conn.uid, s.store.pwmac_matches, list(items))
+    return {"matches": sorted(int(i) for i in matches)}
+
+
+# --- clip ---------------------------------------------------------------------------------------
+
+async def op_redeem(reg, conn, req):
+    t = getattr(conn, "ticket", None)
+    if t is None or conn.data.get("redeemed"):
+        raise OpError("bad-ticket")
+    conn.data["redeemed"] = True
+    value, t.value = t.value, None
+    s = _session(reg, conn)
+    return {"value": value or "", "sensitive": bool(t.sensitive),
+            "timeout": s.settings["clip_timeout_s"]}
+
+
+async def op_clip_result(reg, conn, req):
+    outcome = _need(req, "outcome", str)
+    if outcome not in protocol.CLIP_OUTCOMES:
+        raise OpError("invalid", field="outcome")
+    t = getattr(conn, "ticket", None)
+    if t is None or not conn.data.get("redeemed"):
+        raise OpError("bad-ticket")
+    if conn.data.get("result"):
+        raise OpError("invalid", field="outcome")
+    conn.data["result"] = outcome
+    event = {"event": "clip", "id": t.id, "field": t.field, "outcome": outcome}
+    after_reply(lambda: reg.notify_ui(conn.uid, event))
+    return {"ok": True}
+
+
+# --- migrate ------------------------------------------------------------------------------------
+
+def _import_ticket(conn, purpose: str):
+    t = getattr(conn, "ticket", None)
+    if t is None or t.purpose != purpose:
+        raise OpError("forbidden")
+    return t
+
+
+def _import_files(conn) -> dict:
+    return conn.data.setdefault("files", {})
+
+
+def _discard(files: dict, name: str) -> None:
+    f = files.pop(name, None)
+    if f is not None:
+        f["buf"][:] = bytes(len(f["buf"]))
+
+
+async def op_import_file(reg, conn, req):
+    _import_ticket(conn, "import")
+    name = _need(req, "name", str)
+    seq = _need(req, "seq", int)
+    b64 = _need(req, "b64", str)
+    eof = _need(req, "eof", bool, optional=True, default=False)
+    if name not in protocol.IMPORT_FILES:
+        raise OpError("invalid", field="name")
+    files = _import_files(conn)
+    f = files.get(name)
+    if f is not None and f["done"]:
+        _discard(files, name)
+        raise OpError("invalid", field="name")
+    expected = 0 if f is None else f["seq"]
+    if seq != expected:
+        _discard(files, name)
+        raise OpError("invalid", field="seq")
+    try:
+        chunk = base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError):
+        _discard(files, name)
+        raise OpError("invalid", field="b64") from None
+    if len(chunk) > protocol.IMPORT_CHUNK_MAX:
+        _discard(files, name)
+        raise OpError("invalid", field="b64")
+    if f is None:
+        f = files[name] = {"buf": bytearray(), "seq": 0, "done": False}
+    if len(f["buf"]) + len(chunk) > protocol.IMPORT_FILE_MAX:
+        _discard(files, name)
+        raise OpError("invalid", field="name")
+    f["buf"] += chunk
+    f["seq"] += 1
+    if not eof:
+        return {"ok": True}
+    f["done"] = True
+    f["sha256"] = hashlib.sha256(f["buf"]).hexdigest()
+    return {"ok": True, "size": len(f["buf"]), "sha256": f["sha256"]}
+
+
+def _done(conn, name: str) -> bytes | None:
+    f = _import_files(conn).get(name)
+    return bytes(f["buf"]) if f is not None and f["done"] else None
+
+
+async def op_import_key(reg, conn, req):
+    _import_ticket(conn, "import")
+    has_key, has_pass = "key_b64" in req, "passphrase" in req
+    if has_key == has_pass:
+        raise OpError("bad-request")
+    check = _done(conn, "check.enc")
+    if check is None:
+        raise OpError("incomplete")
+    lock = conn.data.setdefault("key_lock", asyncio.Lock())
+    async with lock:
+        if has_key:
+            try:
+                key = base64.b64decode(_need(req, "key_b64", str), validate=True)
+            except (binascii.Error, ValueError):
+                raise OpError("invalid", field="key_b64") from None
+            if len(key) != 32:
+                raise OpError("invalid", field="key_b64")
+        else:
+            passphrase = _need(req, "passphrase", str)
+            if not passphrase or len(passphrase) > MAX_PASSPHRASE:
+                raise OpError("invalid", field="passphrase")
+            kdf = _done(conn, "kdf.json")
+            if kdf is None:
+                raise OpError("incomplete")
+            try:
+                key = await asyncio.to_thread(vstore.v1_key_from_passphrase, kdf, passphrase)
+            except (ValueError, KeyError, TypeError):
+                raise OpError("invalid", field="kdf.json") from None
+            finally:
+                passphrase = None
+        if not vstore.v1_key_opens(check, key):
+            raise OpError("wrong-passphrase")
+        old = conn.data.get("key")
+        if isinstance(old, bytearray):
+            old[:] = bytes(len(old))
+        conn.data["key"] = bytearray(key)
+    return {"ok": True}
+
+
+async def op_import_commit(reg, conn, req):
+    _import_ticket(conn, "import")
+    backup_dir = _need(req, "backup_dir", str, optional=True)
+    if backup_dir is not None and (not backup_dir.startswith("/") or "\x00" in backup_dir
+                                   or len(backup_dir) > 4096):
+        raise OpError("invalid", field="backup_dir")
+    files = _import_files(conn)
+    key = conn.data.get("key")
+    if key is None or any(_done(conn, n) is None for n in protocol.IMPORT_REQUIRED):
+        raise OpError("incomplete")
+    s = _session(reg, conn)
+    if not s.unlocked():
+        raise OpError("locked")
+    payload = {n: bytes(f["buf"]) for n, f in files.items() if f["done"]}
+    digests = [{"name": n, "sha256": f["sha256"]} for n, f in sorted(files.items())
+               if f["done"]]
+    try:
+        result = await reg.run_store(conn.uid, s.store.import_v1, payload, bytes(key))
+    except vstore.ImportMismatch:
+        raise OpError("mismatch") from None
+    except vstore.WrongPassphrase:
+        raise OpError("wrong-passphrase") from None
+    except Exception as e:
+        err = _store_error(e)
+        if err is None:
+            logger.exception("uid %d: import failed", conn.uid)
+            raise OpError("internal") from None
+        raise err from None
+    finally:
+        payload = None
+        key[:] = bytes(len(key))
+        conn.data.pop("key", None)
+        for name in list(files):
+            _discard(files, name)
+    s.migrating = False
+    oc = None
+    if backup_dir is not None:
+        oc = {"dir": backup_dir, "files": digests, "migrated_at": reg.wall()}
+        s.old_copy = oc
+    try:
+        await _save_setting_keys(reg, s, old_copy=oc, migration_pending=None)
+    except OpError:
+        logger.warning("uid %d: could not record the old copy", conn.uid)
+    counts = dict(result.get("counts", {}))
+    after_reply(lambda: reg.notify_ui(conn.uid, {"event": "migrated", "counts": counts}))
+    _sync_after_reply(reg, conn.uid)
+    return {"counts": counts, "digest": result.get("digest")}
+
+
+async def op_purge_result(reg, conn, req):
+    _import_ticket(conn, "purge")
+    removed = _need(req, "removed", list)
+    kept = _need(req, "kept", list)
+    if not all(isinstance(n, str) for n in removed + kept):
+        raise OpError("bad-request")
+    s = _session(reg, conn)
+    s.old_copy = None
+    await _save_setting_keys(reg, s, old_copy=None)
+    logger.info("uid %d: old copy purged (%d removed, %d kept)", conn.uid, len(removed),
+                len(kept))
+    return {"ok": True}
+
+
+# --- autofill (WP6), imported on first use ----------------------------------------------------
+
+async def op_autofill_query(reg, conn, req):
+    from . import autofill
+    return await autofill.handle_autofill_query(reg, conn, req)
+
+
+async def op_autofill_fill(reg, conn, req):
+    from . import autofill
+    return await autofill.handle_autofill_fill(reg, conn, req)
+
+
+HANDLERS = {
+    "unlock": op_unlock, "lock": op_lock, "release": op_release, "cancel": op_cancel,
+    "grant": op_grant, "reveal": op_reveal, "totp": op_totp, "history": op_history,
+    "copy": op_copy, "set": op_set, "create": op_create, "delete": op_delete,
+    "totp-preview": op_totp_preview, "signin": op_signin, "answer": op_answer,
+    "signout": op_signout, "sync": op_sync, "settings": op_settings,
+    "migrate-begin": op_migrate_begin, "reset": op_reset, "purge-old-copy": op_purge_old_copy,
+    "clip-history-check": op_clip_history_check,
+    "redeem": op_redeem, "clip-result": op_clip_result,
+    "import-file": op_import_file, "import-key": op_import_key,
+    "import-commit": op_import_commit, "purge-result": op_purge_result,
+    "autofill-query": op_autofill_query, "autofill-fill": op_autofill_fill,
+}

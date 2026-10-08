@@ -1,0 +1,502 @@
+"""Per-uid state, and the shared services every op handler uses (protocol.SessionRegistry).
+
+A Session is one uid: its store, its one window connection, whether tier 1 is open on that
+connection, its settings, and what is running for it. The Registry holds every session plus
+the things that must be decided in exactly one place:
+
+- authorize(): the only way any handler raises a polkit dialog. It enforces one outstanding
+  dialog per (uid, bucket) and PROMPT_ANSWERED_PER_MIN answered dialogs per rolling minute,
+  supersedes a pending `grant` with a new one, and cancels on EOF.
+- lock(): every lock trigger in docs/protocol.md 4.2 ends here. It marks the uid locked first,
+  then wipes the grant, revokes tickets, withdraws clip and migrate processes, cancels dialogs
+  and a running sign-in, and wipes the store's keys - synchronously, so a PrepareForSleep
+  handler can release its inhibitor knowing nothing is left.
+- run_store(): blocking UserStore and Apple calls go to a worker thread under the uid's store
+  lock. A lock that lands while such a call runs wipes the keys at once and again when the call
+  returns, so a sync finishing late cannot leave them in memory.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import itertools
+import logging
+import math
+import secrets
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable
+
+from . import paths, protocol
+from .context import Cancelled
+from .grants import GrantTable
+from .peer import start_time_of
+from .polkit import AUTHORIZED, CANCELLED, COUNTED, NO_AGENT, Authority, Subject, sanitize
+from .protocol import OpError
+from .tickets import TicketBook
+
+logger = logging.getLogger(__name__)
+
+ANISETTE_URL = "http://127.0.0.1:6969"
+
+
+# --- the request being handled --------------------------------------------------------------
+# The server sets this for each request's task. Handlers use after_reply() for events their
+# request causes, so those events follow the reply (docs/protocol.md 1, ordering).
+
+class Request:
+    __slots__ = ("conn", "rid", "after")
+
+    def __init__(self, conn, rid):
+        self.conn = conn
+        self.rid = rid
+        self.after: list[Callable[[], Any]] = []
+
+
+_current: contextvars.ContextVar[Request | None] = contextvars.ContextVar(
+    "pear_request", default=None)
+
+
+def current_request() -> Request | None:
+    return _current.get()
+
+
+def set_request(req: Request | None):
+    return _current.set(req)
+
+
+def reset_request(token) -> None:
+    _current.reset(token)
+
+
+def after_reply(fn: Callable[[], Any]) -> None:
+    """Run `fn` right after the current request's reply is queued (at once outside one)."""
+    req = _current.get()
+    if req is None:
+        fn()
+    else:
+        req.after.append(fn)
+
+
+def spawn(coro) -> asyncio.Task:
+    """A background task that belongs to no request, so its events are sent when they
+    happen rather than queued behind a reply that has already gone."""
+    return asyncio.get_running_loop().create_task(coro, context=contextvars.Context())
+
+
+class WorkerCancelled(Exception):
+    """context.Cancelled raised in a worker thread, carried back as an ordinary exception: a
+    KeyboardInterrupt reaching an asyncio task would be re-raised out of the event loop."""
+
+
+def _call(fn, args):
+    try:
+        return fn(*args)
+    except Cancelled:
+        raise WorkerCancelled() from None
+    except KeyboardInterrupt:
+        raise WorkerCancelled() from None
+
+
+# --- sessions ---------------------------------------------------------------------------------
+
+class Session:
+    def __init__(self, uid: int, store):
+        self.uid = uid
+        self.store = store
+        self.ui = None                     # the one window connection
+        self.tier1 = None                  # the connection tier 1 is open on (always self.ui)
+        self.settings: dict = dict(protocol.DEFAULT_SETTINGS)
+        self.old_copy: dict | None = None
+        self.settings_loaded = False
+        self.show_all = False              # unlock{all:true}
+        self.epoch = 0                     # bumped by every lock
+        self.busy: str | None = None       # "sync" | "signin" | "edit" while Apple work runs
+        self.signin = None                 # the live SocketFrontend
+        self.migrating = False             # migrate-begin made a store, import not committed
+        self.last_ui_request = 0.0
+        self.next_sync_at: float | None = None
+        self.store_lock = asyncio.Lock()
+
+    def unlocked(self) -> bool:
+        t = self.tier1
+        return t is not None and t is self.ui and not t.closed
+
+
+class _Pending:
+    __slots__ = ("conn", "rid", "action", "cancel_id", "cancelled", "key")
+
+    def __init__(self, conn, rid, action, key):
+        self.conn = conn
+        self.rid = rid
+        self.action = action
+        self.key = key
+        self.cancel_id = f"pear-{secrets.token_hex(8)}"
+        self.cancelled = False
+
+
+def validate_settings(d: dict) -> dict:
+    """The public settings from whatever load_settings returned, each key checked against its
+    range and replaced by the default when it fails."""
+    out = dict(protocol.DEFAULT_SETTINGS)
+    for key in protocol.SETTINGS_KEYS:
+        if key in d and setting_ok(key, d[key]):
+            out[key] = d[key]
+    return out
+
+
+def setting_ok(key: str, value) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    if key == "grant_s":
+        lo, hi = protocol.GRANT_S_RANGE
+        return lo <= value <= hi
+    if key == "clip_timeout_s":
+        lo, hi = protocol.CLIP_TIMEOUT_S_RANGE
+        return lo <= value <= hi
+    if key == "idle_lock_s":
+        return value in protocol.IDLE_LOCK_S_CHOICES
+    return False
+
+
+class Registry:
+    """Implements protocol.SessionRegistry, plus the lifecycle the server and the lock
+    triggers drive."""
+
+    def __init__(self, *, store_cls=None, authority=None, apple=None,
+                 clock: Callable[[], float] = time.monotonic,
+                 wall: Callable[[], float] = time.time,
+                 anisette_url: str = ANISETTE_URL,
+                 parent_start_time: Callable[[int], int | None] = start_time_of):
+        self._store_cls = store_cls
+        self._authority = authority
+        self._apple = apple
+        self.clock = clock
+        self.wall = wall
+        self.anisette_url = anisette_url
+        self.parent_start_time = parent_start_time
+        self.sessions: dict[int, Session] = {}
+        self.conns: set = set()
+        self.tickets = TicketBook(clock)
+        self.grants = GrantTable(clock, wall)
+        self._pending: dict[tuple, _Pending] = {}
+        self._answered: dict[tuple, deque] = {}
+        self._grant_timers: dict[int, asyncio.TimerHandle] = {}
+        self._store_pool = ThreadPoolExecutor(8, thread_name_prefix="pear-store")
+        self._prompt_pool = ThreadPoolExecutor(8, thread_name_prefix="pear-polkit")
+        self._conn_ids = itertools.count(1)
+
+    # --- lazily bound collaborators (tests pass fakes) ---------------------------------------
+    @property
+    def store_cls(self):
+        if self._store_cls is None:
+            from ..vstore import UserStore
+            self._store_cls = UserStore
+        return self._store_cls
+
+    @property
+    def authority(self):
+        if self._authority is None:
+            self._authority = Authority()
+        return self._authority
+
+    @property
+    def apple(self):
+        if self._apple is None:
+            from . import apple
+            self._apple = apple
+        return self._apple
+
+    # --- protocol.SessionRegistry -------------------------------------------------------------
+    def get(self, uid: int) -> Session | None:
+        return self.sessions.get(uid)
+
+    def connections(self, uid: int, role: str) -> list:
+        return [c for c in self.conns if c.uid == uid and c.role == role and not c.closed]
+
+    async def authorize(self, conn, action: str, details: dict[str, str]) -> None:
+        bucket = protocol.PROMPT_BUCKET.get(conn.role)
+        if bucket is None or action not in protocol.PROMPT_ACTION.values():
+            raise OpError("forbidden")
+        if conn.closed:
+            raise OpError("cancelled")
+        key = (conn.uid, bucket)
+        old = self._pending.get(key)
+        if old is not None:
+            if action == paths.ACTION_REVEAL and old.action == paths.ACTION_REVEAL \
+                    and old.conn is conn:
+                self._cancel(old)            # a new grant supersedes the pending one
+            else:
+                raise OpError("prompt-pending")
+        answered = self._answered.setdefault(key, deque())
+        now = self.clock()
+        while answered and now - answered[0] >= 60:
+            answered.popleft()
+        if len(answered) >= protocol.PROMPT_ANSWERED_PER_MIN:
+            raise OpError("rate-limited",
+                          retry_after=max(1, math.ceil(60 - (now - answered[0]))))
+        req = _current.get()
+        p = _Pending(conn, req.rid if req else None, action, key)
+        self._pending[key] = p
+        subject = Subject(pid=conn.pid, pidfd=conn.pidfd, uid=conn.uid,
+                          start_time=conn.start_time)
+        clean = {str(k): sanitize(v) for k, v in (details or {}).items()}
+        try:
+            outcome = await self._in_pool(self._prompt_pool, self._check, subject, action,
+                                          clean, p.cancel_id)
+        finally:
+            if self._pending.get(key) is p:
+                del self._pending[key]
+        if p.cancelled:
+            outcome = CANCELLED
+        if outcome in COUNTED:
+            answered.append(self.clock())
+        if outcome == AUTHORIZED and conn.closed:
+            outcome = CANCELLED                  # nobody left to use the approval
+        if outcome != AUTHORIZED:
+            raise OpError(outcome)
+
+    def _check(self, subject, action, details, cancel_id) -> str:
+        try:
+            return self.authority.check(subject, action, details, cancel_id)
+        except Exception:
+            logger.exception("polkit check raised")
+            return NO_AGENT
+
+    async def run_store(self, uid: int, fn: Callable[..., Any], *args: Any) -> Any:
+        s = self.sessions.get(uid)
+        if s is None:
+            raise OpError("internal")
+        async with s.store_lock:
+            epoch = s.epoch
+            try:
+                return await self._in_pool(self._store_pool, fn, *args)
+            finally:
+                if s.epoch != epoch and not s.unlocked():
+                    self._wipe_store(s)
+
+    def notify_ui(self, uid: int, event: dict) -> None:
+        s = self.sessions.get(uid)
+        if s is not None and s.ui is not None and not s.ui.closed:
+            s.ui.send_event(event)
+
+    # --- workers ------------------------------------------------------------------------------
+    async def _in_pool(self, pool, fn, *args):
+        fut = asyncio.get_running_loop().run_in_executor(pool, _call, fn, args)
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            # Never let go of the store lock while the worker still uses the store.
+            await asyncio.wait({fut})
+            raise
+
+    def shutdown(self) -> None:
+        if self._authority is not None and hasattr(self._authority, "close"):
+            try:
+                self._authority.close()
+            except Exception:
+                pass
+        self._store_pool.shutdown(wait=False, cancel_futures=True)
+        self._prompt_pool.shutdown(wait=False, cancel_futures=True)
+
+    # --- sessions and connections -------------------------------------------------------------
+    async def session_for(self, uid: int) -> Session:
+        s = self.sessions.get(uid)
+        if s is None:
+            s = Session(uid, self.store_cls.open(uid))
+            self.sessions[uid] = s
+        if not s.settings_loaded:
+            s.settings_loaded = True
+            try:
+                d = await self.run_store(uid, s.store.load_settings)
+            except Exception:
+                logger.exception("uid %d: settings unreadable, using defaults", uid)
+                d = {}
+            s.settings = validate_settings(d or {})
+            oc = (d or {}).get("old_copy")
+            s.old_copy = oc if isinstance(oc, dict) else None
+        return s
+
+    def attach(self, conn) -> None:
+        self.conns.add(conn)
+
+    def detach(self, conn) -> None:
+        """A connection is gone (EOF, error, or closed by us)."""
+        self.conns.discard(conn)
+        self.cancel_prompts(conn=conn)
+        s = self.sessions.get(conn.uid)
+        if s is None:
+            return
+        if conn.role == "ui" and s.ui is conn:
+            # EOF on the window locks the uid; there is nobody to tell.
+            self.lock(conn.uid, None, notify=False)
+            s.ui = None
+
+    def touch(self, conn) -> None:
+        if conn.role == "ui":
+            s = self.sessions.get(conn.uid)
+            if s is not None and s.ui is conn:
+                s.last_ui_request = self.clock()
+
+    def active(self) -> bool:
+        """Anything that keeps the daemon from exiting when idle."""
+        return bool(self.conns) or any(s.unlocked() for s in self.sessions.values())
+
+    # --- tier 1 -------------------------------------------------------------------------------
+    def open_tier1(self, s: Session, conn, show_all: bool = False) -> None:
+        s.tier1 = conn
+        s.show_all = bool(show_all)
+        s.next_sync_at = None              # the scheduler starts the 2 h clock from here
+        s.last_ui_request = self.clock()
+        self.notify_autofill(s.uid)
+
+    def lock(self, uid: int, reason: str | None, *, notify: bool = True) -> bool:
+        """Every lock trigger. Returns whether tier 1 was open."""
+        s = self.sessions.get(uid)
+        if s is None:
+            return False
+        was = s.tier1 is not None
+        s.tier1 = None
+        s.show_all = False
+        s.epoch += 1
+        s.next_sync_at = None
+        self._drop_grant(uid, event=False)
+        self.tickets.revoke_uid(uid)
+        self.withdraw(uid)
+        self.cancel_prompts(uid=uid)
+        if s.signin is not None:
+            s.signin.cancel()
+        self._wipe_store(s)
+        if notify and reason and (was or reason == "user"):
+            self.notify_ui(uid, {"event": "locked", "reason": reason})
+        if was:
+            self.notify_autofill(uid)
+            logger.info("uid %d locked (%s)", uid, reason or "window closed")
+        return was
+
+    def lock_all(self, reason: str) -> None:
+        for uid in list(self.sessions):
+            self.lock(uid, reason)
+
+    def _wipe_store(self, s: Session) -> None:
+        try:
+            s.store.lock()
+        except Exception:
+            logger.exception("uid %d: store.lock() failed", s.uid)
+
+    def withdraw(self, uid: int, roles=("clip", "migrate")) -> None:
+        for c in list(self.conns):
+            if c.uid == uid and c.role in roles and not c.closed:
+                c.send_event({"event": "withdraw"})
+                c.close()
+
+    # --- autofill visibility ------------------------------------------------------------------
+    def autofill_state(self, s: Session | None) -> str:
+        if s is None:
+            return "locked"
+        if s.unlocked():
+            return "unlocked"
+        try:
+            st = s.store.state()
+        except Exception:
+            return "unavailable"
+        return "unavailable" if st == "empty" or st in protocol.SEAL_STATES else "locked"
+
+    def notify_autofill(self, uid: int) -> None:
+        conns = self.connections(uid, "autofill")
+        if not conns:
+            return
+        state = self.autofill_state(self.sessions.get(uid))
+        for c in conns:
+            c.send_event({"event": "state", "state": state})
+
+    # --- grants -------------------------------------------------------------------------------
+    def put_grant(self, s: Session, id: str, secrets_):
+        self._drop_grant(s.uid, event=True)
+        g = self.grants.put(s.uid, id, secrets_, s.settings["grant_s"])
+        if not g.single_use:
+            self._grant_timers[s.uid] = asyncio.get_running_loop().call_later(
+                s.settings["grant_s"], self._grant_timeout, s.uid, g)
+        return g
+
+    def _grant_timeout(self, uid: int, g) -> None:
+        if self.grants.current(uid) is g:
+            self.end_grant(uid)
+
+    def end_grant(self, uid: int) -> None:
+        """The grant ran out (timer or single use)."""
+        self._cancel_timer(uid)
+        gid = self.grants.end(uid)
+        if gid is not None:
+            after_reply(lambda: self.notify_ui(uid, {"event": "grant-expired", "id": gid}))
+
+    def _drop_grant(self, uid: int, *, event: bool) -> None:
+        self._cancel_timer(uid)
+        gid = self.grants.drop(uid)
+        if gid is not None and event:
+            after_reply(lambda: self.notify_ui(uid, {"event": "grant-expired", "id": gid}))
+
+    def release_grant(self, uid: int) -> None:
+        self._drop_grant(uid, event=True)
+
+    def _cancel_timer(self, uid: int) -> None:
+        h = self._grant_timers.pop(uid, None)
+        if h is not None:
+            h.cancel()
+
+    def grant_check(self, uid: int, id: str):
+        """The live grant on `id` (OpError no-grant / grant-expired). A grant past its time
+        is ended here, with its event, even if its timer has not fired yet."""
+        self.check_grant_expiry()
+        return self.grants.check(uid, id)
+
+    def grant_use(self, uid: int, id: str):
+        self.check_grant_expiry()
+        return self.grants.use(uid, id)
+
+    def check_grant_expiry(self) -> None:
+        """Catch-up for timers that fire late (a suspended machine)."""
+        for uid, _ in self.grants.due():
+            self.end_grant(uid)
+
+    # --- dialogs ------------------------------------------------------------------------------
+    def cancel_prompts(self, *, uid: int | None = None, conn=None, rid=None,
+                       action: str | None = None) -> int:
+        n = 0
+        for key, p in list(self._pending.items()):
+            if uid is not None and p.conn.uid != uid:
+                continue
+            if conn is not None and p.conn is not conn:
+                continue
+            if rid is not None and p.rid != rid:
+                continue
+            if action is not None and p.action != action:
+                continue
+            self._cancel(p)
+            n += 1
+        return n
+
+    def _cancel(self, p: _Pending) -> None:
+        if p.cancelled:
+            return
+        p.cancelled = True
+        if self._pending.get(p.key) is p:
+            del self._pending[p.key]
+        try:
+            self._prompt_pool.submit(self._cancel_call, p.cancel_id)
+        except RuntimeError:                  # pool shut down at exit
+            pass
+
+    def _cancel_call(self, cancel_id: str) -> None:
+        try:
+            self.authority.cancel(cancel_id)
+        except Exception:
+            logger.debug("cancel raised", exc_info=True)
+
+    def prompt_pending(self, uid: int, bucket: str) -> bool:
+        return (uid, bucket) in self._pending
+
+    def new_conn_id(self) -> int:
+        return next(self._conn_ids)
