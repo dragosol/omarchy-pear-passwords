@@ -433,8 +433,10 @@ class SourceRuleTests(unittest.TestCase):
     def test_unlink_only_where_allowed(self):
         # Removal is allowed in exactly these places: a temp file of a failed write, a
         # sign-out's session.v2, the re-seal's own .new/.prev files, the history cap, a create
-        # that failed before it became a store, and the importer's own tmp/aside trees.
-        allowed = {"format.py": 1, "session_store.py": 1, "entries.py": 2, "__init__.py": 3,
+        # that failed before it became a store (its files, then its own empty directories by
+        # rmdir, which never removes anything that is not empty), and the importer's own
+        # tmp/aside trees.
+        allowed = {"format.py": 1, "session_store.py": 1, "entries.py": 2, "__init__.py": 4,
                    "importer.py": 1}
         for name, src in self.sources().items():
             n = sum(1 for node in ast.walk(ast.parse(src))

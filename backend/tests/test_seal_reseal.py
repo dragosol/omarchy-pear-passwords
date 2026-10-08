@@ -517,6 +517,17 @@ class ResealTests(StoreCase):
             s.reseal_if_tpm_available()
 
 
+class RefusedCreateTests(StoreCase):
+    def test_a_refused_seal_leaves_nothing_behind(self):
+        # Gate run (round 1, PEM case): a refused create left an empty u<uid>/ skeleton.
+        with mock.patch.object(self.backend, "encrypt",
+                               side_effect=seal.SealRefused("pcr-policy", "x")):
+            with self.assertRaises(seal.SealRefused):
+                vstore.UserStore.create(UID)
+        self.assertFalse(self.udir.exists())
+        self.assertEqual(vstore.UserStore.open(UID).state(), "empty")
+
+
 class TpmMoveStateTests(StoreCase):
     """What the window is told before it offers "Move your keys onto the security chip"."""
 

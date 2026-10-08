@@ -192,6 +192,7 @@ class UserStore:
             raise StoreError(f"u{uid} already holds a store")
         backend = _seal.get_backend()
         _fmt.ensure_dir(_Path(_paths.STATE_ROOT))
+        fresh_dir = not _os.path.lexists(store._dir)
         kd = _fmt.ensure_dir(store._keys_dir())
         _entries.EntryFiles(store._dir).ensure()
 
@@ -235,6 +236,14 @@ class UserStore:
                     _os.unlink(f)
                 except FileNotFoundError:
                     pass
+            if fresh_dir:
+                # Nothing was saved, so nothing is left: not even the empty skeleton.
+                for d in (kd, store._dir / _paths.ENTRIES_DIR, store._dir / _paths.HISTORY_DIR,
+                          store._dir):
+                    try:
+                        _os.rmdir(d)
+                    except OSError:
+                        pass
             raise
         finally:
             sk.wipe()
