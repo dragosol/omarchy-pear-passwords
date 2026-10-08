@@ -192,18 +192,41 @@ Tests for the locking rows: `test_logind_lock.py`. Tests for the network row:
 ## 8. Verification gates (VM, before release)
 
 These are run in an Arch VM with swtpm and a nested Hyprland, never on the owner's laptop, and
-their results are recorded here. Each has a decided fallback. Status: **not yet run**.
+their results are recorded here. Each has a decided fallback.
 
-| Gate | What | Fallback | How the fallback is switched on |
-|---|---|---|---|
-| G1 | `systemd-creds --user` from uid `pear-passwords` inside the hardened unit | root's `pear-passwords-seal.socket` (Accept=yes) runs system-scope `systemd-creds` for the daemon, one request per connection, only for the daemon's uid and `pear.(list\|secret).u<uid>` names (`icp.vstore.seal_service`) | an active `Environment=PEAR_SEAL_BACKEND=seal-service` line in the shipped `pear-passwordsd.service`; `install-root.sh` then enables the seal socket (installed, never enabled, otherwise) |
-| G2 | polkit accepts a pidfd `unix-process` subject; `$(account)` shows | `{pid, start-time, uid}`, fixed message | `Environment=PEAR_POLKIT_SUBJECT=pid-start-time` in the shipped unit |
-| G3 | Quickshell starts with egid != rgid under AT_SECURE | redesign the identity step | none: no release without one of the two |
-| G4 | Quickshell with empty XDG homes and no disk cache; what it opens under `$HOME` | allowlist the residue | docs only |
-| G5 | pear-clip can identify a reader's pipe at `ptrace_scope` 1 and 2 | a 250 ms window, documented as weaker | `READER_POLICY = "timing"` in `icp/client/clip.py` (root-owned; pear-exec passes no environment) |
-| G6 | logind `Lock`, `LockedHint`, `PrepareForSleep` with Omarchy's lock | forward Hyprland's lock event | **not built**: which Hyprland event marks a session lock is for this gate to find; window close and the Lock button lock either way |
-| G7 | what `CheckAuthorization` returns with no agent | under 300 ms non-dismissed failure = no agent | this classification is what ships |
-| G8 | `MemoryDenyWriteExecute=yes` with cffi, cryptography, srp; Argon2id at 256 MiB | drop MDWE, documented | delete the `MemoryDenyWriteExecute=yes` line |
+**Status: run on v2 at 380de03** (2026-10, on the build box): a podman Arch container with
+systemd as PID 1 for the install path, G1 host key, G2, G3, G4, G5 at `ptrace_scope` 0, G7, G8
+and `systemd-analyze`; an Arch cloud-image VM (KVM, OVMF UEFI, swtpm) for `ptrace_scope` 0, 1
+and 2, the TPM re-seal, `tpm-missing`, `tpm-cleared` and autofill. As shipped at 380de03 every
+connection was refused (the peer liveness check used signal 0, which is EPERM for another
+uid's process); the gates below ran with that one line patched in the test environment, and
+the fix is now in the tree (`test_daemon_peer.py`). Real Hyprland could not run headless there
+(no DRM render node), so G3 and G5 used a test build of `pear-exec` that accepts sway as the
+compositor, and the real Omarchy polkit agent was replaced by pkttyagent's text agent
+registered for the session. Not run: real Hyprland, the Omarchy agent (fingerprint first),
+XWayland paste, the clipboard under load, G6, and a real browser extension.
+
+| Gate | What | Result | Fallback | How the fallback is switched on |
+|---|---|---|---|---|
+| G1 | `systemd-creds --user` from uid `pear-passwords` inside the hardened unit | **Passes** with the host key: round trip, wrong `--name` refused, tampered blob refused. swtpm with **UEFI** (OVMF): `has-tpm2` yes and the first unlock moved to TPM-sealed keys; under legacy BIOS (SeaBIOS) `has-tpm2` reports `-firmware` and Pear stays host-sealed, so the TPM path needs UEFI with TCG2. `tpm-missing` passes. `tpm-cleared` **failed** at 380de03 (reported `damaged`: the SRK PEM exists only on measured UKI boots); fixed since, see section 2. The fallback also passes (bonus run). | root's `pear-passwords-seal.socket` (Accept=yes) runs system-scope `systemd-creds` for the daemon, one request per connection, only for the daemon's uid and `pear.(list\|secret).u<uid>` names (`icp.vstore.seal_service`) | an active `Environment=PEAR_SEAL_BACKEND=seal-service` line in the shipped `pear-passwordsd.service`; `install-root.sh` then enables the seal socket (installed, never enabled, otherwise) |
+| G2 | polkit accepts a pidfd `unix-process` subject; `$(account)` shows | **Passes** (with the liveness fix): the owner annotation is what lets uid `pear-passwords` check other users' subjects (`nobody` gets `NotAuthorized`); the dialog showed `Use the saved password for Work GitHub — dev@example.test`; grants are per entry; a seatless session and a process with no session are denied with no dialog. | `{pid, start-time, uid}`, fixed message | `Environment=PEAR_POLKIT_SUBJECT=pid-start-time` in the shipped unit |
+| G3 | Quickshell starts with egid != rgid under AT_SECURE | **Passes** (sway build): Quickshell ran with `Gid: 1000 969 969 969`, passed the daemon's peer checks, unlocked through polkit and drew the list. Labels and background did not draw in the container either with or without set-gid (no theme there); to be checked visually on the XPS. | redesign the identity step | none: no release without one of the two |
+| G4 | Quickshell with empty XDG homes and no disk cache; what it opens under `$HOME` | **Passes, with residue now documented** (section 1): QML only from `$P/app` and `/usr/share/omarchy`; under `$HOME`: `~/.drirc` (Mesa), Omarchy's theme and toggle files, and the `hyprctl`/`fc-match` children; Quickshell's runtime directory lets the same user `qs kill` the window; `qs ipc show` is empty and its log holds no account data. | allowlist the residue | docs only (and pinned by `test_qml_process_allowlist.py`) |
+| G5 | pear-clip can identify a reader's pipe at `ptrace_scope` 1 and 2 | **Passes** at 0, 1 and 2: Omarchy's history watcher never got the password, the first paste got it and a second reader nothing, no paste expires at 30 s, an unrelated copy is `replaced` and survives, `x-kde-passwordManagerHint` offered. `mem`, `environ`, `fd`, `maps` of the UI and clip processes are EACCES and PTRACE_ATTACH EPERM at every scope. | a 250 ms window, documented as weaker | `READER_POLICY = "timing"` in `icp/client/clip.py` (root-owned; pear-exec passes no environment) |
+| G6 | logind `Lock`, `LockedHint`, `PrepareForSleep` with Omarchy's lock | **Not run.** Omarchy's lock emits neither `Lock` nor `LockedHint` (checked in its source), so a screen lock does not lock Pear; README and section 7 say so. | forward Hyprland's lock event | **not built**: window close, the Lock button, idle lock and sleep lock either way |
+| G7 | what `CheckAuthorization` returns with no agent | **Passes**: `[false, true, {"polkit.result":"auth_self"}]` in 1-2 ms with no `polkit.dismissed`, reported `no-agent`; a wrong password is `denied` after 2.3 s. A polkitd refusal of the call itself is now `internal`, not `no-agent`. | under 300 ms non-dismissed failure = no agent | this classification is what ships |
+| G8 | `MemoryDenyWriteExecute=yes` with cffi, cryptography, srp; Argon2id at 256 MiB | **Passes**: PyNaCl, cryptography (P-384, X25519, AES-GCM, HKDF) and srp work under MDWE; Argon2id moderate took 0.17 s, 293 MiB maxrss. Old-style cffi `ffi.callback` would fail, and the code does not use it. | drop MDWE, documented | delete the `MemoryDenyWriteExecute=yes` line |
+
+Also from that run: the install path, re-runs, upgrades and every refusal passed; uninstall
+left `/run/pear-passwords/client.sock` behind and with it the identities (fixed: the sockets
+`RemoveOnStop=yes`, uninstall removes stale runtime sockets and keeps itself while the
+identities stay); idle exits logged an unlink error for systemd's socket (fixed:
+`cleanup_socket=False`); an ABI mismatch restarted into the start limit (fixed:
+`RestartPreventExitStatus=78`); the three-a-minute dialog limit blocked a third account
+(fixed: only refusals count, per action). `systemd-analyze security`: 1.5 for
+`pear-passwordsd.service`, 1.2 for `pear-passwords-seal@.service`; `systemd-analyze verify`
+clean. Failed dialog passwords count toward `pam_faillock` like any other: three wrong ones
+lock the account for ten minutes (Arch's default).
 
 Tests for the switches: `test_seal_service.py`, `test_install_root_receipts.py::InstallRootTests::test_seal_service_runs_only_when_the_daemon_unit_selects_it`, `test_daemon_polkit.py`, `test_clip_policy.py::TimingFallbackTests`.
 
@@ -241,6 +264,7 @@ Each of these was considered and rejected because it leaves a hole:
 
 - The anisette base images' `apt-get` packages are resolved at build time and not pinned
   ([anisette-provenance.md](anisette-provenance.md)).
-- The gates in section 8 have not run yet.
+- Gates G6 (screen lock) and the parts of G3/G5 that need real Hyprland and the Omarchy
+  polkit agent have not run (section 8).
 - Python cannot reliably zero memory; QML strings cannot be zeroed at all. A revealed value is
   overwritten after 20 s or on focus loss, not wiped.

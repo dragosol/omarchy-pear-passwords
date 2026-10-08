@@ -77,7 +77,9 @@ asks for a password:
 
 Each dialog takes your fingerprint first. The password field appears if the reader times out
 (about 30 seconds) or fails, or straight away when the lid is closed. A dialog is never
-remembered: there is no "keep me authorized for 5 minutes" behind any of them.
+remembered: there is no "keep me authorized for 5 minutes" behind any of them. A wrong
+password in a Pear dialog counts toward your account's failed-login limit like any other
+(`pam_faillock`: three in a row lock the account for ten minutes on Arch).
 
 **Pear locks** when you close the window, press **Lock**, suspend, or log out, and every key is
 wiped from memory before the machine sleeps or the session ends. **Locking the screen with
@@ -310,7 +312,8 @@ down, sync says "anisette unavailable" and the list stays as it was.
 ## TPM (the security chip)
 
 Pear seals its two keys with `systemd-creds`: today with the computer's host key, and
-automatically with the TPM as well once one is present (on Intel laptops, "PTT" in the BIOS).
+automatically with the TPM as well once one is present (on Intel laptops, "PTT" in the BIOS;
+the firmware must boot in UEFI mode, which exposes the TPM to Linux).
 The next unlock after you turn PTT on moves the vault to **new** keys sealed with the TPM, with
 no action from you: everything is re-encrypted, checked to read back, swapped in at once, and
 the old keys are deleted. No PCRs and no TPM PIN are used, so firmware, bootloader and kernel
