@@ -118,6 +118,25 @@ def fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+_AT_FDCWD = -100
+_RENAME_EXCHANGE = 2
+
+
+def exchange(a: Path, b: Path) -> None:
+    """Swap two paths in one step (renameat2 RENAME_EXCHANGE): at every moment each name
+    holds one complete tree. OSError if the kernel or filesystem cannot."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = getattr(libc, "renameat2", None)
+    if fn is None:
+        raise OSError(38, "renameat2 is not available")
+    fn.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    fn.restype = ctypes.c_int
+    if fn(_AT_FDCWD, os.fsencode(str(a)), _AT_FDCWD, os.fsencode(str(b)), _RENAME_EXCHANGE) != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+
+
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     """Replace `path` with `data`: O_EXCL temp file (0600 from creation), fsync, rename, fsync
     of the directory. The temp file is removed if anything fails before the rename."""

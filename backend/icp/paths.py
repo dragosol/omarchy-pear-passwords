@@ -28,7 +28,7 @@ LIST_CRED = "list.cred"             # RK_list, sealed with systemd-creds
 SECRET_CRED = "secret.cred"         # SK_secret (X25519), sealed with systemd-creds
 SECRET_PUB = "secret.pub"           # PK_secret || HMAC(K_meta, "pk" || PK_secret)
 KEYS_JSON = "keys.json"             # plaintext {format, sealed_with, tpm_srk_fp?, created}
-PREV_SUFFIX = ".prev"               # previous key blobs during a re-seal (rollback window)
+PREV_SUFFIX = ".prev"               # pre-rotation re-seal rollback copies (read, never written now)
 NEW_SUFFIX = ".new"                 # re-sealed blobs before they are verified
 
 META_FILE = "meta.v2"

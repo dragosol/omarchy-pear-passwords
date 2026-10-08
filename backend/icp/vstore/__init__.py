@@ -292,6 +292,13 @@ class UserStore:
             return
         if not self._has_keys():
             raise StoreError("empty: there is no store to unlock")
+        # A rotation interrupted before its swap left the unverified new tree here, one
+        # interrupted after it left the old (host-only) tree: either way, not the store.
+        try:
+            _remove_tree(self._rotate_dir())
+        except (OSError, StoreError):
+            _log.warning("u%d: could not remove a leftover %s", self.uid,
+                         self._rotate_dir().name)
         try:
             rk = self._unseal_list()
         except SealError as e:
@@ -329,9 +336,19 @@ class UserStore:
 
     @_serialized
     def reseal_if_tpm_available(self) -> bool:
-        """After a successful unlock: if a TPM2 is present and keys.json says "host", re-seal
-        both key blobs with host+tpm2, verify the new blobs, keep the old ones as *.prev, and
-        record the SRK fingerprint. Returns True if it re-sealed. Never touches data files."""
+        """After a successful unlock: if a TPM2 is present and keys.json says "host", move the
+        store to NEW keys sealed with host+tpm2. Returns True if it did.
+
+        A re-wrap of the same RK_list and SK_secret would leave every backup or snapshot taken
+        before (host-key-only blobs plus /var/lib/systemd/credential.secret) able to decrypt
+        everything written afterwards, so this is a rotation: a fresh RK_list and SK/PK pair;
+        meta, session, aliases and nicknames re-encrypted under the new subkeys; every entry
+        and history box opened once with the old SK_secret and sealed to the new PK. The new
+        store is built beside the old one (u<uid>.rotate), opened again from scratch through a
+        real unseal with every box checked against the old plaintext, and only then swapped
+        in with one renameat2(RENAME_EXCHANGE). The old tree is deleted at once; a crash
+        leaves at most a u<uid>.rotate that the next unlock removes. No host-only copy of a
+        key that opens current data is kept anywhere."""
         self._need_unlocked()
         kj = self._read_keys_json() or {}
         if kj.get("sealed_with") == "host+tpm2":
@@ -339,50 +356,137 @@ class UserStore:
         backend = _seal.get_backend()
         if not backend.tpm_present():
             return False
-        kd = self._keys_dir()
-        srk = backend.srk_fingerprint()
+        rot = self._rotate_dir()
         try:
-            sk = self._unseal_sk()
-        except (SealError, _seal.SealUnavailable) as e:
+            _remove_tree(rot)
+            sk_old = self._unseal_sk()
+        except (SealError, _seal.SealUnavailable, OSError, StoreError) as e:
             _log.warning("u%d: cannot re-seal, the entry key did not unseal (%s)", self.uid,
                          type(e).__name__)
             return False
-        new = {t: kd / (self._cred_file(t) + _paths.NEW_SUFFIX) for t in _TIERS}
+        rk = _keys.new_root()
+        sk, pk = _keys.new_keypair()
+        sub = _keys.derive(rk)
         try:
-            plain = {"list": self._rk, "secret": sk}
-            for t in _TIERS:
-                _fmt.atomic_write(new[t], backend.encrypt(self._cred_name(t), bytes(plain[t])))
-            # Verify before touching the blobs in use. A failure here leaves everything as it
-            # was: the current blobs, keys.json and any rollback copies.
-            for t in _TIERS:
-                self._verify_blob(backend, t, _fmt.read_file(new[t]), plain[t])
-        except (SealError, _seal.SealUnavailable, OSError) as e:
-            for f in new.values():
-                try:
-                    f.unlink()
-                except FileNotFoundError:
-                    pass
-            _log.warning("u%d: re-seal with the TPM did not verify (%s); kept host sealing",
+            try:
+                doc = self._build_rotated(rot, backend, kj, sk_old, rk, sk, pk, sub)
+            finally:
+                sk_old.wipe()
+                sk.wipe()
+            _fmt.exchange(rot, self._dir)
+        except (SealError, _seal.SealUnavailable, OSError, StoreError, ValueError) as e:
+            rk.wipe()
+            _keys.wipe_all(sub)
+            try:
+                _remove_tree(rot)
+            except (OSError, StoreError):
+                pass
+            _log.warning("u%d: moving to TPM-sealed keys did not verify (%s); kept host sealing",
                          self.uid, type(e).__name__)
             return False
-        finally:
-            sk.wipe()
-        # Only now, with both new blobs proven, do the old ones step aside - kept as *.prev
-        # until the next successful unlock, so a TPM that misbehaves right after can be
-        # rolled back from.
-        new_kj = kd / (_paths.KEYS_JSON + _paths.NEW_SUFFIX)
-        _fmt.atomic_write(new_kj, _fmt.dumps({**kj, "format": _KEYS_FORMAT,
-                                              "sealed_with": "host+tpm2",
-                                              **({"tpm_srk_fp": srk} if srk else {}),
-                                              "resealed": _time.time()}))
-        for name, src in ((self._cred_file("list"), new["list"]),
-                          (self._cred_file("secret"), new["secret"]),
-                          (_paths.KEYS_JSON, new_kj)):
-            _os.replace(kd / name, kd / (name + _paths.PREV_SUFFIX))
-            _os.replace(src, kd / name)
-        _fmt.fsync_dir(kd)
-        _log.info("u%d: keys re-sealed with host+tpm2", self.uid)
+        _fmt.fsync_dir(self._dir.parent)
+        # u<uid>.rotate now holds the old tree, whose host-only keys open the old data: gone.
+        try:
+            _remove_tree(rot)
+        except (OSError, StoreError):
+            _log.warning("u%d: the pre-TPM tree could not be removed yet; the next unlock "
+                         "removes it", self.uid)
+        old_rk, old_sub = self._rk, self._sub
+        self._rk, self._sub, self._pk, self._doc = rk, sub, pk, doc
+        old_rk.wipe()
+        _keys.wipe_all(old_sub)
+        _log.info("u%d: keys rotated and sealed with host+tpm2", self.uid)
         return True
+
+    def _rotate_dir(self) -> _Path:
+        return self._dir.with_name(self._dir.name + ".rotate")
+
+    def _build_rotated(self, rot, backend, kj, sk_old, rk, sk, pk, sub) -> dict:
+        """Write the whole store under new keys into `rot` and prove it reads back."""
+        import copy
+        uid = self.uid
+        _fmt.ensure_dir(rot)
+        kd = _fmt.ensure_dir(rot / _paths.KEYS_DIR)
+        blobs = {"list": backend.encrypt(self._cred_name("list"), bytes(rk)),
+                 "secret": backend.encrypt(self._cred_name("secret"), bytes(sk))}
+        self._verify_blob(backend, "list", blobs["list"], rk)
+        self._verify_blob(backend, "secret", blobs["secret"], sk)
+        for t in _TIERS:
+            if backend.key_type(blobs[t]) != "host+tpm2":
+                raise _seal.SealUnavailable("the new blobs are not bound to the TPM")
+        srk = backend.srk_fingerprint()
+        for t in _TIERS:
+            _fmt.atomic_write(kd / self._cred_file(t), blobs[t])
+        _fmt.atomic_write(kd / _paths.SECRET_PUB, _keys.pk_record(sub["meta"], pk))
+
+        # Every box on disk, current and history, referenced by meta or not.
+        old_files, new_files = _entries.EntryFiles(self._dir), _entries.EntryFiles(rot)
+        new_files.ensure()
+        want: dict = {}                    # (id, n or None) -> sha256 of the payload
+        doc = copy.deepcopy(self._doc)
+        import hashlib
+        for name in sorted(_os.listdir(old_files.entries)) if old_files.entries.is_dir() else []:
+            if not name.endswith(_paths.BOX_SUFFIX):
+                continue
+            id = name[:-len(_paths.BOX_SUFFIX)]
+            payload = _entries.open_box(bytes(sk_old), old_files.read(id), id)
+            new_files.write(id, _entries.seal(pk, payload))
+            want[(id, None)] = hashlib.sha256(_fmt.dumps(payload)).hexdigest()
+            rec = doc["entries"].get(id)
+            if rec is not None:
+                s = _entries.from_payload(payload)
+                rec["pwmac"] = _keys.pwmac(sub["pwmac"], s.password)
+                rec["smac"] = _keys.smac(sub["pwmac"], _entries.rest_canonical(s))
+        for rec_id, rec in doc["entries"].items():
+            if (rec_id, None) not in want:
+                rec.pop("pwmac", None)     # a MAC under the old key means nothing now
+                rec.pop("smac", None)
+        hist_root = old_files.history
+        for id in sorted(_os.listdir(hist_root)) if hist_root.is_dir() else []:
+            for n in old_files.numbers(id):
+                payload = _entries.open_box(bytes(sk_old), old_files.read_history(id, n), id)
+                new_files.write_history(id, n, _entries.seal(pk, payload))
+                want[(id, n)] = hashlib.sha256(_fmt.dumps(payload)).hexdigest()
+
+        _fmt.write_sealed(rot, _paths.META_FILE, bytes(sub["meta"]), _fmt.KIND_META, uid, doc)
+        sess = _ss.load_session(self._dir, self._sub["session"], uid)
+        if sess:
+            _ss.save_session(rot, sub["session"], uid, sess)
+        if (self._dir / _paths.ALIASES_FILE).exists():
+            _ss.save_aliases(rot, sub["aliases"], uid,
+                             _ss.load_aliases(self._dir, self._sub["aliases"], uid))
+        if (self._dir / _paths.NICKNAMES_FILE).exists():
+            _ss.save_nicknames(rot, sub["nicknames"], uid, dict(self._nick or {}))
+        for plain in (_paths.DEVICE_FILE, _paths.STATE_FILE):
+            data = _fmt.read_file(self._dir / plain)
+            if data is not None:
+                _fmt.atomic_write(rot / plain, data)
+        # keys.json last, as in create().
+        _fmt.atomic_write(kd / _paths.KEYS_JSON, _fmt.dumps(
+            {**{k: v for k, v in kj.items() if k != "tpm_srk_fp"}, "format": _KEYS_FORMAT,
+             "sealed_with": "host+tpm2", **({"tpm_srk_fp": srk} if srk else {}),
+             "rotated": _time.time()}))
+
+        # Read it all back through a fresh unlock (a real unseal of the new blobs).
+        reader = UserStore(uid, _root=rot)
+        reader.unlock()
+        try:
+            got: dict = {}
+            sk2 = reader._unseal_sk()
+            try:
+                for (id, n) in want:
+                    blob = new_files.read(id) if n is None else new_files.read_history(id, n)
+                    got[(id, n)] = hashlib.sha256(_fmt.dumps(
+                        _entries.open_box(bytes(sk2), blob, id))).hexdigest()
+            finally:
+                sk2.wipe()
+            if got != want or reader._doc != doc \
+                    or reader.load_session() != sess \
+                    or reader.load_nicknames() != dict(self._nick or {}):
+                raise StoreError("the TPM-sealed copy does not read back as the store")
+        finally:
+            reader.lock()
+        return doc
 
     # --- tier 1: metadata ---------------------------------------------------------------------
     @_serialized
@@ -709,8 +813,14 @@ class UserStore:
         return rk
 
     def _drop_prev(self) -> None:
-        """The rollback window closes at the first successful unlock after a re-seal."""
+        """The rollback window of a re-seal from before key rotation closes at the first
+        successful unlock - but only when the current set is complete: a .prev must never go
+        while it is the only copy of a key."""
         kd = self._keys_dir()
+        names = (_paths.LIST_CRED, _paths.SECRET_CRED, _paths.KEYS_JSON)
+        if not all((kd / n).is_file() for n in names) \
+                or any(_os.path.lexists(kd / (n + _paths.NEW_SUFFIX)) for n in names):
+            return
         dropped = False
         for name in (_paths.LIST_CRED, _paths.SECRET_CRED, _paths.KEYS_JSON):
             try:
@@ -766,6 +876,17 @@ class UserStore:
         rec.update({"v": v, "pwmac": pwm, "smac": sm, "apple_n": len(s.apple_history or []),
                     "has_totp": bool(s.totp_secret), "has_notes": bool(s.notes)})
         return True
+
+
+def _remove_tree(path) -> None:
+    """Remove a directory the store created beside a user directory. Refuses a symlink."""
+    import shutil
+    p = _Path(path)
+    if p.is_symlink():
+        raise StoreError(f"{p} is a symlink")
+    if p.exists():
+        shutil.rmtree(p)
+        _fmt.fsync_dir(p.parent)
 
 
 def _ts(iso: str) -> float:

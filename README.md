@@ -276,14 +276,18 @@ down, sync says "anisette unavailable" and the list stays as it was.
 
 Pear seals its two keys with `systemd-creds`: today with the computer's host key, and
 automatically with the TPM as well once one is present (on Intel laptops, "PTT" in the BIOS).
-The next unlock after you turn PTT on re-seals them, with no action from you, and keeps the old
-copies until the following unlock in case anything goes wrong. No PCRs and no TPM PIN are used,
-so firmware, bootloader and kernel updates never lock you out.
+The next unlock after you turn PTT on moves the vault to **new** keys sealed with the TPM, with
+no action from you: everything is re-encrypted, checked to read back, swapped in at once, and
+the old keys are deleted. No PCRs and no TPM PIN are used, so firmware, bootloader and kernel
+updates never lock you out. (If a `tpm2-pcr-public-key.pem` exists, as with a signed UKI,
+`systemd-creds` would tie the keys to it; Pear then keeps host sealing rather than risk that.)
 
-**What turning PTT on buys:** a copy of the whole disk, or a backup of `/`, can no longer
-decrypt your passwords on another machine. Without it, the host key is in that same image. It
-does not protect against root or malware on the running laptop, or against someone who has
-both the laptop and your disk passphrase. It changes nothing about booting.
+**What turning PTT on buys:** a copy of the whole disk, or a backup of `/`, taken after the
+switch can no longer decrypt your passwords on another machine. Without it, the host key is in
+that same image. A backup taken **before** the switch still decrypts what was in the vault at
+that time (and the Apple sign-in tokens it held), forever: delete those snapshots. It does not
+protect against root or malware on the running laptop, or against someone who has both the
+laptop and your disk passphrase. It changes nothing about booting.
 
 **What it costs:** clearing the TPM in the BIOS, turning PTT off again, or replacing the board
 makes the keys unrecoverable. Pear then says so and offers **Start over** (sign in to iCloud
@@ -294,7 +298,9 @@ again; local history and nicknames are lost). Turning PTT off by mistake is not 
 
 - Until PTT is on, **exclude `/var/lib/pear-passwords` and `/var/lib/systemd/credential.secret`
   from backups of `/`** (for example btrbk snapshots on a NAS). Together they decrypt your
-  passwords anywhere. With PTT on they are useless without this computer's TPM.
+  passwords anywhere. Once PTT is on and Pear has moved to TPM-sealed keys (Settings says "sealed
+  to this computer and its security chip"), new copies are useless without this computer's TPM;
+  snapshots from before that still decrypt the vault as it was then, so delete them.
 - Your passwords themselves are in iCloud; a lost vault on this computer means signing in
   again, not losing passwords.
 - Old copies of `~/.config/icp` in backups stay crackable by anyone who guesses your old 1.x
@@ -310,7 +316,7 @@ again; local history and nicknames are lost). Turning PTT off by mistake is not 
 | You, logged in over SSH | **Protected.** The dialogs are refused outside an active local session, and Pear only starts under your real desktop. |
 | Someone on the network | **Protected.** Every connection to Apple is verified (below). |
 | A copy of the whole disk or of `/`, with PTT off | **Not protected.** The host key is in the image; only disk encryption (LUKS) protects it. Turn PTT on, or exclude the two paths above from backups. |
-| The same, with PTT on | **Protected.** The keys need this computer's TPM. |
+| The same, with PTT on | **Protected** for copies taken after Pear moved to TPM-sealed keys. A copy from before still opens the vault as it was then. |
 | A stolen laptop, off, locked or asleep | **Protected.** Disk encryption, and Pear wipes its keys before the screen locks or the machine sleeps. |
 | Root, the kernel, admin polkit rules | **Not defended.** See below. |
 

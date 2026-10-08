@@ -326,9 +326,20 @@ class ResealTests(StoreCase):
         self.assertFalse(s.reseal_if_tpm_available())
         self.assertEqual(s.status()["sealed_with"], "host")
 
-    def test_tpm_appears_and_keys_are_resealed(self):
+    def rich(self):
+        """A store with history, notes, a nickname and a session, so every file is in play."""
         s = self.populated(2)
+        first = s.list_meta()[0].id
+        s.apply_sync([item("site0.example.test", "user0", "pw-0-new", notes="n")], set())
+        s.save_nicknames({first: "Work"})
+        s.save_session({"dsid": "1", "token": "t"})
+        return s, first
+
+    def test_tpm_appears_and_keys_are_rotated(self):
+        # crypto-ptt-reseal-does-not-rotate-keys: new RK_list and SK/PK, every file rewritten.
+        s, first = self.rich()
         old_keys, old_data = self.keyfiles(), self.datafiles()
+        old_list_blob = old_keys["list.cred"]
         self.backend.tpm = True
         s.lock()
         s.unlock()
@@ -336,21 +347,41 @@ class ResealTests(StoreCase):
         kj = json.loads((self.udir / "keys" / "keys.json").read_bytes())
         self.assertEqual(kj["sealed_with"], "host+tpm2")
         self.assertEqual(kj["tpm_srk_fp"], "srk-one")
-        new = self.keyfiles()
-        # The old blobs are kept, byte for byte, as the rollback copies.
-        for name in ("list.cred", "secret.cred", "keys.json"):
-            self.assertEqual(new[name + ".prev"], old_keys[name])
+        new, new_data = self.keyfiles(), self.datafiles()
+        self.assertFalse(any(n.endswith((".prev", ".new")) for n in new), new)
+        self.assertFalse(os.path.exists(str(self.udir) + ".rotate"))
+        for name in ("list.cred", "secret.cred", "secret.pub"):
             self.assertNotEqual(new[name], old_keys[name])
-        self.assertEqual(self.datafiles(), old_data)       # data files untouched
-        self.assertFalse(any(n.endswith(".new") for n in new))
+        self.assertEqual(set(new_data) - {f"u{UID}/state.json"},
+                         set(old_data) - {f"u{UID}/state.json"})
+        for name, data in new_data.items():
+            if not name.endswith(("device.json", "state.json")):
+                self.assertNotEqual(data, old_data[name], name)
+        # The pre-TPM blob (what an old snapshot holds) still opens with the host key alone,
+        # and what it opens is useless against the new files.
+        from icp.vstore import format as fmt, keys
+        old_rk = keys.SecretBytes(self.backend.decrypt(f"pear.list.u{UID}", old_list_blob))
+        old_sub = keys.derive(old_rk)
+        with self.assertRaises(vstore.SealError):
+            fmt.read_sealed(self.udir, "meta.v2", bytes(old_sub["meta"]), fmt.KIND_META, UID)
         self.assertFalse(s.reseal_if_tpm_available())        # already host+tpm2
-        # The next successful unlock closes the rollback window.
+        # The live object and a fresh unlock both read everything back.
+        self.assertEqual(s.open_entry(first).password, "pw-0-new")
         s.lock()
         s2 = vstore.UserStore.open(UID)
         s2.unlock()
-        self.assertFalse(any(n.endswith(".prev") for n in self.keyfiles()))
         self.assertEqual(s2.status()["sealed_with"], "host+tpm2")
-        self.assertEqual(s2.open_entry(s2.list_meta()[0].id).password, "pw-0")
+        self.assertEqual(s2.open_entry(first).password, "pw-0-new")
+        self.assertEqual(s2.open_entry(first).notes, "n")
+        self.assertEqual([h[1] for h in s2.history(first)], ["pw-0"])
+        self.assertEqual(s2.load_nicknames(), {first: "Work"})
+        self.assertEqual(s2.load_session(), {"dsid": "1", "token": "t"})
+        # pwmac moved to the new key: an unchanged sync changes nothing.
+        unseals = s2.unseal_count
+        counts = s2.apply_sync([item("site0.example.test", "user0", "pw-0-new", notes="n"),
+                                item("site1.example.test", "user1", "pw-1")], set())
+        self.assertEqual(counts["unchanged"], 2)
+        self.assertEqual(s2.unseal_count, unseals)
 
     def test_failed_verification_changes_nothing(self):
         s = self.populated(1)
@@ -358,25 +389,84 @@ class ResealTests(StoreCase):
         self.backend.tpm = True
         self.backend.corrupt_next_encrypts = 2
         self.assertFalse(s.reseal_if_tpm_available())
-        self.assertEqual(self.snapshot(), before)            # no .new, no .prev, same blobs
+        self.assertEqual(self.snapshot(), before)            # no .rotate, same blobs
         self.assertEqual(s.status()["sealed_with"], "host")
         s.lock()
         vstore.UserStore.open(UID).unlock()                   # still opens
 
-    def test_prev_kept_if_reseal_is_followed_by_failure(self):
+    def test_no_host_only_copy_survives_the_rotation(self):
         s = self.populated(1)
         self.backend.tpm = True
         self.assertTrue(s.reseal_if_tpm_available())
         s.lock()
-        # The TPM goes away again before the next unlock: the host+tpm2 blobs are refused,
-        # the host-only .prev blobs still open, and the store rolls back to them.
+        # The TPM goes away again: there is no host-only key left to fall back to (it would
+        # be exactly what an old snapshot holds), so this is tpm-missing, and turning PTT
+        # back on is the recovery.
         self.backend.tpm = False
         s2 = vstore.UserStore.open(UID)
+        with self.assertRaises(vstore.SealError) as cm:
+            s2.unlock()
+        self.assertEqual(cm.exception.kind, "tpm-missing")
+        self.backend.tpm = True
         s2.unlock()
-        self.assertEqual(s2.status()["sealed_with"], "host")
-        names = self.keyfiles()
-        self.assertFalse(any(n.endswith(".prev") for n in names))
         self.assertEqual(s2.open_entry(s2.list_meta()[0].id).password, "pw-0")
+
+    def test_a_rotation_interrupted_before_the_swap_leaves_the_old_store(self):
+        # crypto-reseal-swap-not-crash-safe
+        from icp.vstore import format as fmt
+        s, first = self.rich()
+        self.backend.tpm = True
+        with mock.patch.object(fmt, "exchange", side_effect=SystemExit("power cut")):
+            with self.assertRaises(SystemExit):
+                s.reseal_if_tpm_available()
+        self.assertTrue(os.path.isdir(str(self.udir) + ".rotate"))
+        s2 = vstore.UserStore.open(UID)
+        s2.unlock()
+        self.assertFalse(os.path.exists(str(self.udir) + ".rotate"))
+        self.assertEqual(s2.status()["sealed_with"], "host")
+        self.assertEqual(s2.open_entry(first).password, "pw-0-new")
+        self.assertTrue(s2.reseal_if_tpm_available())        # and it simply runs again
+        self.assertEqual(s2.open_entry(first).password, "pw-0-new")
+
+    def test_a_rotation_interrupted_after_the_swap_leaves_the_new_store(self):
+        from icp import vstore as v
+        from icp.vstore import format as fmt
+        s, first = self.rich()
+        self.backend.tpm = True
+        real_remove, real_exchange = v._remove_tree, fmt.exchange
+        swapped = []
+
+        def exchange(a, b):
+            real_exchange(a, b)
+            swapped.append(True)
+
+        def remove(path):
+            if swapped:                      # the removal of the old tree, after the swap
+                raise SystemExit("power cut")
+            real_remove(path)
+        with mock.patch.object(v, "_remove_tree", remove), \
+                mock.patch.object(fmt, "exchange", exchange):
+            with self.assertRaises(SystemExit):
+                s.reseal_if_tpm_available()
+        self.assertTrue(os.path.isdir(str(self.udir) + ".rotate"))   # the old tree
+        s2 = vstore.UserStore.open(UID)
+        s2.unlock()
+        self.assertFalse(os.path.exists(str(self.udir) + ".rotate"))
+        self.assertEqual(s2.status()["sealed_with"], "host+tpm2")
+        self.assertEqual(s2.open_entry(first).password, "pw-0-new")
+        self.assertEqual([h[1] for h in s2.history(first)], ["pw-0"])
+
+    def test_a_prev_is_never_dropped_while_it_is_the_only_copy(self):
+        # crypto-reseal-swap-not-crash-safe (the old swap's state): secret.cred moved aside,
+        # its replacement still .new. The unlock must not delete secret.cred.prev.
+        s = self.populated(1)
+        s.lock()
+        kd = self.udir / "keys"
+        os.replace(kd / "secret.cred", kd / "secret.cred.prev")
+        (kd / "secret.cred.new").write_bytes(b"x")
+        s2 = vstore.UserStore.open(UID)
+        s2.unlock()
+        self.assertTrue((kd / "secret.cred.prev").exists())
 
     def test_reseal_needs_unlock(self):
         s = vstore.UserStore.create(UID)

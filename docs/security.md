@@ -75,9 +75,13 @@ Per user, in `/var/lib/pear-passwords/u<uid>/` (0700 `pear-passwords`; your uid 
 - In memory: nothing while locked; `RK_list`, its subkeys and the metadata after the first
   dialog; one entry's fields for at most the grant (120 s) after the second. Tests:
   `test_grants.py`, `test_logind_lock.py`.
-- Re-sealing to host+TPM2 happens at the first unlock after a TPM appears; the old blobs stay
-  as `*.prev` until the next successful unlock, and a missing TPM is told apart from a cleared
-  one. A cleared TPM is recognised by its storage key fingerprint where systemd-tpm2-setup
+- Moving to host+TPM2 happens at the first unlock after a TPM appears, and it is a key
+  rotation, not a re-wrap: a new `RK_list` and `SK/PK`, every file re-encrypted and every box
+  re-sealed in `u<uid>.rotate`, read back through a real unseal and compared, then swapped in
+  with one `renameat2(RENAME_EXCHANGE)`; the old tree is deleted at once and a leftover is
+  removed by the next unlock. No host-only copy of a key that opens current data survives, so
+  a pre-PTT backup opens only the vault as it was then. A missing TPM is told apart from a
+  cleared one. A cleared TPM is recognised by its storage key fingerprint where systemd-tpm2-setup
   writes one (measured, UKI boots); on other boots (Limine or GRUB without a UKI) a working
   TPM that refuses the keys is reported as `tpm-cleared` too, with "most likely" wording. A
   failure of the mechanism itself (the credentials service unreachable, a busy or locked-out
@@ -154,7 +158,7 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
 | Remote login as you | Holds | `allow_any=no`, `allow_inactive=no`; pear-exec needs a local compositor. |
 | Network | Holds | TLS verified, `trust_env=False`, no redirects, `icloud.com` endpoint check. |
 | Disk image or backup of `/` with the host key, PTT off | Does not hold | Only LUKS protects it. |
-| The same with PTT on | Holds | Blobs need this TPM. |
+| The same with PTT on | Holds | Blobs need this TPM. A pre-PTT copy still opens the data as it was then (the keys were rotated, so nothing written later); delete such snapshots. |
 | Stolen laptop, off, locked, suspended or hibernated | Holds | Keys wiped on Lock, LockedHint and PrepareForSleep. |
 | Root, the kernel, `empower`, `/etc/polkit-1/rules.d` | Not defended | Same position as systemd-homed. |
 | Old v1 ciphertext in snapshots | Residual | Crackable by guessing the old passphrase. |
