@@ -1,0 +1,718 @@
+# Pear Passwords 2 daemon protocol
+
+Status: **frozen** (protocol version 2). This is the contract between `pear-passwordsd` and its
+four kinds of client: the Pear window (`ui`), the clipboard writer (`clip`), the v1 importer
+(`migrate`) and the browser autofill host (`autofill`). The same values in code are in
+`backend/icp/daemon/protocol.py` and `backend/icp/daemon/paths.py`;
+`backend/tests/test_protocol_contract.py` fails if this document and that module disagree on
+an op, an event or an error code. A change to anything here lands on the `v2-base` branch
+first and every work package merges it; no work package edits this file on its own branch.
+
+The browser-facing side of autofill (native messaging between an extension and
+`pear-autofill-host`) is specified separately in `docs/autofill-protocol.md` (WP6). This file
+covers only what that host says to the daemon.
+
+---
+
+## 1. Transport and framing
+
+- Socket: `/run/pear-passwords/client.sock`, `SOCK_STREAM`, owned `pear-passwords:pear-client`,
+  mode 0660. Only a process whose effective gid is `pear-client` can connect, and only
+  `pear-exec` produces one.
+- Encoding: UTF-8 JSON, one object per line, terminated by `\n`. No other whitespace rules.
+  Every line is a JSON object; anything else is `bad-request`.
+- Size limits are asymmetric:
+  - client to daemon: at most **64 KiB** per line including the newline. A longer line gets
+    `{"rid":null,"error":"too-large"}` and the connection is closed.
+  - daemon to client: at most **8 MiB** per line. The account list for 554 entries is about
+    150 KiB, so every client must accept long lines.
+- Requests: `{"op": "<name>", "rid": <int>, ...fields}`. `rid` is a client-chosen integer
+  from 0 to 2^53-1 and is echoed in the reply. Rids need not be unique across the life of a
+  connection but must be unique among requests still awaiting a reply.
+- Replies: `{"rid": <int>, ...payload}` on success, `{"rid": <int>, "error": "<code>", ...}`
+  on failure. Every request gets exactly one reply, except `signin`, which also gets a stream
+  of events carrying its rid before its reply (section 9).
+- Events: `{"event": "<name>", ...}` with no `rid`, except the sign-in stream.
+- Unknown extra fields in a request are ignored. Missing or mistyped required fields are
+  `bad-request`. Unknown `op` is `unknown-op`. An op not allowed for the connection's role is
+  `forbidden`.
+- Concurrency: requests on one connection are handled concurrently and replies may arrive out
+  of order. At most **16** requests may await a reply per connection; the 17th gets
+  `too-many`. Ordering guarantee: an event caused by a request (for example `synced` after
+  `unlock`) is sent after that request's reply.
+- Timestamps are unix seconds as JSON numbers (may be fractional). History dates are ISO 8601
+  UTC strings (`"2026-10-08T12:34:56Z"`).
+
+## 2. Connection lifecycle
+
+### 2.1 Peer verification (before any byte is read)
+
+On every accept the daemon checks, and closes the connection silently on any failure:
+
+1. `SO_PEERCRED`: `gid == pear-client`, `uid >= 1000`.
+2. `SO_PEERPIDFD` (option 77): a pidfd held for the life of the connection.
+3. `/proc/<pid>/status`: `Gid:` real = the user's gid, effective = `pear-client`; `Uid:`
+   real = effective = uid. `/proc/<pid>/stat` gives the start time. Then
+   `pidfd_send_signal(pidfd, 0)` confirms the pid was not recycled.
+
+### 2.2 hello
+
+The first line must be `hello` and must arrive within **5 s** of connecting; otherwise
+`{"rid":null,"error":"hello-required"}` and close.
+
+Request:
+
+```json
+{"op":"hello","rid":0,"role":"ui","proto":2}
+{"op":"hello","rid":0,"role":"clip","proto":2,"ticket":"<43 chars base64url>"}
+{"op":"hello","rid":0,"role":"migrate","proto":2,"ticket":"<43 chars base64url>"}
+{"op":"hello","rid":0,"role":"autofill","proto":2}
+```
+
+`proto` other than 2: `{"rid":0,"error":"proto","proto":2}` and close. Unknown role: close
+without a reply.
+
+Role rules:
+
+| role | rule |
+|---|---|
+| `ui` | At most one per uid. A second `ui` hello gets `{"rid":0,"error":"already-running"}` and is closed; the existing UI gets `{"event":"focus"}`. |
+| `clip`, `migrate` | `ticket` required. It must be live (10 s), unused, issued on this uid's UI connection for this role, and the client's `PPid` must equal that UI's pid with a matching UI start time. Otherwise `{"rid":0,"error":"bad-ticket"}` and close. The ticket is consumed by the hello, success or not. More than 5 bad tickets per uid per minute: further `clip`/`migrate` hellos for that uid are refused with `bad-ticket` for the rest of the minute. |
+| `autofill` | No ticket, no parent binding. At most **4** live autofill connections per uid; the 5th gets `{"rid":0,"error":"too-many"}` and is closed. |
+
+Replies:
+
+`ui`:
+
+```json
+{"rid":0,"proto":2,"version":"2.0.0","state":"locked","signed_in":true,
+ "sealed_with":"host","synced_at":null,"needs_login":null,
+ "settings":{"grant_s":120,"idle_lock_s":0,"clip_timeout_s":30},
+ "old_copy":{"dir":"/home/u/.config/icp.v1-backup-20261008","migrated_at":1791450000.0}}
+```
+
+- `state`: one of `empty`, `locked`, `unlocked`, `tpm-missing`, `tpm-cleared`, `damaged`
+  (section 4). A fresh `ui` hello is never `unlocked`, because the previous UI's EOF locked
+  the uid.
+- `signed_in`: whether an iCloud session is stored (known without keys).
+- `sealed_with`: `"host"`, `"host+tpm2"`, or `null` when `empty`.
+- `synced_at`, `needs_login`: `null` while locked (they live under the metadata key).
+- `old_copy`: the v1 backup recorded by a migration, or `null`.
+
+`clip` (after the ticket is checked):
+
+```json
+{"rid":0,"proto":2,"version":"2.0.0","purpose":"copy"}
+```
+
+`migrate`:
+
+```json
+{"rid":0,"proto":2,"version":"2.0.0","purpose":"import"}
+{"rid":0,"proto":2,"version":"2.0.0","purpose":"purge",
+ "files":[{"name":"vault.enc","sha256":"<hex>"}],"dir":"/home/u/.config/icp.v1-backup-20261008"}
+```
+
+`autofill`:
+
+```json
+{"rid":0,"proto":2,"version":"2.0.0","state":"locked"}
+```
+
+with `state` one of `locked`, `unlocked`, `unavailable` only. `unavailable` covers `empty`,
+`tpm-missing`, `tpm-cleared` and `damaged`; nothing else about the store is disclosed.
+
+### 2.3 Tickets
+
+- 32 random bytes, sent as unpadded base64url (43 characters).
+- Issued only on a `ui` connection by `copy` (role `clip`), `migrate-begin` (role `migrate`,
+  purpose `import`) and `purge-old-copy` (role `migrate`, purpose `purge`).
+- Bound to: uid, the issuing UI connection, the role, the purpose, and for `copy` the
+  `(id, field)` and the value snapshot taken at issue time.
+- Single use, **10 s** TTL from issue to hello. All of a uid's tickets are revoked by any lock.
+- The UI passes a ticket to its child **on stdin only** (section 10), never in argv or the
+  environment.
+
+### 2.4 Closing
+
+- EOF on the `ui` connection locks the uid (section 4.2), cancels its pending dialogs and
+  withdraws every live `clip` and `migrate` connection of the uid (`{"event":"withdraw"}`,
+  then close).
+- EOF on any connection cancels its pending dialogs (`CancelCheckAuthorization`).
+- The daemon closes a connection whose client stops reading (send buffer over 16 MiB).
+
+## 3. Shared shapes
+
+### 3.1 Meta (what tier 1 releases)
+
+```json
+{"id":"<opaque>","title":"GitHub","domain":"github.com","sites":["gist.github.com"],
+ "username":"me@example.com","nickname":"","apple_title":"GitHub","aliases":[],
+ "has_totp":true,"has_notes":false,"mdat":1791450000.0,"history_count":2,
+ "primary":"GitHub","secondary":"me@example.com","no_site":false,"is_wifi":false,
+ "ambiguous":false}
+```
+
+- The first twelve fields are `vstore.Meta`. `id` is opaque to clients: at most 128 characters
+  of `[A-Za-z0-9._:-]`, stable for the same keychain item across syncs.
+- `primary`, `secondary`, `no_site`, `is_wifi`, `ambiguous` are display fields the daemon
+  derives exactly as 1.3.2's `app-list` did (nickname, then Apple's title, then the derived
+  title; Wi-Fi items are domain `AirPort`; `ambiguous` when two rows would look identical).
+- Entries 1.3.2 hid as internal (Apple service records, HomeKit keys, ...) are omitted unless
+  `unlock` was sent with `"all":true`.
+- The list is sorted by `primary`, then `secondary`, case-insensitively.
+- Meta never contains a password, notes text, a TOTP seed or code, or a pwmac.
+
+### 3.2 Settings
+
+```json
+{"grant_s":120,"idle_lock_s":0,"clip_timeout_s":30}
+```
+
+| key | default | allowed |
+|---|---|---|
+| `grant_s` | 120 | integer 0..600; 0 = a grant is used up by its first use |
+| `idle_lock_s` | 0 (off) | 0, 300, 900, 1800 |
+| `clip_timeout_s` | 30 | integer 5..60 |
+
+There is no `sync_lease_h`: 2.0 has no sync lease. A `set` naming any other key is
+`{"error":"invalid","field":"<key>"}` and nothing is changed.
+
+## 4. States, locking and sync
+
+### 4.1 States
+
+| state | meaning | how a UI leaves it |
+|---|---|---|
+| `empty` | no store for this uid | `migrate-begin` (v1 present) or `signin` (fresh) |
+| `locked` | store present, no keys in memory | `unlock` |
+| `unlocked` | tier 1 open on this uid's UI connection | any lock trigger |
+| `tpm-missing` | sealed with host+tpm2 and no TPM now | turn PTT back on; no destructive action offered |
+| `tpm-cleared` | a TPM is present but its SRK differs | `reset` |
+| `damaged` | keys unseal but data does not authenticate | `reset` (files are kept) |
+
+The seal states are discovered at `unlock` (unsealing is lazy) and are then reported by
+`hello` until the store changes.
+
+### 4.2 Lock triggers
+
+Each of these wipes every key, subkey, grant, ticket and live clip offer of the uid, then
+sends `{"event":"locked","reason":...}` to the UI if it is still connected:
+
+| trigger | reason |
+|---|---|
+| `lock` op | `user` |
+| UI connection EOF | (no event; the UI is gone) |
+| logind `Lock` signal or `LockedHint=true` on any session of the uid | `screen-locked` |
+| `PrepareForSleep(true)` (wiped before the delay inhibitor is released) | `sleep` |
+| the uid's last session removed | `session-ended` |
+| `idle_lock_s` seconds with no UI request | `idle` |
+| `reset` | `reset` |
+| `signout` | `signout` |
+| an unrecoverable daemon error for this uid | `error` |
+
+After a lock nothing re-prompts until the UI sends `unlock` again.
+
+### 4.3 Sync
+
+Sync runs only for a uid whose tier 1 is unlocked: right after every successful `unlock`,
+every 2 h (±60 s jitter) while unlocked, and on a `sync` op. It never prompts and never
+unseals the entry key. Results reach the UI as `synced` or `sync-failed` events. There is no
+lease: a locked uid does not sync.
+
+## 5. Prompts (polkit)
+
+| action | message | raised by |
+|---|---|---|
+| `io.github.dragosol.pearpasswords.unlock` | Unlock Pear Passwords to show your accounts | `unlock` |
+| `io.github.dragosol.pearpasswords.reveal` | Use the saved password for $(account) | `grant` |
+| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | `create`, `delete`, `signin`, `signout`, `migrate-begin`, `reset`, `purge-old-copy`, `clip-history-check` |
+| `io.github.dragosol.pearpasswords.autofill` | Fill the password for $(account) on $(origin) | `autofill-fill` |
+
+All four: `auth_self` for active local sessions, `no` for any and inactive, no `_keep`, owner
+annotation `unix-user:pear-passwords`. No other op ever raises a dialog.
+
+- Subject: `unix-process` with the connection's `pidfd` (and `uid`); fallback
+  `{pid, start-time, uid}` if gate G2 fails. `AllowUserInteraction` is set only while
+  handling one of the ops above.
+- Details: `account` = `"<title> — <username>"` (nickname if set; domain when there is no
+  title), `origin` = the origin's host (autofill only). Each value is reduced to printable
+  characters with no control or bidi characters and cut to 64 characters.
+- Outcomes and the codes they map to:
+
+| polkit result | code | counted against the limit |
+|---|---|---|
+| authorized | (success) | yes |
+| challenge failed with `polkit.dismissed` | `dismissed` | yes |
+| not authorized | `denied` | yes |
+| no agent registered (G7) | `no-agent` | no |
+| agent busy with another dialog | `busy` | no |
+| cancelled by the daemon (EOF, `cancel`, superseded `grant`) | `cancelled` | no |
+
+- Rate limits, per uid and **bucket** (`ui` for the window's ops, `autofill` for the browser's):
+  - one outstanding dialog per bucket: a second prompt-raising op gets `prompt-pending`
+    (except `grant`, which supersedes a pending `grant`: the old one gets `cancelled`);
+  - at most **3 answered** dialogs per rolling minute per bucket; the 4th prompt-raising op
+    gets `{"error":"rate-limited","retry_after":<seconds>}` without a dialog.
+- For `unlock` a refusal is a normal reply, not an error (section 6.1). For every other op it
+  is `{"rid":n,"error":"<code>"}`.
+
+## 6. UI ops (role `ui`)
+
+Unless stated, ops that need tier 1 return `locked` when the uid is not unlocked, and ops that
+name an `id` return `not-found` for an id with no live entry.
+
+### 6.1 unlock
+
+```json
+{"op":"unlock","rid":1}
+{"op":"unlock","rid":1,"all":true}
+```
+
+Raises `.unlock` (no dialog if already unlocked on this connection). Success:
+
+```json
+{"rid":1,"entries":[<Meta>...],"synced_at":1791450000.0,"needs_login":false}
+```
+
+then a background sync. Refusal (a reply, not an error):
+
+```json
+{"rid":1,"locked":true,"reason":"dismissed"}
+```
+
+`reason` is `dismissed`, `denied`, `no-agent`, `busy`, `rate-limited` (with `retry_after`),
+`empty`, `tpm-missing`, `tpm-cleared` or `damaged`. The seal reasons come from unsealing after
+an approved dialog. On success with a TPM present, the keys are re-sealed to host+tpm2 before
+the reply (no user action).
+
+### 6.2 lock, release, cancel
+
+```json
+{"op":"lock","rid":2}                      -> {"rid":2,"locked":true}
+{"op":"release","rid":3}                   -> {"rid":3,"released":true}
+{"op":"cancel","rid":4,"target":1}         -> {"rid":4,"cancelled":true|false}
+```
+
+- `lock`: lock trigger `user` (section 4.2). Then also the `locked` event.
+- `release`: drop the current grant (if any) and cancel a pending `grant` dialog. The UI sends
+  it whenever the selected account changes. Never an error.
+- `cancel`: cancel the pending request with rid `target` on this connection if it is a
+  prompt-raising op or `signin`; that request then replies `cancelled`. `cancelled:false` if
+  nothing was pending under that rid.
+
+### 6.3 grant
+
+```json
+{"op":"grant","rid":5,"id":"<id>"}
+```
+
+Needs tier 1. Wipes any existing grant (one grant per uid), then raises `.reveal` with
+`account` for that entry. Success:
+
+```json
+{"rid":5,"id":"<id>","expires":1791450120.0,"grant_s":120,"single_use":false,
+ "fields":["password","notes","code","history"]}
+```
+
+- `expires` is `null` and `single_use` is `true` when `grant_s` is 0: the first `reveal`,
+  `totp`, `history`, `copy` of a secret field, or `set` on that id uses it up.
+- `fields` lists what the entry has: `password` always, `notes` if `has_notes`, `code` if
+  `has_totp`, `history` if `history_count > 0`.
+- When the grant ends the daemon zeroes the entry's buffer and sends
+  `{"event":"grant-expired","id":"<id>"}` (also after `release`, a new `grant`, or single use).
+
+### 6.4 Ops that need a grant on `id`
+
+Each returns `no-grant` with no live grant on that id, `grant-expired` if it just ran out.
+
+```json
+{"op":"reveal","rid":6,"id":"<id>","field":"password"}
+  -> {"rid":6,"id":"<id>","field":"password","value":"...","hide_after":20}
+{"op":"totp","rid":7,"id":"<id>"}
+  -> {"rid":7,"id":"<id>","code":"123456","valid_until":1791450030.0}
+{"op":"history","rid":8,"id":"<id>"}
+  -> {"rid":8,"id":"<id>","items":[{"date":"2026-09-01T10:00:00Z","value":"...","source":"apple"}]}
+```
+
+- `reveal` `field`: `password` or `notes` (else `invalid`). The UI shows the value for at most
+  `hide_after` seconds or until it loses focus.
+- `totp`: `invalid` if the entry has no code. The seed never leaves the daemon.
+- `history`: newest first; `source` is `apple` (Apple's own record) or `local` (a change this
+  machine saw).
+
+### 6.5 copy
+
+```json
+{"op":"copy","rid":9,"id":"<id>","field":"password"}
+  -> {"rid":9,"ticket":"<43 chars>","ttl":10}
+```
+
+- `field`: `username`, `domain` (tier 1 only, no grant), or `password`, `code`, `notes`
+  (need a grant). `code` is computed at issue time.
+- The value is snapshotted into the ticket. The UI then runs `pear-exec clip` and writes the
+  ticket to its stdin (section 10.1). The outcome arrives later as the `clip` event.
+- A new `copy` withdraws the uid's previous live clip offer (`withdraw` to that clip).
+
+### 6.6 set, create, delete, totp-preview
+
+```json
+{"op":"set","rid":10,"id":"<id>","fields":{"notes":"...","sites":["a.example.com"]}}
+{"op":"set","rid":10,"id":"<id>","fields":{},"generate":{}}
+{"op":"create","rid":11,"fields":{"domain":"example.com","username":"me","title":"Example"},"generate":{}}
+{"op":"delete","rid":12,"id":"<id>"}
+{"op":"totp-preview","rid":13,"setup":"otpauth://totp/...?secret=..."}
+```
+
+- `set` needs a grant on `id`. `fields` may hold any of `password` (string), `notes`
+  (string), `sites` (array of strings), `nickname` (string), `totp`
+  (`{"setup":"<key or otpauth link>"}` or `{"remove":true}`). `generate:{}` sets the password
+  to a daemon-generated one in Apple's shape (`generate` and `fields.password` together are
+  `invalid`); the generated value is never in the reply, only `reveal` shows it.
+  Reply: `{"rid":10,"id":"<id>","synced":true}` (`synced:false` when only a local nickname
+  changed). The old password moves into history.
+- `create` needs `.manage` and tier 1. `fields` from `domain`, `username`, `password`,
+  `title`, `notes`, `sites`, `totp`; a password is required unless `generate:{}`.
+  Reply: `{"rid":11,"id":"<new id>"}`.
+- `delete` needs `.manage` and tier 1. Reply: `{"rid":12,"deleted":true}`.
+- `totp-preview` needs tier 1, no grant, reads nothing from the store: parses the setup text
+  and replies `{"rid":13,"code":"123456","seconds":17,"issuer":"...","account":"..."}` or
+  `invalid`.
+- All three Apple-touching ops can fail with `not-signed-in`, `needs-login`,
+  `anisette-unavailable`, `network`, `apple` (with a sanitized `detail`), `busy-sync`.
+- Validation failures are `{"error":"invalid","field":"<name>"}`.
+
+### 6.7 signin, answer, signout
+
+```json
+{"op":"signin","rid":14,"mode":"login"}
+{"op":"signin","rid":14,"mode":"relogin"}
+```
+
+- `login` needs `empty` (a store is created first) or an unlocked store with no session;
+  `relogin` needs tier 1 and a stored session. Both raise `.manage`.
+- While it runs, the daemon sends the sign-in stream (section 9.2) with `"rid":14`. Questions
+  are `ask` events; the UI answers each with:
+
+```json
+{"op":"answer","rid":15,"ask_id":3,"value":"123456"}
+{"op":"answer","rid":15,"ask_id":3,"cancel":true}
+```
+
+  `answer` replies `{"rid":15,"ok":true}` immediately, or `invalid` for an unknown or
+  already-answered `ask_id`. `cancel:true` (or `cancel{target:14}`, or EOF) aborts the
+  sign-in.
+- Final reply: `{"rid":14,"ok":true}` or `{"rid":14,"error":"cancelled"|"needs-login"|...}`.
+  A successful sign-in leaves the uid unlocked and starts a sync.
+- `signout` needs `.manage` and tier 1: forgets the iCloud session; entries stay; then lock
+  trigger `signout`.
+
+```json
+{"op":"signout","rid":16}                  -> {"rid":16,"signed_out":true}
+```
+
+### 6.8 sync, settings
+
+```json
+{"op":"sync","rid":17}                     -> {"rid":17,"queued":true}
+                                              {"rid":17,"skipped":"locked"|"running"|"signed-out"}
+{"op":"settings","rid":18,"get":true}      -> {"rid":18,"settings":{...}}
+{"op":"settings","rid":18,"set":{"grant_s":60}}  -> {"rid":18,"settings":{...}}
+```
+
+`sync` never prompts. `settings` needs no dialog (the window is already the authenticated
+app); `set` validates every key first and applies all or none. A lower `grant_s` applies to
+the next grant; `idle_lock_s` restarts the idle clock.
+
+### 6.9 Migration and cleanup
+
+```json
+{"op":"migrate-begin","rid":19}            -> {"rid":19,"ticket":"<43 chars>","ttl":10}
+{"op":"purge-old-copy","rid":20}           -> {"rid":20,"ticket":"<43 chars>","ttl":10}
+{"op":"reset","rid":21}                    -> {"rid":21,"state":"empty"}
+{"op":"clip-history-check","rid":22,"items":["...","..."]}  -> {"rid":22,"matches":[0,4]}
+```
+
+- `migrate-begin`: needs state `empty` (else `not-locked`). Raises `.manage`, creates and
+  seals new keys, opens tier 1 on this connection, and issues a `migrate`/`import` ticket. The
+  UI runs `pear-exec migrate` with it (section 10.2). When the import commits, the UI gets
+  `{"event":"migrated","counts":{...}}` and then the first `synced`.
+- `purge-old-copy`: needs an `old_copy` record. Raises `.manage` and issues a
+  `migrate`/`purge` ticket; the importer deletes exactly the recorded files whose sha256
+  still matches and reports `purge-result`. The record is cleared afterwards.
+- `reset`: allowed in `tpm-cleared` and `damaged` only (else `not-locked`). Raises `.manage`;
+  the old directory is renamed aside, never deleted; the new store is `empty` (the UI then
+  offers sign-in).
+- `clip-history-check`: needs tier 1. Raises `.manage`. At most 1000 items of at most 1024
+  characters each. Compares pwmac only (no entry key); `matches` are indexes into `items`.
+  Values are never logged.
+
+## 7. clip ops (role `clip`)
+
+```json
+{"op":"redeem","rid":1}
+  -> {"rid":1,"value":"...","sensitive":true,"timeout":30}
+{"op":"clip-result","rid":2,"outcome":"pasted"}
+  -> {"rid":2,"ok":true}
+```
+
+- `redeem` works once per connection; a second one is `bad-ticket`. `sensitive` is true for
+  `password`, `code` and `notes`. `timeout` is the uid's `clip_timeout_s`.
+- `outcome`: `pasted` (the single counted paste), `expired` (timeout; cleared only if still
+  the selection), `replaced` (someone else set the selection), `withdrawn` (the daemon sent
+  `withdraw`), `failed` (no data-control protocol, compositor gone). The daemon relays it as
+  `{"event":"clip","id":"<id>","field":"password","outcome":"pasted"}` to the UI.
+- On `{"event":"withdraw"}` or EOF from the daemon the clip process destroys its source
+  (clearing the clipboard only if its offer is still the selection), zeroes the value and
+  exits.
+
+## 8. migrate ops (role `migrate`)
+
+Purpose `import`:
+
+```json
+{"op":"import-file","rid":1,"name":"vault.enc","seq":0,"b64":"...","eof":false}
+  -> {"rid":1,"ok":true}
+{"op":"import-file","rid":2,"name":"vault.enc","seq":1,"b64":"...","eof":true}
+  -> {"rid":2,"ok":true,"size":123456,"sha256":"<hex>"}
+{"op":"import-key","rid":3,"key_b64":"<32 bytes base64>"}
+{"op":"import-key","rid":3,"passphrase":"..."}
+  -> {"rid":3,"ok":true}  |  {"rid":3,"error":"wrong-passphrase"}
+{"op":"import-commit","rid":4}
+  -> {"rid":4,"counts":{"credentials":554,"history":31,"nicknames":12,"aliases":7,"session_keys":14},
+      "digest":"<hex>"}
+  |  {"rid":4,"error":"mismatch"}  |  {"rid":4,"error":"incomplete"}
+```
+
+- `name` must be one of `session.enc`, `vault.enc`, `history.enc`, `nicknames.enc`,
+  `aliases.enc`, `kdf.json`, `check.enc`, `device.json`; `vault.enc`, `kdf.json` and
+  `check.enc` are required. Each file is sent in chunks of at most **32 KiB raw** with `seq`
+  counting from 0; at most **4 MiB** per file. A repeated name after `eof`, a gap in `seq` or
+  an oversize file is `invalid` and discards that file.
+- `import-key` is checked against `check.enc`, which must already have arrived (else
+  `incomplete`). `passphrase` runs Argon2id with the `kdf.json` parameters inside the daemon.
+  A wrong key or passphrase changes nothing and may be retried.
+- `import-commit` converts in `u<uid>.tmp`, verifies, and renames into place on a match. On
+  `mismatch` nothing is kept and v1 stays authoritative. On success the daemon records
+  `old_copy` with the sha256 of each imported file and the backup directory the importer
+  reports via the `backup_dir` field: `{"op":"import-commit","rid":4,"backup_dir":"<abs path>"}`.
+
+Purpose `purge`:
+
+```json
+{"op":"purge-result","rid":1,"removed":["vault.enc"],"kept":["session.enc"]}
+  -> {"rid":1,"ok":true}
+```
+
+The `files` and `dir` from the purge hello are the only files the importer may unlink, and only
+if their sha256 still matches.
+
+## 9. Events
+
+### 9.1 To the UI
+
+```json
+{"event":"locked","reason":"screen-locked"}
+{"event":"synced","entries":[<Meta>...],"synced_at":1791450000.0,
+ "counts":{"added":0,"changed":2,"deleted":0,"unchanged":552}}
+{"event":"sync-failed","reason":"anisette-unavailable"|"network"|"needs-login"|"apple","detail":"..."}
+{"event":"needs-login"}
+{"event":"grant-expired","id":"<id>"}
+{"event":"clip","id":"<id>","field":"password","outcome":"pasted"}
+{"event":"autofill","id":"<id>","origin":"github.com","outcome":"filled"|"dismissed"|"denied"|"failed"}
+{"event":"migrated","counts":{...}}
+{"event":"focus"}
+```
+
+`focus` asks the window to raise itself (`hyprctl dispatch focuswindow`).
+
+### 9.2 Sign-in stream (to the UI, carrying the signin rid)
+
+```json
+{"event":"stage","rid":14,"stage":"verify","info":{"via":"device"}}
+{"event":"out","rid":14,"kind":"step"|"out"|"warn"|"err","text":"..."}
+{"event":"ask","rid":14,"ask_id":3,"need":"text"|"secret"|"confirm"|"choice",
+ "kind":"code","prompt":"6-digit code: ","default":null,"detail":null,
+ "options":["MacBook Pro"],"details":["Last used ..."]}
+```
+
+`options` and `details` appear only for `need:"choice"`; the answer `value` is then the index
+as a string. For `confirm` the value is `"yes"` or `"no"`. These mirror the 1.x jsonui
+frontend, so a stage Apple adds later reaches the window without a UI change.
+
+### 9.3 To clip and migrate
+
+`{"event":"withdraw"}`: stop now (lock, new copy, UI gone). The daemon closes the connection
+right after.
+
+### 9.4 To autofill
+
+`{"event":"state","state":"locked"|"unlocked"|"unavailable"}` whenever the uid's tier 1 opens or
+closes, so an extension can update its button. Carries nothing else.
+
+## 10. UI to child (stdin/stdout of processes the UI spawns)
+
+These pipes never leave the pair of processes: both ends are non-dumpable `pear-client`
+processes of the same user.
+
+### 10.1 `pear-exec clip`
+
+- stdin: exactly one line, the ticket, then EOF.
+- stdout: nothing the UI depends on (diagnostics only, never a value). The outcome reaches the
+  UI through the daemon's `clip` event.
+- exit 0 after reporting an outcome, non-zero if it could not connect or redeem.
+
+### 10.2 `pear-exec migrate`
+
+- stdin, line 1: the ticket. Line 2 (purpose `import` only): options
+  `{"move_manifests":true|false}`. Later lines, only when asked:
+  `{"passphrase":"..."}` or `{"cancel":true}`.
+- stdout: one JSON object per line:
+
+```json
+{"stage":"reading"|"peek"|"converting"|"cleanup"|"purging"}
+{"need":"passphrase","retry":false}
+{"done":true,"counts":{...},"digest":"<hex>","backup_dir":"<abs path>","kept_manifests":["..."]}
+{"done":true,"removed":["..."],"kept":["..."]}
+{"error":"wrong-passphrase"|"mismatch"|"unsafe-file"|"no-v1"|"daemon","detail":"..."}
+```
+
+- The importer first PEEKs the 1.3.2 agent (never GET). Only if that fails does it print
+  `{"need":"passphrase"}`; the window shows its one field and writes the answer to stdin; the
+  importer sends it as `import-key{passphrase}`. On `wrong-passphrase` it prints
+  `{"need":"passphrase","retry":true}`.
+
+## 11. Autofill (role `autofill`)
+
+The autofill role is `pear-exec autofill`, started by a browser through the native-messaging
+host `io.github.dragosol.pearpasswords` (wrapper `/usr/local/lib/pear-passwords/libexec/pear-autofill-host`).
+It never gets a tier-1 or tier-2 grant and never uses the window's grants.
+
+**A locked Pear reveals nothing.** Both ops work only while the uid's tier 1 is unlocked in the
+Pear window. Otherwise they say nothing about any site.
+
+### 11.1 Origin
+
+`origin` is the page origin as the browser reports it (the extension takes it from the tabs
+API or `sender.url`, never from page content): exactly `https://<host>` or
+`https://<host>:<port>`, ASCII host (punycode for IDNs), at least two dot-separated
+`[a-z0-9-]` labels, no IP literal, no userinfo, path, query, fragment or trailing dot. Any
+other scheme is `insecure-origin`; anything else malformed is `bad-origin`. One leading `www.`
+is stripped; the port is ignored.
+
+### 11.2 Matching
+
+An entry matches host `h` when `h` equals its `domain` or one of its `sites`, or one is a
+subdomain of the other at a dot boundary and the shorter one is not a public suffix (at least
+two labels and not in the daemon's frozen list of multi-label public suffixes). Rank 0 is an
+exact host match, rank 1 a related one. Name-only matches and inferred `aliases` never match.
+
+### 11.3 Ops
+
+```json
+{"op":"autofill-query","rid":1,"origin":"https://github.com"}
+  -> {"rid":1,"state":"locked"}
+  -> {"rid":1,"state":"unavailable"}
+  -> {"rid":1,"state":"unlocked","host":"github.com",
+      "accounts":[{"id":"<id>","username":"me","label":"GitHub — me","match":"exact"}]}
+
+{"op":"autofill-fill","rid":2,"origin":"https://github.com","id":"<id>"}
+  -> {"rid":2,"id":"<id>","username":"me","password":"..."}
+  |  {"rid":2,"error":"locked"|"no-match"|"dismissed"|"denied"|"no-agent"|"busy"|
+                      "rate-limited"|"prompt-pending"|"cancelled"|"bad-origin"|"insecure-origin"}
+```
+
+- `autofill-query` never prompts. Locked or without a UI connection: only
+  `{"state":"locked"}`; empty or a seal state: only `{"state":"unavailable"}`. Unlocked: up to
+  20 accounts ranked by match, then newest change, then label. Never a secret.
+- `autofill-fill` raises `.autofill` every time with `account` and `origin` (the host), in the
+  `autofill` rate-limit bucket (one outstanding, 3 answered per minute per uid). An unknown
+  id and a non-matching id both give `no-match`. After approval the daemon re-checks that the
+  uid is still unlocked and the entry still matches, opens the entry and replies with
+  username and password only. It also sends the UI an `autofill` event.
+- The browser, and the extension, then hold that one password. The origin is only as
+  trustworthy as the browser that reported it.
+
+## 12. Error codes
+
+| code | meaning |
+|---|---|
+| `bad-request` | malformed JSON, wrong types, or a missing field |
+| `too-large` | request line over 64 KiB; the connection is closed |
+| `hello-required` | first line was not hello, or no hello within 5 s; closed |
+| `proto` | unsupported `proto` in hello; closed |
+| `unknown-op` | op name not in this protocol |
+| `forbidden` | op not allowed for this connection's role |
+| `too-many` | 16 requests pending, or 4 autofill connections already open |
+| `already-running` | a second `ui` hello for this uid; the existing window is focused |
+| `bad-ticket` | ticket missing, expired, used, of another role or uid, or wrong parent |
+| `peer` | peer verification failed (sent only if the socket is still writable); closed |
+| `internal` | a daemon bug; logged, never carries detail |
+| `locked` | needs tier 1 and this uid is locked |
+| `not-locked` | `migrate-begin` or `reset` in a state that does not allow it |
+| `no-grant` | needs a grant on this id and there is none |
+| `grant-expired` | the grant on this id ran out |
+| `not-found` | no live entry with this id |
+| `no-match` | autofill: unknown id, or the entry does not match the origin |
+| `not-signed-in` | needs an iCloud session and there is none |
+| `needs-login` | Apple wants an interactive sign-in |
+| `empty` | no store for this uid |
+| `tpm-missing` | see section 4.1 |
+| `tpm-cleared` | see section 4.1 |
+| `damaged` | see section 4.1 |
+| `dismissed` | the user closed the dialog |
+| `denied` | polkit refused (wrong password, failed fingerprint, policy) |
+| `no-agent` | no polkit agent; not counted against the rate limit |
+| `busy` | the agent is showing another dialog; not counted |
+| `rate-limited` | 3 answered dialogs in the last minute in this bucket; has `retry_after` |
+| `prompt-pending` | this bucket already has a dialog open |
+| `cancelled` | cancelled by `cancel`, a superseding `grant`, or EOF |
+| `busy-sync` | a sync, sign-in or edit for this uid is already running |
+| `anisette-unavailable` | the anisette server on 127.0.0.1:6969 did not answer |
+| `network` | iCloud could not be reached |
+| `apple` | iCloud refused; a sanitized `detail` explains |
+| `invalid` | a field failed validation; `field` names it |
+| `wrong-passphrase` | the v1 key or passphrase does not open check.enc |
+| `mismatch` | the converted store did not verify; nothing was kept |
+| `incomplete` | `import-key` or `import-commit` before the files it needs |
+| `bad-origin` | autofill origin malformed |
+| `insecure-origin` | autofill origin is not https |
+
+Errors never carry a secret, a file path under `/var/lib/pear-passwords`, or a Python
+traceback.
+
+## 13. Op table
+
+| op | role | dialog | needs | reply |
+|---|---|---|---|---|
+| `hello` | all | – | first line | section 2.2 |
+| `unlock` | ui | `.unlock` | store present | `{entries, synced_at, needs_login}` or `{locked, reason}` |
+| `lock` | ui | – | – | `{locked:true}` |
+| `release` | ui | – | – | `{released:true}` |
+| `cancel` | ui | – | – | `{cancelled}` |
+| `grant` | ui | `.reveal` | tier 1 | `{id, expires, grant_s, single_use, fields}` |
+| `reveal` | ui | – | grant | `{id, field, value, hide_after:20}` |
+| `totp` | ui | – | grant | `{id, code, valid_until}` |
+| `history` | ui | – | grant | `{id, items:[{date, value, source}]}` |
+| `copy` | ui | – | tier 1; grant for password/code/notes | `{ticket, ttl:10}` |
+| `set` | ui | – | grant | `{id, synced}` |
+| `create` | ui | `.manage` | tier 1 | `{id}` |
+| `delete` | ui | `.manage` | tier 1 | `{deleted:true}` |
+| `totp-preview` | ui | – | tier 1 | `{code, seconds, issuer, account}` |
+| `signin` | ui | `.manage` | section 6.7 | stream, then `{ok:true}` |
+| `answer` | ui | – | a pending ask | `{ok:true}` |
+| `signout` | ui | `.manage` | tier 1 | `{signed_out:true}` |
+| `sync` | ui | – | – | `{queued:true}` or `{skipped}` |
+| `settings` | ui | – | – | `{settings}` |
+| `migrate-begin` | ui | `.manage` | state empty | `{ticket, ttl:10}` |
+| `reset` | ui | `.manage` | tpm-cleared or damaged | `{state:"empty"}` |
+| `purge-old-copy` | ui | `.manage` | an old_copy record | `{ticket, ttl:10}` |
+| `clip-history-check` | ui | `.manage` | tier 1 | `{matches}` |
+| `redeem` | clip | – | ticket at hello | `{value, sensitive, timeout}` |
+| `clip-result` | clip | – | after redeem | `{ok:true}` |
+| `import-file` | migrate | – | purpose import | `{ok, size?, sha256?}` |
+| `import-key` | migrate | – | purpose import | `{ok:true}` |
+| `import-commit` | migrate | – | files + key | `{counts, digest}` |
+| `purge-result` | migrate | – | purpose purge | `{ok:true}` |
+| `autofill-query` | autofill | – | – | `{state, host?, accounts?}` |
+| `autofill-fill` | autofill | `.autofill` | tier 1 | `{id, username, password}` |
