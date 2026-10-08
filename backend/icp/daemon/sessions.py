@@ -13,9 +13,11 @@ the things that must be decided in exactly one place:
   and a running sign-in, and wipes the store's keys. It never waits: it runs on the event loop,
   which serves every uid, and a store call can sit in systemd-creds for up to a minute on a
   slow TPM. When no store call is running the keys are wiped at once; when one is, the uid is
-  marked wipe-after, every new store call for it is refused at once, and run_store wipes the
-  keys the moment the running call returns (never a half-applied sync, never a meta.v2 sealed
-  from a wiped doc).
+  marked wipe-after and the store is asked to wipe (UserStore.try_lock): the store method in
+  progress wipes the keys the moment it returns, still under the store's mutex, and every
+  store method after it is refused - also inside the same run_store call, which can be many
+  store methods (a sync). New run_store calls for the uid are refused until then. Never a
+  half-applied sync, never a meta.v2 sealed from a wiped doc.
 - run_store(): blocking UserStore and Apple calls go to a worker thread under the uid's store
   lock, and wipe the keys again on the way out when a lock landed meanwhile.
 """

@@ -107,11 +107,14 @@ Per user, in `/var/lib/pear-passwords/u<uid>/` (0700 `pear-passwords`; your uid 
   `test_grants.py`, `test_logind_lock.py`.
 - A lock never waits. It runs on the daemon's one event loop, and a store call can sit in
   `systemd-creds` for up to a minute on a slow TPM, so a lock that finds a store call running
-  marks the uid locked, refuses every new store call for it at once, and wipes the keys the
-  moment that call returns. PrepareForSleep holds the suspend back for one second at the most.
+  marks the uid locked and asks the store to wipe: the store method in progress wipes the keys
+  the moment it returns (still holding the store's mutex), and every store method after it is
+  refused, also later steps of the same daemon call, so a sync that was locked part-way never
+  writes again. A sync also checks between its network steps and stops talking to Apple.
+  PrepareForSleep holds the suspend back for one second at the most.
   **Sleep while a store call runs** (residual): if a store call is still running when that
   second is up (an unseal on a hung TPM, a sync), the machine sleeps with that call's keys
-  in RAM, and they are wiped when the call returns after resume. Tests:
+  in RAM, and they are wiped when that one store method returns after resume. Tests:
   `test_lock_never_waits.py`.
 - Moving to host+TPM2 is never automatic. With a usable TPM and host-sealed keys the unlock
   reply says `tpm_move`, and Settings offers **Move your keys onto the security chip**, which

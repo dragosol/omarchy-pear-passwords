@@ -90,6 +90,148 @@ class RegistryLockTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.s.wipe_after)
 
 
+class LockInsideOneStoreCallTests(unittest.IsolatedAsyncioTestCase):
+    """Round 2 audit, problem 2: one run_store call can be many store calls (a sync is a
+    session save, a nickname read, apply_sync and a status write). A lock landing during
+    one of them must stop the rest: the keys are wiped the moment that store method returns,
+    and every later store method in the same call is refused."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._env = vstore_env(Path(self._tmp.name), FakeSealBackend(tpm=False))
+        self._env.__enter__()
+        self.store = vstore.UserStore.create(UID)
+        self.store.apply_sync([item("a.example.test", "me", "pw-a")], set())
+        self.reg = Registry(store_cls=vstore.UserStore)
+        self.s = Session(UID, self.store)
+        self.s.settings_loaded = True
+        self.reg.sessions[UID] = self.s
+
+    def tearDown(self):
+        self.reg.shutdown()
+        self._env.__exit__(None, None, None)
+        self._tmp.cleanup()
+
+    async def _lock_during_first_step(self, steps):
+        started, proceed = threading.Event(), threading.Event()
+        real = E.EntryFiles.write
+        first = {"done": False}
+
+        def slow_write(files, id, blob):
+            real(files, id, blob)
+            if not first["done"]:
+                first["done"] = True
+                started.set()
+                proceed.wait(10)
+        with mock.patch.object(E.EntryFiles, "write", slow_write):
+            call = asyncio.ensure_future(self.reg.run_store(UID, steps, self.store))
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
+            self.reg.lock(UID, "screen-locked")
+            proceed.set()
+            return await asyncio.wait_for(asyncio.gather(call, return_exceptions=True), 10)
+
+    async def test_the_rest_of_a_multi_step_call_is_refused_after_a_lock(self):
+        seen = {}
+
+        def sync_like(store):
+            store.apply_sync([item("a.example.test", "me", "pw-a2")], set())
+            seen["keys_after_step_1"] = store.state()
+            try:
+                store.list_meta()
+                seen["list_meta"] = "served"
+            except vstore.StoreLocked:
+                seen["list_meta"] = "refused"
+            store.apply_sync([item("b.example.test", "you", "pw-b")], set())
+            seen["step_3"] = "ran"
+        (res,) = await self._lock_during_first_step(sync_like)
+        self.assertIsInstance(res, vstore.StoreLocked)
+        self.assertEqual(seen["keys_after_step_1"], "locked")   # wiped as step 1 returned
+        self.assertEqual(seen["list_meta"], "refused")
+        self.assertNotIn("step_3", seen)
+        self.assertEqual(self.store.state(), "locked")
+        self.assertFalse(self.s.wipe_after)
+        # Step 1 completed whole; nothing was written after the lock.
+        s2 = vstore.UserStore.open(UID)
+        s2.unlock()
+        self.assertEqual([m.domain for m in s2.list_meta()], ["a.example.test"])
+        self.assertEqual(s2.open_entry(ids.entry_id("a.example.test", "me")).password, "pw-a2")
+
+    async def test_the_store_opens_again_after_such_a_lock(self):
+        def steps(store):
+            store.apply_sync([item("a.example.test", "me", "pw-a2")], set())
+            store.list_meta()
+        await self._lock_during_first_step(steps)
+        self.assertFalse(self.store._wipe_req)
+        await self.reg.run_store(UID, self.store.unlock)        # no wipe request left over
+        self.assertEqual(len(await self.reg.run_store(UID, self.store.list_meta)), 1)
+
+    async def test_lock_pending_is_seen_while_the_call_still_runs(self):
+        seen = {}
+
+        def steps(store):
+            store.apply_sync([item("a.example.test", "me", "pw-a2")], set())
+            seen["pending"] = store.lock_pending()
+        await self._lock_during_first_step(steps)
+        self.assertTrue(seen["pending"])
+
+
+class AppleSyncStopsAfterALockTests(unittest.TestCase):
+    """apple.sync checks between its network steps and stops once the user has locked."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._env = vstore_env(Path(self._tmp.name), FakeSealBackend(tpm=False))
+        self._env.__enter__()
+        self.store = vstore.UserStore.create(UID)
+
+    def tearDown(self):
+        self._env.__exit__(None, None, None)
+        self._tmp.cleanup()
+
+    def test_a_lock_during_the_token_refresh_stops_before_the_keychain_fetch(self):
+        from icp.daemon import apple
+        from icp.daemon.context import UserContext
+        fetched = []
+
+        class Client:
+            def __init__(self, *a, **kw):
+                fetched.append("client")
+
+            def sync_and_decrypt(self, **kw):
+                fetched.append("fetch")
+                return []
+
+        def tokens_then_lock(ctx, s, device, anisette):
+            ctx.store.try_lock()             # the user locks while Apple answers
+        ctx = UserContext(UID, self.store, "http://127.0.0.1:1", None)
+        with mock.patch.object(apple, "_session", lambda ctx: {"x": 1}), \
+                mock.patch.object(apple, "_device", lambda ctx: (None, None)), \
+                mock.patch.object(apple, "_fresh_tokens", tokens_then_lock), \
+                mock.patch("icp.octagon.client.OctagonClient", Client), \
+                mock.patch.object(apple, "fetch_aliases") as aliases:
+            with self.assertRaises(vstore.StoreLocked):
+                apple.sync(ctx)
+        self.assertEqual(fetched, [])
+        aliases.assert_not_called()
+
+    def test_a_lock_during_the_fetch_stops_before_anything_is_applied(self):
+        from icp.daemon import apple
+        from icp.daemon.context import UserContext
+        store = self.store
+
+        class Client:
+            failed_zones = []
+
+            def sync_and_decrypt(self, **kw):
+                store.try_lock()
+                return [item("b.example.test", "you", "pw-b")]
+        ctx = UserContext(UID, store, "http://127.0.0.1:1", None)
+        with mock.patch.object(vstore.UserStore, "apply_sync") as applied:
+            with self.assertRaises(vstore.StoreLocked):
+                apple._sync_with(ctx, {}, None, None, client=Client())
+        applied.assert_not_called()
+
+
 class SleepWaitTests(unittest.TestCase):
     def test_prepare_for_sleep_never_holds_the_suspend_past_about_a_second(self):
         log = []

@@ -51,6 +51,16 @@ class FieldError(ValueError):
 
 # --------------------------------------------------------------------------- shared steps
 
+def _still_unlocked(ctx: "UserContext") -> None:
+    """Stop between network steps once the user has locked. The store refuses every call
+    after a lock by itself; this keeps a sync from going on talking to Apple (and holding a
+    fresh keychain fetch in memory) for nothing."""
+    pending = getattr(ctx.store, "lock_pending", None)
+    if pending is not None and pending():
+        from ..vstore import StoreLocked
+        raise StoreLocked("locked during the sync")
+
+
 def _session(ctx: "UserContext", *, joined: bool = True) -> dict:
     s = session_store.load(ctx.store)
     if not s:
@@ -114,11 +124,13 @@ def _sync_with(ctx: "UserContext", s: dict, device, anisette, client=None) -> di
     from ..octagon import client as octagon
 
     store = ctx.store
+    _still_unlocked(ctx)
     if client is None:
         client = octagon.OctagonClient(s, device, anisette)
     session_store.save(store, s)   # the refreshed cloudKitToken + cloudKitUserId from ckAppInit
     ctx.ui.stage("syncing")
     items = client.sync_and_decrypt(nicknames=store.load_nicknames())
+    _still_unlocked(ctx)
     deleted = _deleted(store, items, getattr(client, "failed_zones", []))
     counts = dict(store.apply_sync(items, deleted))
     n = len(items)
@@ -143,8 +155,10 @@ def sync(ctx: "UserContext") -> dict:
     {"synced_at": unix seconds}."""
     s = _session(ctx)
     device, anisette = _device(ctx)
+    _still_unlocked(ctx)
     _fresh_tokens(ctx, s, device, anisette)
     result = _sync_with(ctx, s, device, anisette)
+    _still_unlocked(ctx)
     fetch_aliases(ctx)
     return result
 
