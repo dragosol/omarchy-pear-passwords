@@ -10,8 +10,10 @@ On the system bus the daemon listens for:
 - Manager.SessionRemoved: when a uid's last session ends it is locked (`session-ended`).
 
 Signals are accepted only from logind's own bus name. A forged one could at worst cause a
-lock, which is harmless (gate G6). If the bus or logind is unavailable the daemon still runs;
-the window then forwards Hyprland's lock as a `lock` op (G6 fallback) and EOF still locks.
+lock, which is harmless (gate G6). If the bus or logind is unavailable the daemon still runs,
+and closing the window (EOF) and the Lock button still lock. The spec's G6 fallback - the
+window forwarding Hyprland's own lock event as a `lock` op - is not built: which event
+Hyprland 0.56 emits for a session lock is for the G6 test to establish first.
 
 The D-Bus I/O runs in a thread of its own (jeepney's threading router, which can receive the
 inhibitor fd). Every action on daemon state is handed to the event loop and waited for.

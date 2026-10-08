@@ -326,6 +326,19 @@ class ShippedFilesTests(unittest.TestCase):
         import icp.client.autofill as host
         self.assertTrue(callable(host.main))
 
+    def test_help_lists_the_browsers_the_readme_names(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            reg.main(["--help"])
+        listed = re.search(r"Browsers: ([a-z, ]+)\.", buf.getvalue()).group(1).split(", ")
+        self.assertEqual(listed, list(reg.BROWSERS))
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertIn("`pear-passwords-autofill --help` lists them", readme)
+        for b in ("zen", "firefox", "librewolf", "chromium"):
+            self.assertIn(b, listed)
+            self.assertIn(f"`{b}`", readme)
+
     def test_manifest_points_at_the_root_owned_wrapper(self):
         with mock.patch.object(reg, "HOST_PATH", paths.AUTOFILL_HOST):
             doc = json.loads(reg.render("mozilla", [ZEN_ID]))

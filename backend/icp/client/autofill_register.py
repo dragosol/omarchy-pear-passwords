@@ -478,7 +478,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="pear-passwords-autofill",
         description="Let one browser extension ask Pear Passwords to fill a login. Off until "
-                    "you register; every fill still asks you in a Pear dialog.")
+                    "you register; every fill still asks you in a Pear dialog.",
+        epilog="Browsers: " + ", ".join(BROWSERS) + ".")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("register", help="allow an extension in one browser")
     r.add_argument("--browser", required=True, choices=list(BROWSERS))

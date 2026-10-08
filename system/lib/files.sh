@@ -246,9 +246,17 @@ pp_table() {
   pp_row f "$AUTOFILL_REGISTER_BIN" "$s/system/bin/pear-passwords-autofill" 0755 root:root
   pp_row f "$UNIT_DIR/$SOCKET_UNIT" "$s/system/units/$SOCKET_UNIT" 0644 root:root
   pp_row f "$UNIT_DIR/$SERVICE_UNIT" "$s/system/units/$SERVICE_UNIT" 0644 root:root
+  pp_row f "$UNIT_DIR/$SEAL_SOCKET_UNIT" "$s/system/units/$SEAL_SOCKET_UNIT" 0644 root:root
+  pp_row f "$UNIT_DIR/$SEAL_SERVICE_UNIT" "$s/system/units/$SEAL_SERVICE_UNIT" 0644 root:root
   pp_row f "$SYSUSERS_CONF" "$s/system/sysusers.d/pear-passwords.conf" 0644 root:root
   pp_row f "$TMPFILES_CONF" "$s/system/tmpfiles.d/pear-passwords.conf" 0644 root:root
   pp_row f "$POLICY_FILE" "$s/polkit/$POLKIT_ACTION_PREFIX.policy" 0644 root:root
+}
+
+# Gate G1 fallback switch: the shipped daemon unit selects the root seal service with an
+# active (uncommented) Environment=PEAR_SEAL_BACKEND=seal-service line.
+pp_seal_service_selected() {
+  grep -qx 'Environment=PEAR_SEAL_BACKEND=seal-service' "$1"
 }
 
 # Sources the table needs from the stage, for a clear error on a stage that is not 2.0.
@@ -267,7 +275,7 @@ pp_missing_sources() {
 # that would change the unit's hardening behind the receipt's back.
 pp_shadows() {
   local u d r pol f
-  for u in "$SOCKET_UNIT" "$SERVICE_UNIT"; do
+  for u in "$SOCKET_UNIT" "$SERVICE_UNIT" "$SEAL_SOCKET_UNIT" "$SEAL_SERVICE_UNIT"; do
     for d in /usr/lib/systemd/system /usr/local/lib/systemd/system /run/systemd/system \
              /etc/systemd/system.control /run/systemd/system.control /run/systemd/transient \
              /run/systemd/generator /run/systemd/generator.early /run/systemd/generator.late; do

@@ -1,0 +1,207 @@
+"""The gate G1 fallback, root's seal service (icp.vstore.seal_service), against the daemon's
+own client for it (seal.SealServiceBackend), over a real unix socket. systemd-creds is a fake
+runner; nothing here is root or touches a real credential.
+"""
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+
+from icp.daemon import paths
+from icp.vstore import seal, seal_service
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class FakeCreds:
+    """Stands in for system-scope systemd-creds: 'seals' by prefixing the name."""
+
+    def __init__(self, refuse=False, rc=0):
+        self.refuse = refuse
+        self.rc = rc
+        self.argvs = []
+
+    def __call__(self, argv, data):
+        self.argvs.append(list(argv))
+        name = [a for a in argv if a.startswith("--name=")][0][7:].encode()
+        if self.rc:
+            return self.rc, b"", b"failed"
+        if argv[1] == "encrypt":
+            return 0, b"SEALED:" + name + b":" + data, b""
+        if self.refuse or not data.startswith(b"SEALED:" + name + b":"):
+            return 1, b"", b"Failed to decrypt the credential."
+        return 0, data[len(b"SEALED:" + name + b":"):], b""
+
+
+class ServiceCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pear-seal-")
+        self.path = os.path.join(self.tmp, "seal.sock")
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        self.srv.listen()
+        self.creds = FakeCreds()
+        self.uid = os.getuid()
+        self.served = []
+
+    def tearDown(self):
+        self.srv.close()
+        os.unlink(self.path)
+        os.rmdir(self.tmp)
+
+    def accept_once(self):
+        def run():
+            conn, _ = self.srv.accept()
+            with conn:
+                self.served.append(seal_service.serve(conn, self.uid, self.creds))
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t
+
+    def call(self, fn, *args):
+        t = self.accept_once()
+        try:
+            return fn(*args)
+        finally:
+            t.join(5)
+
+
+class RoundTripTests(ServiceCase):
+    def test_encrypt_then_decrypt_through_the_daemons_client(self):
+        client = seal.SealServiceBackend(self.path)
+        blob = self.call(client.encrypt, "pear.list.u1000", b"k" * 32)
+        self.assertNotEqual(blob, b"k" * 32)
+        self.assertEqual(self.call(client.decrypt, "pear.list.u1000", blob), b"k" * 32)
+        enc, dec = self.creds.argvs
+        # The primary path's flags, in system scope: no --user, empty PCRs and public key.
+        self.assertEqual(enc, [seal.SYSTEMD_CREDS, "encrypt", "--with-key=auto",
+                               "--tpm2-pcrs=", "--tpm2-public-key=",
+                               "--name=pear.list.u1000", "-", "-"])
+        self.assertEqual(dec, [seal.SYSTEMD_CREDS, "decrypt", "--name=pear.list.u1000",
+                               "-", "-"])
+        for argv in (enc, dec):
+            self.assertNotIn("--user", argv)
+            self.assertNotIn("k" * 32, " ".join(argv))          # the secret never in argv
+
+    def test_a_refused_decrypt_is_unseal_refused_not_unavailable(self):
+        client = seal.SealServiceBackend(self.path)
+        self.creds.refuse = True
+        with self.assertRaises(seal.UnsealRefused):
+            self.call(client.decrypt, "pear.secret.u1000", b"blob")
+
+    def test_a_tool_failure_is_transient(self):
+        client = seal.SealServiceBackend(self.path)
+        self.creds.rc = -9
+        with self.assertRaises(seal.SealUnavailable):
+            self.call(client.decrypt, "pear.secret.u1000", b"blob")
+        self.creds.rc = 1
+        with self.assertRaises(seal.SealUnavailable):
+            self.call(client.encrypt, "pear.secret.u1000", b"x")
+
+    def test_no_service_is_transient(self):
+        with self.assertRaises(seal.SealUnavailable):
+            seal.SealServiceBackend(os.path.join(self.tmp, "nope.sock")).encrypt(
+                "pear.list.u1000", b"x")
+
+
+class RefusalTests(ServiceCase):
+    def raw(self, line: bytes):
+        t = self.accept_once()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(self.path)
+            try:
+                s.sendall(line)
+                s.shutdown(socket.SHUT_WR)
+                out = s.makefile("rb").read()
+            except (ConnectionResetError, BrokenPipeError):
+                out = b""                         # closed on us without a reply
+        t.join(5)
+        return json.loads(out) if out else None
+
+    def test_another_uid_gets_nothing(self):
+        self.uid = os.getuid() + 1
+        self.assertIsNone(self.raw(b'{"op":"encrypt","name":"pear.list.u1","b64":"eA=="}\n'))
+        self.assertEqual(self.served, [False])
+        self.assertEqual(self.creds.argvs, [])
+
+    def test_only_pear_key_names(self):
+        for name in ("pear.list.u", "pear.list.u1000x", "pear.other.u1", "x/../pear.list.u1",
+                     "pear.list.u1\n", "pear.list.u12345678901", 7):
+            req = json.dumps({"op": "encrypt", "name": name, "b64": "eA=="}).encode() + b"\n"
+            self.assertEqual(self.raw(req), {"error": "bad-request", "detail": "name"}, name)
+        self.assertEqual(self.creds.argvs, [])
+
+    def test_malformed_requests(self):
+        cases = [(b"not json\n", "not JSON"),
+                 (b'{"op":"encrypt","name":"pear.list.u1"}\n', "expected op, name and b64"),
+                 (b'{"op":"exec","name":"pear.list.u1","b64":"eA=="}\n', "op"),
+                 (b'{"op":"encrypt","name":"pear.list.u1","b64":"!!"}\n', "b64"),
+                 (b'{"op":"encrypt","name":"pear.list.u1","b64":""}\n', "b64"),
+                 (b'{"op":"encrypt","name":"pear.list.u1","b64":"eA==","x":1}\n',
+                  "expected op, name and b64")]
+        for line, detail in cases:
+            self.assertEqual(self.raw(line), {"error": "bad-request", "detail": detail}, line)
+        big = b'{"op":"encrypt","name":"pear.list.u1","b64":"' + b"A" * (300 * 1024)
+        self.assertEqual(self.raw(big), {"error": "bad-request", "detail": "too large"})
+        self.assertEqual(self.creds.argvs, [])
+
+
+class UnitTests(unittest.TestCase):
+    def read(self, name):
+        with open(os.path.join(ROOT, "system", "units", name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_socket_reaches_only_the_daemons_group(self):
+        u = self.read(paths.SEAL_SOCKET_UNIT)
+        self.assertIn(f"ListenStream={paths.SEAL_SOCKET_PATH}\n", u)
+        self.assertEqual(seal.SEAL_SERVICE_SOCKET, paths.SEAL_SOCKET_PATH)
+        for line in ("SocketUser=root", f"SocketGroup={paths.SERVICE_GROUP}", "SocketMode=0660",
+                     "Accept=yes"):
+            self.assertIn(line + "\n", u)
+
+    def test_service_runs_this_module_hardened(self):
+        u = self.read(paths.SEAL_SERVICE_UNIT)
+        self.assertIn(f"ExecStart={paths.VENV_PYTHON} -I -m icp.vstore.seal_service\n", u)
+        for line in ("StandardInput=socket", "NoNewPrivileges=yes", "CapabilityBoundingSet=",
+                     "ProtectSystem=strict", "ProtectHome=yes", "PrivateNetwork=yes",
+                     "DevicePolicy=closed", "RestrictAddressFamilies=AF_UNIX", "LimitCORE=0"):
+            self.assertIn(line + "\n", u)
+
+    def test_daemon_unit_ships_with_the_primary_path(self):
+        """The switch is off: systemd-creds --user (gate G1) until the VM says otherwise."""
+        u = self.read(paths.SERVICE_UNIT)
+        self.assertIn("#Environment=PEAR_SEAL_BACKEND=seal-service\n", u)
+        self.assertNotRegex(u, re.compile(r"^Environment=PEAR_SEAL_BACKEND", re.M))
+        self.assertIsInstance(seal.SystemdCredsBackend(), seal.SystemdCredsBackend)
+
+    def test_backend_selection(self):
+        env = dict(os.environ, PYTHONPATH=os.path.join(ROOT, "backend"))
+        code = ("from icp.vstore import seal; import sys; "
+                "print(type(seal.get_backend()).__name__)")
+        for value, want in ((None, "SystemdCredsBackend"), ("user-creds", "SystemdCredsBackend"),
+                            ("seal-service", "SealServiceBackend")):
+            e = dict(env)
+            e.pop(seal.BACKEND_ENV, None)
+            if value:
+                e[seal.BACKEND_ENV] = value
+            out = subprocess.run([sys.executable, "-c", code], env=e, capture_output=True,
+                                 text=True, timeout=30)
+            self.assertEqual(out.stdout.strip(), want, out.stderr)
+
+    def test_main_refuses_arguments(self):
+        old = sys.argv
+        sys.argv = ["seal_service", "extra"]
+        try:
+            self.assertEqual(seal_service.main(), 64)
+        finally:
+            sys.argv = old
+
+
+if __name__ == "__main__":
+    unittest.main()

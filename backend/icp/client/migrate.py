@@ -301,10 +301,14 @@ def legacy_manifest_matches(data: bytes, home: str) -> bool:
             and m.get("allowed_extensions") == [LEGACY_EXTENSION_ID])
 
 
-def move_legacy_manifests(home: str, backup_dir: str | None, consent: bool) -> list[str]:
+def move_legacy_manifests(home: str, backup_dir: str | None,
+                          consent: bool) -> tuple[list[str], bool]:
     """Move content-matched org.icp.native.json files into the backup, with consent. Returns
-    the manifests left in place (all of them without consent), as paths."""
+    the manifests left in place (all of them without consent), as paths, and whether any of
+    them was the 1.x extension's (so the window can show the register command with its id).
+    Nothing is registered for the new host either way."""
     kept = []
+    seen_legacy = False
     for label, rel in LEGACY_MANIFEST_DIRS:
         d = os.path.join(home, rel)
         path = os.path.join(d, paths.LEGACY_NATIVE_HOST_MANIFEST)
@@ -320,7 +324,9 @@ def move_legacy_manifests(home: str, backup_dir: str | None, consent: bool) -> l
                 continue
             if data is None:
                 continue
-            if not consent or backup_dir is None or not legacy_manifest_matches(data, home):
+            matches = legacy_manifest_matches(data, home)
+            seen_legacy = seen_legacy or matches
+            if not consent or backup_dir is None or not matches:
                 kept.append(path)
                 continue
             dest_dir = os.path.join(backup_dir, MANIFESTS_SUBDIR)
@@ -335,7 +341,7 @@ def move_legacy_manifests(home: str, backup_dir: str | None, consent: bool) -> l
                 kept.append(path)
         finally:
             os.close(dfd)
-    return kept
+    return kept, seen_legacy
 
 
 def choose_backup_dir(home: str, today: datetime.date | None = None) -> str:
@@ -448,9 +454,10 @@ def do_import(daemon: Channel, stdin, out: Out, home: str, runtime: str,
     except OSError as e:
         out(error="daemon", detail=f"imported, but ~/.config/icp could not be renamed "
                                    f"({e.strerror})")
-    kept = move_legacy_manifests(home, renamed, consent)
+    kept, seen_legacy = move_legacy_manifests(home, renamed, consent)
+    extra = {"extension_id": LEGACY_EXTENSION_ID} if seen_legacy else {}
     out(done=True, counts=counts, digest=digest, backup_dir=renamed or config_dir,
-        kept_manifests=kept)
+        kept_manifests=kept, **extra)
     return 0
 
 

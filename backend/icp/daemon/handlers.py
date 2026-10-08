@@ -351,6 +351,12 @@ async def background_sync(reg, uid: int) -> str:
         st = await reg.run_store(uid, s.store.status)
         if not st.get("signed_in"):
             return "signed-out"
+        if st.get("needs_login"):
+            # Apple already asked for a person and the window already says so (hello, unlock
+            # and the first needs-login event). Each later tick stands down quietly instead
+            # of re-announcing it every 2 h; only a sign-in clears the latch.
+            logger.info("uid %d: needs login: skipped", uid)
+            return "needs-login"
         ctx = UserContext(uid, s.store, reg.anisette_url, None)
         try:
             counts = await reg.run_store(uid, reg.apple.sync, ctx) or {}
@@ -799,6 +805,8 @@ async def op_sync(reg, conn, req):
     st = await _store(reg, conn.uid, s.store.status)
     if not st.get("signed_in"):
         return {"skipped": "signed-out"}
+    if st.get("needs_login"):
+        return {"skipped": "needs-login"}
     _sync_after_reply(reg, conn.uid)
     return {"queued": True}
 

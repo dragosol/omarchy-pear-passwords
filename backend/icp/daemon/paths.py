@@ -93,6 +93,10 @@ MIN_CLIENT_UID = 1000
 UNIT_DIR = "/etc/systemd/system"
 SOCKET_UNIT = "pear-passwordsd.socket"
 SERVICE_UNIT = "pear-passwordsd.service"
+# Gate G1 fallback: root's system-scope sealing for the daemon (icp.vstore.seal_service).
+SEAL_SOCKET_UNIT = "pear-passwords-seal.socket"
+SEAL_SERVICE_UNIT = "pear-passwords-seal@.service"
+SEAL_SOCKET_PATH = "/run/pear-passwords-seal/seal.sock"     # root:pear-passwords 0660
 SYSUSERS_CONF = "/etc/sysusers.d/pear-passwords.conf"
 TMPFILES_CONF = "/etc/tmpfiles.d/pear-passwords.conf"
 

@@ -194,6 +194,7 @@ class ImportTests(unittest.TestCase):
         done = msgs[-1]
         self.assertTrue(done["done"])
         self.assertEqual(done["counts"]["credentials"], 3)
+        self.assertNotIn("extension_id", done)            # no 1.x extension manifest here
         backup = done["backup_dir"]
         self.assertEqual(os.path.basename(backup),
                          "icp.v1-backup-" + datetime.date.today().strftime("%Y%m%d"))
@@ -354,6 +355,8 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(os.path.exists(other))
         self.assertTrue(os.path.exists(foreign_ext))
         self.assertEqual(sorted(done["kept_manifests"]), sorted([other, foreign_ext]))
+        # The window shows the one register command with the old extension's id filled in.
+        self.assertEqual(done["extension_id"], migrate.LEGACY_EXTENSION_ID)
         # ~/icp is never touched (it does not even need to exist), and no new host is
         # registered: no io.github.dragosol manifest anywhere.
         for root, _, files in os.walk(s.home):
@@ -368,6 +371,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(rc, 0, msgs)
         self.assertTrue(os.path.exists(good))
         self.assertEqual(msgs[-1]["kept_manifests"], [good])
+        self.assertEqual(msgs[-1]["extension_id"], migrate.LEGACY_EXTENSION_ID)
         # The legacy units are stopped regardless of the checkbox.
         self.assertEqual(len(s.units), len(migrate.LEGACY_UNITS))
 

@@ -67,6 +67,9 @@ fi
 # Stop the daemon first, so nothing writes while files go away. Only units Pear installed.
 if pp_ours "$UNIT_DIR/$SOCKET_UNIT" && pp_ours "$UNIT_DIR/$SERVICE_UNIT"; then
   pp_sys systemctl disable --now "$SOCKET_UNIT" "$SERVICE_UNIT" || true
+  if pp_ours "$UNIT_DIR/$SEAL_SOCKET_UNIT"; then
+    pp_sys systemctl disable --now "$SEAL_SOCKET_UNIT" || true
+  fi
 elif pp_exists "$UNIT_DIR/$SOCKET_UNIT" || pp_exists "$UNIT_DIR/$SERVICE_UNIT"; then
   pp_warn "the Pear units were changed since they were installed; left enabled and in place"
 fi

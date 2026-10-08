@@ -41,7 +41,7 @@ TPM_SYSFS = "/sys/class/tpm/tpm0"
 TIMEOUT_S = 60                       # a TPM2 operation through the varlink service can be slow
 
 # The G1 fallback service. Only consulted when PEAR_SEAL_BACKEND=seal-service.
-SEAL_SERVICE_SOCKET = "/run/pear-passwords-seal/seal.sock"
+SEAL_SERVICE_SOCKET = system_paths.SEAL_SOCKET_PATH
 BACKEND_ENV = "PEAR_SEAL_BACKEND"
 BACKEND_USER_CREDS = "user-creds"
 BACKEND_SEAL_SERVICE = "seal-service"

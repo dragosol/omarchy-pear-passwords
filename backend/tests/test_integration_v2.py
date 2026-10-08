@@ -36,6 +36,21 @@ def keychain(files):
             for c in legacy.read(files, v1_key(files)).credentials]
 
 
+class VersionTests(unittest.TestCase):
+    def test_hello_version_is_the_release(self):
+        """hello's version is a constant in the daemon; the release number lives in the
+        manifest and pyproject.toml. All three move together."""
+        import json
+        import re
+        from icp.daemon import handlers
+        root = os.path.join(os.path.dirname(__file__), "..", "..")
+        with open(os.path.join(root, "manifest.json"), encoding="utf-8") as f:
+            manifest = json.load(f)["version"]
+        with open(os.path.join(root, "backend", "pyproject.toml"), encoding="utf-8") as f:
+            pyproject = re.search(r'^version = "([^"]+)"', f.read(), re.M).group(1)
+        self.assertEqual({handlers.VERSION, manifest, pyproject}, {"2.0.0"})
+
+
 class RealStoreHarness(Harness):
     """Harness with vstore.UserStore and icp.daemon.apple instead of the in-memory fakes."""
 

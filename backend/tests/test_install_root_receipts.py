@@ -115,6 +115,8 @@ class Harness:
         self.write(f"polkit/{P['POLKIT_ACTION_PREFIX']}.policy", FAKE_POLICY)
         self.write(f"system/units/{P['SOCKET_UNIT']}", "[Socket]\n")
         self.write(f"system/units/{P['SERVICE_UNIT']}", "[Service]\n")
+        self.write(f"system/units/{P['SEAL_SOCKET_UNIT']}", "[Socket]\nAccept=yes\n")
+        self.write(f"system/units/{P['SEAL_SERVICE_UNIT']}", "[Service]\n")
         self.write("system/sysusers.d/pear-passwords.conf", "u pear-passwords -\n")
         self.write("system/tmpfiles.d/pear-passwords.conf", "d /var/lib/pear-passwords\n")
         self.write("system/libexec/pear-passwordsd", "#!/bin/sh\n", 0o755)
@@ -235,6 +237,42 @@ class InstallRootTests(unittest.TestCase):
             version = f.read()
         with open(os.path.join(self.h.stage, "SHA256SUMS"), "rb") as f:
             self.assertEqual(version, f"version=2.0.0\nsums={sha(f.read())}\n")
+
+    def test_seal_service_runs_only_when_the_daemon_unit_selects_it(self):
+        """Gate G1 fallback switch: the root seal socket is installed either way, enabled
+        only by an active PEAR_SEAL_BACKEND=seal-service line in the shipped daemon unit."""
+        self.ok(self.h.install())
+        cmds = self.h.commands()
+        self.assertTrue(os.path.isfile(self.h.r(f"{P['UNIT_DIR']}/{P['SEAL_SOCKET_UNIT']}")))
+        self.assertNotIn(P["SEAL_SOCKET_UNIT"], cmds)        # a fresh install leaves it alone
+
+        os.unlink(self.h.r("commands.log"))
+        self.h.write(f"system/units/{P['SERVICE_UNIT']}",
+                     "[Service]\n#Environment=PEAR_SEAL_BACKEND=seal-service\n")
+        self.h.sums()
+        self.ok(self.h.install())
+        self.assertNotIn(f"enable --now {P['SEAL_SOCKET_UNIT']}", self.h.commands())
+
+        os.unlink(self.h.r("commands.log"))
+        self.h.write(f"system/units/{P['SERVICE_UNIT']}",
+                     "[Service]\nEnvironment=PEAR_SEAL_BACKEND=seal-service\n")
+        self.h.sums()
+        self.ok(self.h.install())
+        cmds = self.h.commands()
+        self.assertIn(f"systemctl enable --now {P['SEAL_SOCKET_UNIT']}", cmds)
+        self.assertLess(cmds.index(P["SEAL_SOCKET_UNIT"]),
+                        cmds.index(f"enable --now {P['SOCKET_UNIT']}"))
+
+        # Back to the primary path in a later release: the upgrade turns the socket off.
+        os.unlink(self.h.r("commands.log"))
+        self.h.write(f"system/units/{P['SERVICE_UNIT']}", "[Service]\n")
+        self.h.sums()
+        self.ok(self.h.install())
+        self.assertIn(f"systemctl disable --now {P['SEAL_SOCKET_UNIT']}", self.h.commands())
+
+        os.unlink(self.h.r("commands.log"))
+        self.ok(self.h.uninstall())
+        self.assertIn(f"disable --now {P['SEAL_SOCKET_UNIT']}", self.h.commands())
 
     def test_installed_uninstaller_is_self_contained(self):
         self.ok(self.h.install())

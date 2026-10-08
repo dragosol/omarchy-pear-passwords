@@ -20,6 +20,13 @@ The rules, in the order a request meets them:
    clipboard only if it is still the selection: a copy you made since is never touched, and
    set_selection(null) is never sent.
 
+Gate G5 decides rule 2. If the VM shows that /proc/<pid>/fd cannot be read from this set-gid
+process, the release flips READER_POLICY to "timing" (spec section 1.4, proposal 2's fallback,
+explicitly weaker): nobody is identified, the requests in the first WATCHER_WINDOW_S after the
+offer goes up are taken to be the history watcher (which reads the moment the selection
+changes) and get nothing, and the first request after that is the paste. A switch in this
+root-owned file, not the environment, because pear-exec passes no environment through.
+
 The outcome goes back to the daemon (`clip-result`), which tells the window. The value lives in
 a bytearray that is zeroed before exit; Python may have copied it on the way in (the JSON
 reply), which is why the real boundary is that this process is non-dumpable.
@@ -47,6 +54,10 @@ HINT_MIME = "x-kde-passwordManagerHint"
 TEXT_MIMES = ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "TEXT", "STRING")
 TICKET_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 WRITE_DEADLINE_S = 2.0
+
+# Gate G5 switch: "proc" (identify every reader's pipe in /proc) or "timing" (the fallback).
+READER_POLICY = "proc"
+WATCHER_WINDOW_S = 0.25
 
 
 # --- who holds the pipe (gate G5) ------------------------------------------------------------
@@ -114,6 +125,21 @@ def make_identifier(exclude: set, describe=watchers.describe_proc) -> Callable[[
     return identify
 
 
+def identify_nobody(fd: int) -> Readers:
+    """The timing fallback's identifier: every reader is unknown."""
+    return Readers(frozenset(), frozenset())
+
+
+def policy(name: str = None) -> tuple[Callable[[set], Callable[[int], Readers]], float]:
+    """(identifier factory, watcher window) for READER_POLICY."""
+    name = READER_POLICY if name is None else name
+    if name == "proc":
+        return make_identifier, 0.0
+    if name == "timing":
+        return (lambda exclude: identify_nobody), WATCHER_WINDOW_S
+    raise ValueError(f"unknown reader policy {name!r}")
+
+
 # --- the offer ----------------------------------------------------------------------------------
 
 @dataclass
@@ -127,6 +153,7 @@ class Offer:
     identify: Callable[[int], Readers]
     now: Callable[[], float] = time.monotonic
     grace: float = protocol.CLIP_REREQUEST_GRACE_S
+    watcher_window: float = 0.0             # > 0 only under the G5 timing fallback
     started: float = 0.0
     pasted_at: float | None = None
     paste_holders: frozenset | None = None
@@ -163,7 +190,7 @@ class Offer:
                     self.refused_others += 1
                     self.log.append((mime, "refused"))
                 return
-            if readers.only_watchers:
+            if readers.only_watchers or self.now() - self.started < self.watcher_window:
                 self.refused_watchers += 1
                 self.log.append((mime, "watcher"))
                 return
@@ -331,9 +358,10 @@ def run(stdin, socket_path: str, wayland_path: str, identify=None) -> int:
         except WaylandError as e:
             print(f"pear-clip: {e}", file=sys.stderr)
         else:
+            factory, window = policy()
             if identify is None:
-                identify = make_identifier({os.getpid(), conn.peer_pid or -1})
-            offer = Offer(value, sensitive, float(timeout), identify)
+                identify = factory({os.getpid(), conn.peer_pid or -1})
+            offer = Offer(value, sensitive, float(timeout), identify, watcher_window=window)
             outcome = serve(dc, offer, daemon)
             conn.close()
     finally:

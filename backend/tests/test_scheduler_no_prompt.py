@@ -125,6 +125,19 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await background_sync(self.h.reg, UID), "locked")
         self.assertEqual(self.h.apple.calls, [])
 
+    async def test_a_latched_needs_login_is_not_repeated_every_tick(self):
+        ui, _ = await self.h.ui()
+        await ui.call("unlock")
+        await ui.event("synced")
+        self.st.needs_login = True                  # Apple asked for a person once
+        calls, events = len(self.h.apple.calls), len(ui.events)
+        await self._drive(3 * protocol.SYNC_INTERVAL_S, step=600)
+        self.assertEqual(await background_sync(self.h.reg, UID), "needs-login")
+        self.assertEqual(len(self.h.apple.calls), calls)        # Apple was not contacted
+        self.assertEqual(ui.events[events:], [])                # and nothing re-announced
+        self.assertEqual((await ui.call("sync"))["skipped"], "needs-login")
+        self.assertEqual(len(self.h.authority.calls), 1)
+
     async def test_unlocked_uid_syncs_every_two_hours_without_prompting(self):
         ui, _ = await self.h.ui()
         await ui.call("unlock")

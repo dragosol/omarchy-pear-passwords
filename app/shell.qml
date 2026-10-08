@@ -58,8 +58,12 @@ ShellRoot {
     // two or more labels, an optional port and a plain path. Nothing that could end the Lua
     // string or reach a shell (no quotes, spaces, $, backslashes or semicolons).
     readonly property var urlPattern: /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/%-]*)?$/
+    // The importer reports the 1.x extension's id when it found that extension's old
+    // connection file; the command then needs only to be pasted. It is never run for you.
     readonly property string registerCommand:
-        "pear-passwords-autofill register --browser zen --extension-id <your extension's id>"
+        "pear-passwords-autofill register --browser zen --extension-id "
+        + (/^\{[0-9a-f-]{36}\}$/.test(root.migrateResult.extension_id || "")
+           ? "'" + root.migrateResult.extension_id + "'" : "<your extension's id>")
     readonly property var legacyUnits: ["icp-host.service", "icp-sync.timer", "icp-sync.service",
                                         "pear-passwords-sync.timer", "pear-passwords-sync.service"]
 
@@ -615,6 +619,7 @@ ShellRoot {
         root.send("sync", {}, function (d) {
             if (d.queued) root.syncing = true;
             else if (d.skipped === "signed-out") root.showFlash("Not signed in to iCloud");
+            else if (d.skipped === "needs-login") { root.needsLogin = true; root.showFlash("iCloud wants you to sign in again"); }
         });
     }
 

@@ -160,16 +160,18 @@ Tests for the locking rows: `test_logind_lock.py`. Tests for the network row:
 These are run in an Arch VM with swtpm and a nested Hyprland, never on the owner's laptop, and
 their results are recorded here. Each has a decided fallback. Status: **not yet run**.
 
-| Gate | What | Fallback |
-|---|---|---|
-| G1 | `systemd-creds --user` from uid `pear-passwords` inside the hardened unit | a root oneshot seals over a pipe |
-| G2 | polkit accepts a pidfd `unix-process` subject; `$(account)` shows | `{pid, start-time, uid}`, fixed message |
-| G3 | Quickshell starts with egid != rgid under AT_SECURE | redesign the identity step |
-| G4 | Quickshell with empty XDG homes and no disk cache; what it opens under `$HOME` | allowlist the residue |
-| G5 | pear-clip can identify a reader's pipe at `ptrace_scope` 1 and 2 | a 250 ms window, documented as weaker |
-| G6 | logind `Lock`, `LockedHint`, `PrepareForSleep` with Omarchy's lock | forward Hyprland's lock event |
-| G7 | what `CheckAuthorization` returns with no agent | under 300 ms non-dismissed failure = no agent |
-| G8 | `MemoryDenyWriteExecute=yes` with cffi, cryptography, srp; Argon2id at 256 MiB | drop MDWE, documented |
+| Gate | What | Fallback | How the fallback is switched on |
+|---|---|---|---|
+| G1 | `systemd-creds --user` from uid `pear-passwords` inside the hardened unit | root's `pear-passwords-seal.socket` (Accept=yes) runs system-scope `systemd-creds` for the daemon, one request per connection, only for the daemon's uid and `pear.(list\|secret).u<uid>` names (`icp.vstore.seal_service`) | an active `Environment=PEAR_SEAL_BACKEND=seal-service` line in the shipped `pear-passwordsd.service`; `install-root.sh` then enables the seal socket (installed, never enabled, otherwise) |
+| G2 | polkit accepts a pidfd `unix-process` subject; `$(account)` shows | `{pid, start-time, uid}`, fixed message | `Environment=PEAR_POLKIT_SUBJECT=pid-start-time` in the shipped unit |
+| G3 | Quickshell starts with egid != rgid under AT_SECURE | redesign the identity step | none: no release without one of the two |
+| G4 | Quickshell with empty XDG homes and no disk cache; what it opens under `$HOME` | allowlist the residue | docs only |
+| G5 | pear-clip can identify a reader's pipe at `ptrace_scope` 1 and 2 | a 250 ms window, documented as weaker | `READER_POLICY = "timing"` in `icp/client/clip.py` (root-owned; pear-exec passes no environment) |
+| G6 | logind `Lock`, `LockedHint`, `PrepareForSleep` with Omarchy's lock | forward Hyprland's lock event | **not built**: which Hyprland event marks a session lock is for this gate to find; window close and the Lock button lock either way |
+| G7 | what `CheckAuthorization` returns with no agent | under 300 ms non-dismissed failure = no agent | this classification is what ships |
+| G8 | `MemoryDenyWriteExecute=yes` with cffi, cryptography, srp; Argon2id at 256 MiB | drop MDWE, documented | delete the `MemoryDenyWriteExecute=yes` line |
+
+Tests for the switches: `test_seal_service.py`, `test_install_root_receipts.py::InstallRootTests::test_seal_service_runs_only_when_the_daemon_unit_selects_it`, `test_daemon_polkit.py`, `test_clip_policy.py::TimingFallbackTests`.
 
 ## 9. Rejected simplifications
 

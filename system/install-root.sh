@@ -62,6 +62,9 @@ if [ "$PP_TEST" -eq 0 ]; then
 fi
 command -v cc >/dev/null 2>&1 || pp_die "install gcc: pear-exec is compiled from source here (pacman -S gcc)"
 
+seal_was_installed=0
+! pp_exists "$UNIT_DIR/$SEAL_SOCKET_UNIT" || seal_was_installed=1
+
 # --- what will be installed ------------------------------------------------------------------
 pp_table "$stage" "$work" > "$work/table"
 missing=$(pp_missing_sources "$stage" "$work" "$work/table")
@@ -181,6 +184,13 @@ pp_remove_legacy_policy
 pp_write_receipt "$work/receipt.new"
 
 pp_sys systemctl daemon-reload
+# Gate G1 fallback: the root seal socket runs only when the daemon unit asks for it. An
+# upgrade from a release that used it turns it off again.
+if pp_seal_service_selected "$stage/system/units/$SERVICE_UNIT"; then
+  pp_sys systemctl enable --now "$SEAL_SOCKET_UNIT"
+elif [ "$seal_was_installed" = 1 ]; then
+  pp_sys systemctl disable --now "$SEAL_SOCKET_UNIT" 2>/dev/null || true
+fi
 pp_sys systemctl enable --now "$SOCKET_UNIT"
 # An upgrade must not leave the old daemon serving with the old code. This locks anyone who
 # had Pear open; the window shows "Locked" and one click unlocks again.

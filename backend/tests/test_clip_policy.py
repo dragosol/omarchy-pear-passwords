@@ -305,6 +305,43 @@ class ReaderRuleTests(unittest.TestCase):
         h.finish()
 
 
+class TimingFallbackTests(unittest.TestCase):
+    """Gate G5's fallback (READER_POLICY = "timing"): no reader is identified; whoever asks in
+    the first WATCHER_WINDOW_S is taken for the history watcher and gets nothing."""
+
+    def test_the_shipped_policy_identifies_readers(self):
+        self.assertEqual(clip.READER_POLICY, "proc")
+        factory, window = clip.policy()
+        self.assertIs(factory, clip.make_identifier)
+        self.assertEqual(window, 0.0)
+        with self.assertRaises(ValueError):
+            clip.policy("guess")
+
+    def harness(self, window):
+        factory, w = clip.policy("timing")
+        self.assertEqual(w, clip.WATCHER_WINDOW_S)
+        h = ClipHarness(self, grace=0.4, timeout=3)
+        h.offer.identify = factory(set())
+        h.offer.watcher_window = window
+        return h
+
+    def test_an_early_reader_is_refused_and_not_counted(self):
+        h = self.harness(0.3)
+        self.assertEqual(h.paste({101}, watchers_={101}), b"")       # ids are ignored here
+        self.assertEqual(h.offer.refused_watchers, 1)
+        self.assertIsNone(h.offer.pasted_at)
+        time.sleep(0.35)
+        self.assertEqual(h.paste({200}), b"hunter2-secret")
+        self.assertEqual(h.finish(), "pasted")
+
+    def test_a_later_reader_is_the_paste_even_if_it_is_the_watcher(self):
+        # The documented weakness: after the window, nothing tells a watcher from a paste.
+        h = self.harness(0.05)
+        time.sleep(0.1)
+        self.assertEqual(h.paste({101}, watchers_={101}), b"hunter2-secret")
+        self.assertEqual(h.finish(), "pasted")
+
+
 class LifetimeTests(unittest.TestCase):
     def test_timeout_destroys_the_source_and_never_clears_the_selection(self):
         h = ClipHarness(self, timeout=0.4)

@@ -7,6 +7,9 @@ four kinds of client: the Pear window (`ui`), the clipboard writer (`clip`), the
 `backend/tests/test_protocol_contract.py` fails if this document and that module disagree on
 an op, an event or an error code. A change to anything here lands on the `v2-base` branch
 first and every work package merges it; no work package edits this file on its own branch.
+The integration of the work packages (branch `v2`) amended it where they met: `reset`,
+`migrate-begin` retries, `seal-unavailable`, `sync` while `needs-login` is latched,
+`set{nickname}`, the `clip-history-check` line cap and the importer's cancel status.
 
 The browser-facing side of autofill (native messaging between an extension and
 `pear-autofill-host`) is specified separately in `docs/autofill-protocol.md` (WP6). This file
@@ -207,7 +210,7 @@ sends `{"event":"locked","reason":...}` to the UI if it is still connected:
 | `PrepareForSleep(true)` (wiped before the delay inhibitor is released) | `sleep` |
 | the uid's last session removed | `session-ended` |
 | `idle_lock_s` seconds with no UI request | `idle` |
-| `reset` | `reset` |
+| `reset` | (no event: the window asked for it, and gets `{state:"empty"}`) |
 | `signout` | `signout` |
 | an unrecoverable daemon error for this uid | `error` |
 
@@ -339,7 +342,8 @@ Each returns `no-grant` with no live grant on that id, `grant-expired` if it jus
   `hide_after` seconds or until it loses focus.
 - `totp`: `invalid` if the entry has no code. The seed never leaves the daemon.
 - `history`: newest first; `source` is `apple` (Apple's own record) or `local` (a change this
-  machine saw).
+  machine saw, including the older of two 1.x items for the same account, see 8 and 9.1),
+  as the store labels each item.
 
 ### 6.5 copy
 
@@ -370,7 +374,9 @@ Each returns `no-grant` with no live grant on that id, `grant-expired` if it jus
   to a daemon-generated one in Apple's shape (`generate` and `fields.password` together are
   `invalid`); the generated value is never in the reply, only `reveal` shows it.
   Reply: `{"rid":10,"id":"<id>","synced":true}` (`synced:false` when only a local nickname
-  changed). The old password moves into history.
+  changed). The old password moves into history. A `nickname` goes to iCloud like the other
+  fields when the entry has a details record there (so every device shows it); otherwise,
+  or with no iCloud session at all, it is kept on this computer only and `synced` is false.
 - `create` needs `.manage` and tier 1. `fields` from `domain`, `username`, `password`,
   `title`, `notes`, `sites`, `totp`; a password is required unless `generate:{}`.
   Reply: `{"rid":11,"id":"<new id>"}`.
@@ -389,8 +395,9 @@ Each returns `no-grant` with no live grant on that id, `grant-expired` if it jus
 {"op":"signin","rid":14,"mode":"relogin"}
 ```
 
-- `login` needs `empty` (a store is created first) or an unlocked store with no session;
-  `relogin` needs tier 1 and a stored session. Both raise `.manage`.
+- `login` needs `empty` (a store is created first) or an unlocked store with no session
+  (`invalid` with `field:"mode"` when a session exists: use `relogin`); `relogin` needs
+  tier 1 and a stored session. Both raise `.manage`.
 - While it runs, the daemon sends the sign-in stream (section 9.2) with `"rid":14`. Questions
   are `ask` events; the UI answers each with:
 
@@ -415,12 +422,15 @@ Each returns `no-grant` with no live grant on that id, `grant-expired` if it jus
 
 ```json
 {"op":"sync","rid":17}                     -> {"rid":17,"queued":true}
-                                              {"rid":17,"skipped":"locked"|"running"|"signed-out"}
+                                              {"rid":17,"skipped":"locked"|"running"|"signed-out"|"needs-login"}
 {"op":"settings","rid":18,"get":true}      -> {"rid":18,"settings":{...}}
 {"op":"settings","rid":18,"set":{"grant_s":60}}  -> {"rid":18,"settings":{...}}
 ```
 
-`sync` never prompts. `settings` needs no dialog (the window is already the authenticated
+`sync` never prompts. While the store's `needs_login` latch is set (Apple asked for a person),
+neither a `sync` op nor the 2-hourly schedule contacts Apple or repeats the `needs-login`
+event; `sync` replies `skipped:"needs-login"` and only a `signin` clears the latch.
+`settings` needs no dialog (the window is already the authenticated
 app); `set` validates every key first and applies all or none. A lower `grant_s` applies to
 the next grant; `idle_lock_s` restarts the idle clock.
 
@@ -433,18 +443,26 @@ the next grant; `idle_lock_s` restarts the idle clock.
 {"op":"clip-history-check","rid":22,"items":["...","..."]}  -> {"rid":22,"matches":[0,4]}
 ```
 
-- `migrate-begin`: needs state `empty` (else `not-locked`). Raises `.manage`, creates and
-  seals new keys, opens tier 1 on this connection, and issues a `migrate`/`import` ticket. The
+- `migrate-begin`: needs state `empty`, or a store an earlier `migrate-begin` created that
+  never committed (the daemon records `migration_pending` in state.json; that store holds
+  keys and nothing else, and is renamed aside and started over). Otherwise `not-locked`.
+  Raises `.manage`, creates and seals new keys, opens tier 1 on this connection, and issues
+  a `migrate`/`import` ticket. The
   UI runs `pear-exec migrate` with it (section 10.2). When the import commits, the UI gets
   `{"event":"migrated","counts":{...}}` and then the first `synced`.
-- `purge-old-copy`: needs an `old_copy` record. Raises `.manage` and issues a
+- `purge-old-copy`: needs an `old_copy` record (`not-found` without one, before any dialog).
+  Raises `.manage` and issues a
   `migrate`/`purge` ticket; the importer deletes exactly the recorded files whose sha256
   still matches and reports `purge-result`. The record is cleared afterwards.
 - `reset`: allowed in `tpm-cleared` and `damaged` only (else `not-locked`). Raises `.manage`;
-  the old directory is renamed aside, never deleted; the new store is `empty` (the UI then
-  offers sign-in).
+  the old directory is renamed aside, never deleted. The reply `state:"empty"` means "no
+  entries and no iCloud session": the fresh store already has new sealed keys and tier 1
+  stays open on this connection, so the sign-in the UI then offers needs only its own
+  `.manage` dialog. No `locked` event is sent; a later `hello` reports `locked`.
 - `clip-history-check`: needs tier 1. Raises `.manage`. At most 1000 items of at most 1024
-  characters each. Compares pwmac only (no entry key); `matches` are indexes into `items`.
+  characters each, and the whole request must still fit one 64 KiB line, which binds first:
+  the window sends only single-line history items without spaces of 4 to 256 characters,
+  newest first, up to about 56 KB. Compares pwmac only (no entry key); `matches` are indexes into `items`.
   Values are never logged.
 
 ## 7. clip ops (role `clip`)
@@ -581,6 +599,9 @@ processes of the same user.
   `{"need":"passphrase"}`; the window shows its one field and writes the answer to stdin; the
   importer sends it as `import-key{passphrase}`. On `wrong-passphrase` it prints
   `{"need":"passphrase","retry":true}`.
+- `{"cancel":true}` (or EOF on stdin while asked) ends the importer with exit status 4 and no
+  further output; nothing was changed. In purge mode a recorded file that is already gone is
+  listed under `removed`.
 
 ## 11. Autofill (role `autofill`)
 
@@ -622,8 +643,9 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
                       "rate-limited"|"prompt-pending"|"cancelled"|"bad-origin"|"insecure-origin"}
 ```
 
-- `autofill-query` never prompts. Locked or without a UI connection: only
-  `{"state":"locked"}`; empty or a seal state: only `{"state":"unavailable"}`. Unlocked: up to
+- `autofill-query` never prompts. Locked, without a UI connection, or for a uid the daemon
+  has not seen since it started: only `{"state":"locked"}` (the autofill `hello` says the
+  same); empty or a seal state: only `{"state":"unavailable"}`. Unlocked: up to
   20 accounts ranked by match, then newest change, then label. Never a secret.
 - `autofill-fill` raises `.autofill` every time with `account` and `origin` (the host), in the
   `autofill` rate-limit bucket (one outstanding, 3 answered per minute per uid). An unknown
