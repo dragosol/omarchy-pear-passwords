@@ -372,6 +372,37 @@ class InstallRootTests(unittest.TestCase):
         self.assertTrue(os.path.exists(planted), "deleted before any ownership check")
         self.assertFalse(os.path.exists(self.h.r(P["INSTALL_RECEIPT"])))
 
+    def test_a_leftover_pp_new_is_checked_and_cleaned(self):
+        # audit: a <dest>.pp-new under $P was accepted without a check and never removed.
+        self.ok(self.h.install())
+        self.h.write("app/shell.qml", "// window, 2.0.1, a longer file\n")
+        self.h.sums()
+        dest = self.h.r(PREFIX + "/app/shell.qml")
+        self.assertTrue(os.path.exists(dest))
+        # An interrupted copy of the new file: a byte prefix of it.
+        with open(dest + ".pp-new", "w") as f:
+            f.write("// window, 2.0")
+        with open(self.h.r(P["INSTALL_RECEIPT"]) + ".pp-new", "w") as f:
+            f.write("# half a receipt")
+        self.ok(self.h.install())
+        self.assertFalse(os.path.exists(dest + ".pp-new"))
+        self.assertFalse(os.path.exists(self.h.r(P["INSTALL_RECEIPT"]) + ".pp-new"))
+        with open(dest) as f:
+            self.assertEqual(f.read(), "// window, 2.0.1, a longer file\n")
+
+    def test_a_pp_new_that_is_not_part_of_the_staged_file_is_in_the_way(self):
+        self.ok(self.h.install())
+        dest = self.h.r(PREFIX + "/app/shell.qml")
+        for planted in ("#!/bin/sh\nevil\n", "// window\n// and more than the staged file\n"):
+            with open(dest + ".pp-new", "w") as f:
+                f.write(planted)
+            proc = self.h.install()
+            self.refused(proc, "shell.qml.pp-new  (left over, and not part of the file")
+            self.assertTrue(os.path.exists(dest + ".pp-new"), "deleted before the check")
+        os.unlink(dest + ".pp-new")
+        os.symlink("/etc/shadow", dest + ".pp-new")
+        self.refused(self.h.install(), "shell.qml.pp-new  (left over, and not a plain file)")
+
     def test_prefix_without_a_receipt_is_refused(self):
         os.makedirs(self.h.r(PREFIX))
         self.refused(self.h.install(), "there is no install receipt")
@@ -631,6 +662,20 @@ class UninstallRootTests(unittest.TestCase):
         self.assertIn(f"systemctl disable --now {P['SOCKET_UNIT']} {P['SERVICE_UNIT']}", cmds)
         self.assertIn("userdel pear-passwords", cmds)
         self.assertIn("groupdel pear-client", cmds)
+
+    def test_uninstall_removes_pp_new_leftovers_so_the_prefix_is_gone(self):
+        # audit: an interrupted copy's <dest>.pp-new kept $P from being fully removed.
+        dest = self.h.r(PREFIX + "/app/shell.qml")
+        with open(dest + ".pp-new", "w") as f:
+            f.write("// win")
+        unit = self.h.r(f"{P['UNIT_DIR']}/{P['SERVICE_UNIT']}")
+        with open(unit + ".pp-new", "w") as f:
+            f.write("[Serv")
+        proc = self.h.uninstall()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(os.path.exists(self.h.r(PREFIX)), proc.stdout)
+        self.assertFalse(os.path.exists(unit + ".pp-new"))
+        self.assertFalse(os.path.exists(self.h.r(P["INSTALL_STATE_DIR"])))
 
     def test_uninstall_keeps_edited_files_and_lists_them(self):
         policy = self.h.r(P["POLICY_FILE"])

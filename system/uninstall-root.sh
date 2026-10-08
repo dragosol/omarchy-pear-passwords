@@ -106,6 +106,8 @@ vault_left=0
 if [ -d "$sd" ] && [ -n "$(ls -A "$sd" 2>/dev/null)" ]; then
   vault_left=1
 fi
+# Half-written copies an interrupted install left beside recorded paths, so $P empties.
+pp_remove_pp_new "$PP_OLD"
 awk -F "$PP_TAB" -v u="$UNINSTALL_ROOT" '$3 != u' "$PP_OLD" > "$work/remove"
 awk -F "$PP_TAB" -v u="$UNINSTALL_ROOT" '$3 == u' "$PP_OLD" > "$work/keep.self"
 pp_remove_entries "$work/remove" "$work/kept" "$VENV"

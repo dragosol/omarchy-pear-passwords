@@ -197,6 +197,20 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
   or a frozen released copy (the 1.x `org.icp.unlock.policy`). Foreign, edited and symlinked
   destinations, same-named units, drop-ins and policies, and a `pear-client` group with members
   stop the install before any write. Tests: `test_install_root_receipts.py::InstallRootTests`.
+- Two kinds of path under the install prefix are not proven by hash, and both are names only
+  the installer uses there, inside root-owned `/usr/local/lib/pear-passwords`:
+  `venv.new/` (a venv being built) and `venv.old/` (the previous venv during a swap). Their
+  contents are not checked; once every other path is proven ours (a receipt exists and
+  everything else matches it) they are deleted and the venv is rebuilt from the hashed wheels.
+  A `<dest>.pp-new` beside a destination (a copy an interrupted run did not finish) is
+  checked: it must be owned by root and be a byte prefix of the file being installed there
+  (for a link, a link to the same target), or the install stops; it is deleted before
+  anything is written, and uninstall deletes the ones beside every path in its receipt, so
+  the prefix is removed completely. Tests:
+  `test_install_root_receipts.py::InstallRootTests::test_a_leftover_pp_new_is_checked_and_cleaned`,
+  `test_install_root_receipts.py::InstallRootTests::test_a_pp_new_that_is_not_part_of_the_staged_file_is_in_the_way`,
+  `test_install_root_receipts.py::UninstallRootTests::test_uninstall_removes_pp_new_leftovers_so_the_prefix_is_gone`,
+  `test_install_root_receipts.py::InstallRootTests::test_a_venv_new_is_never_deleted_before_the_prefix_is_proven_ours`.
 - Uninstall removes only receipt-matching files, keeps edited ones in the receipt, and keeps
   the vault and the service user unless `--purge <uid>` is confirmed by typing. Tests:
   `test_install_root_receipts.py::UninstallRootTests`.

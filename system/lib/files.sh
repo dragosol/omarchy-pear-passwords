@@ -353,6 +353,7 @@ pp_check_all() {
   fi
   while IFS="$PP_TAB" read -r kind dest src mode own; do
     r=$(pp_d "$dest")
+    pp_pp_new_problem "$kind" "$r" "$dest" "$src"
     [ -e "$r" ] || [ -L "$r" ] || continue
     case $kind in
       f)
@@ -374,8 +375,10 @@ pp_check_all() {
   if [ -d "$(pp_d "$PREFIX")" ] && [ ! -L "$(pp_d "$PREFIX")" ]; then
     cut -f2 "$t" > "$t.dests"
     pp_manifest "$PREFIX" > "$t.cur"
-    # <dest>.pp-new is the half-written copy an interrupted run left beside a table
-    # destination; pp_install_row writes it again before renaming it into place.
+    # <dest>.pp-new beside a table destination is checked by pp_pp_new_problem above.
+    # $VENV.new/ and $VENV.old/ are names only this script uses inside root-only $P (a venv
+    # being built, the previous venv during a swap): not hash-checked, deleted and rebuilt
+    # once everything else is proven ours.
     awk -F "$PP_TAB" -v pre="$PREFIX" -v vnew="$VENV.new/" -v vold="$VENV.old/" '
       FILENAME == ARGV[1] { dest[$0] = 1; dest[$0 ".pp-new"] = 1; next }
       FILENAME == ARGV[2] { old[$0] = 1; next }
@@ -404,6 +407,71 @@ pp_check_all() {
 
   pp_shadows
   pp_check_identities
+  return 0
+}
+
+# A file in a root-owned directory that root wrote. Test mode chowns nothing, so there every
+# file is the test user's.
+pp_root_owned() { [ "$PP_TEST" -eq 1 ] || [ "$(stat -c %u -- "$1")" = 0 ]; }
+
+# <dest>.pp-new is the half-written copy an interrupted pp_install_row left beside a table
+# destination (or, for a link row, the new link not yet renamed). It is accepted only when it
+# is owned by root and is a byte prefix of the file Pear installs there (a link row: a link to
+# that same target); pp_clean_pp_new then deletes it before anything is written. Anything
+# else by that name is reported as in the way, like any other path.
+pp_pp_new_problem() {
+  local kind r dest src n
+  kind=$1 r=$2.pp-new dest=$3 src=$4
+  [ -e "$r" ] || [ -L "$r" ] || return 0
+  if ! pp_root_owned "$r"; then
+    printf '%s.pp-new  (left over, and not owned by root)\n' "$dest"
+    return 0
+  fi
+  case $kind in
+    f)
+      if [ -L "$r" ] || [ ! -f "$r" ]; then
+        printf '%s.pp-new  (left over, and not a plain file)\n' "$dest"
+        return 0
+      fi
+      n=$(wc -c < "$r")
+      if [ "$n" -gt "$(wc -c < "$src")" ] \
+          || [ "$(sha256sum < "$r")" != "$(head -c "$n" -- "$src" | sha256sum)" ]; then
+        printf '%s.pp-new  (left over, and not part of the file Pear installs there)\n' "$dest"
+      fi ;;
+    l)
+      if [ ! -L "$r" ] || [ "$(readlink -- "$r")" != "$src" ]; then
+        printf '%s.pp-new  (left over, and not the link Pear installs there)\n' "$dest"
+      fi ;;
+    *)
+      printf '%s.pp-new  (in the way)\n' "$dest" ;;
+  esac
+}
+
+# After the checks passed: every <dest>.pp-new left by an interrupted run goes, and so does
+# the receipt's own half-written copy (pp_write_receipt writes it beside the receipt).
+pp_clean_pp_new() {
+  local kind dest src mode own r
+  while IFS="$PP_TAB" read -r kind dest src mode own; do
+    r=$(pp_d "$dest").pp-new
+    if [ -L "$r" ] || [ -f "$r" ]; then rm -f -- "$r"; fi
+  done < "$1"
+  r=$(pp_d "$INSTALL_RECEIPT").pp-new
+  if [ -L "$r" ] || [ -f "$r" ]; then rm -f -- "$r"; fi
+  return 0
+}
+
+# Uninstall: the .pp-new leftovers beside every path the receipt records, and beside the
+# receipt itself. Names only the installer writes, in root-owned directories; a file or a
+# link owned by root, never a directory, never followed.
+pp_remove_pp_new() {
+  local kind value path r
+  while IFS="$PP_TAB" read -r kind value path; do
+    case $kind in f|l) ;; *) continue ;; esac
+    r=$(pp_d "$path").pp-new
+    if { [ -L "$r" ] || [ -f "$r" ]; } && pp_root_owned "$r"; then rm -f -- "$r"; fi
+  done < "$1"
+  r=$(pp_d "$INSTALL_RECEIPT").pp-new
+  if { [ -L "$r" ] || [ -f "$r" ]; } && pp_root_owned "$r"; then rm -f -- "$r"; fi
   return 0
 }
 

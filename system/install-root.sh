@@ -106,6 +106,9 @@ pp_write_receipt "$work/receipt.planned"
 # Removed only now: $P is proven ours (the checks above passed with a receipt), and these
 # are names only this script uses.
 rm -rf -- "$(pp_d "$VENV.new")" "$(pp_d "$VENV.old")"
+# And any <dest>.pp-new an interrupted copy left (each one checked above to be a prefix of the
+# staged file, owned by root).
+pp_clean_pp_new "$work/table"
 
 # --- identities ------------------------------------------------------------------------------
 pp_say "Creating the pear-passwords user and the pear-client group"
