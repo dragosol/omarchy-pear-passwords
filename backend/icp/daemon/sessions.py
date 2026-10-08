@@ -48,6 +48,10 @@ logger = logging.getLogger(__name__)
 
 ANISETTE_URL = "http://127.0.0.1:6969"
 
+# UserStore methods that read no key and hold no store mutex (plaintext files and flags only).
+KEYLESS_STORE_CALLS = frozenset({"status", "state", "load_settings", "holds_nothing",
+                                 "create_blocked"})
+
 
 # --- the request being handled --------------------------------------------------------------
 # The server sets this for each request's task. Handlers use after_reply() for events their
@@ -281,10 +285,20 @@ class Registry:
             logger.exception("polkit check raised")
             return NO_AGENT
 
-    async def run_store(self, uid: int, fn: Callable[..., Any], *args: Any) -> Any:
+    async def run_store(self, uid: int, fn: Callable[..., Any], *args: Any,
+                        keyless: bool = False) -> Any:
         s = self.sessions.get(uid)
         if s is None:
             raise OpError("internal")
+        if keyless:
+            # status/state/load_settings/holds_nothing/create_blocked read no key and take no
+            # store mutex, so
+            # they need neither the store lock nor to wait out a pending wipe: a window opened
+            # meanwhile is told "locked", not refused.
+            name = getattr(fn, "__name__", "")
+            if name not in KEYLESS_STORE_CALLS:
+                raise OpError("internal")
+            return await self._in_pool(self._store_pool, fn, *args)
         if s.wipe_after:
             raise OpError("locked")         # a lock is waiting for the running call to end
         async with s.store_lock:
@@ -337,9 +351,9 @@ class Registry:
         if not s.settings_loaded:
             s.settings_loaded = True
             try:
-                d = await self.run_store(uid, s.store.load_settings)
+                d = await self.run_store(uid, s.store.load_settings, keyless=True)
             except OpError:
-                s.settings_loaded = False      # a wipe is pending: read them next time
+                s.settings_loaded = False
                 d = {}
             except Exception:
                 logger.exception("uid %d: settings unreadable, using defaults", uid)

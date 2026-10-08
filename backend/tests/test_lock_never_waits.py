@@ -84,6 +84,35 @@ class RegistryLockTests(unittest.IsolatedAsyncioTestCase):
         s2.unlock()
         self.assertEqual(s2.open_entry(ids.entry_id("a.example.test", "me")).password, "pw-a2")
 
+    async def test_keyless_reads_are_served_while_a_wipe_is_pending(self):
+        # Round 2 audit note (a): a window opened during a pending wipe got "the background
+        # service refused this window (locked)", because hello's status went through the
+        # refusing path. status/state/load_settings read no key.
+        started, proceed = threading.Event(), threading.Event()
+        real = E.EntryFiles.write
+
+        def slow_write(files, id, blob):
+            real(files, id, blob)
+            started.set()
+            proceed.wait(10)
+        with mock.patch.object(E.EntryFiles, "write", slow_write):
+            call = asyncio.ensure_future(self.reg.run_store(
+                UID, self.store.apply_sync, [item("a.example.test", "me", "pw-a2")], set()))
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
+            self.reg.lock(UID, "user")
+            self.assertTrue(self.s.wipe_after)
+            st = await asyncio.wait_for(
+                self.reg.run_store(UID, self.store.status, keyless=True), 2)
+            self.assertIn(st["state"], ("locked", "unlocked"))
+            self.assertIsInstance(await asyncio.wait_for(
+                self.reg.run_store(UID, self.store.load_settings, keyless=True), 2), dict)
+            # Only those: anything else asked for keyless is refused.
+            with self.assertRaises(OpError):
+                await self.reg.run_store(UID, self.store.list_meta, keyless=True)
+            proceed.set()
+            await asyncio.wait_for(call, 5)
+        self.assertEqual(self.store.state(), "locked")
+
     async def test_lock_with_nothing_running_wipes_now(self):
         self.reg.lock(UID, "user")
         self.assertEqual(self.store.state(), "locked")

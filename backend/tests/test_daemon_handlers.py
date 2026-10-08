@@ -7,7 +7,7 @@ import hashlib
 import unittest
 from unittest import mock
 
-from daemon_fakes import UID, Harness, meta, secrets
+from daemon_fakes import UID, FakeStore, Harness, meta, secrets
 
 from icp import vstore
 from icp.daemon import handlers, paths, polkit, protocol
@@ -93,6 +93,22 @@ class HelloAndUnlockTests(Base):
         await asyncio.sleep(0.05)
         ui2, _ = await self.h.ui()
         self.assertEqual(ui2.hello["state"], "tpm-missing")
+
+    async def test_a_window_opened_while_a_wipe_is_pending_is_not_refused(self):
+        # Round 2 audit note (a): the lock of the last window was still waiting for a store
+        # call; the new window's hello must say "locked", not fail.
+        self.ui.close()
+        await asyncio.sleep(0.05)
+        s = self.h.reg.get(UID)
+        s.wipe_after = True
+        try:
+            ui2, _ = await self.h.ui()
+            self.assertEqual(ui2.hello["state"], "locked")
+            # A keyed call is still refused until the wipe happened.
+            self.assertEqual((await ui2.call("unlock"))["error"], "seal-unavailable")
+            self.assertEqual(self.dialogs(), [])
+        finally:
+            s.wipe_after = False
 
     async def test_ui_ops_need_tier1(self):
         for op, extra in (("grant", {"id": "e.0"}), ("copy", {"id": "e.0", "field": "username"}),
@@ -387,6 +403,15 @@ class MigrationTests(Base):
         self.assertEqual((await self.ui.call("reset"))["error"], "not-locked")
         self.assertEqual(self.dialogs(), [])
 
+    async def test_a_certain_pcr_policy_refusal_comes_before_the_dialog(self):
+        # Gate finding 1 / audit note (b): the user approved a .manage dialog and only then
+        # got seal-refused/pcr-policy.
+        FakeStore.blocked_reason = "pcr-policy"
+        r = await self.ui.call("migrate-begin")
+        self.assertEqual((r["error"], r.get("reason")), ("seal-refused", "pcr-policy"))
+        self.assertEqual(self.dialogs(), [])
+        self.assertNotIn("create", self.h.store().calls)
+
     async def test_lock_withdraws_the_importer(self):
         m = await self.migrate()
         await self.ui.call("lock")
@@ -586,6 +611,16 @@ class TpmMoveTests(Base):
 
 
 class ResetTests(Base):
+    async def test_reset_says_pcr_policy_before_the_dialog(self):
+        self.st.seal_error = "damaged"
+        await self.ui.call("unlock")
+        n = len(self.dialogs())
+        FakeStore.blocked_reason = "pcr-policy"
+        r = await self.ui.call("reset")
+        self.assertEqual((r["error"], r.get("reason")), ("seal-refused", "pcr-policy"))
+        self.assertEqual(len(self.dialogs()), n)
+        self.assertNotIn("reset", self.h.store().calls)
+
     async def test_reset_only_from_a_broken_store(self):
         self.assertEqual((await self.ui.call("reset"))["error"], "not-locked")
         self.st.seal_error = "damaged"

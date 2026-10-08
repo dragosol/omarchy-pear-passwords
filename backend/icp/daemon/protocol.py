@@ -270,8 +270,11 @@ class SessionRegistry(Protocol):
         """
         ...
 
-    async def run_store(self, uid: int, fn: Callable[..., Any], *args: Any) -> Any:
-        """Run a blocking UserStore call in a worker thread under that uid's store lock."""
+    async def run_store(self, uid: int, fn: Callable[..., Any], *args: Any,
+                        keyless: bool = False) -> Any:
+        """Run a blocking UserStore call in a worker thread under that uid's store lock.
+        keyless=True (status, state, load_settings, holds_nothing only) skips the lock and
+        is served while a wipe is pending."""
         ...
 
     def notify_ui(self, uid: int, event: dict) -> None:

@@ -124,9 +124,9 @@ def _store_error(e: BaseException) -> OpError | None:
     return None
 
 
-async def _store(reg, uid: int, fn, *args):
+async def _store(reg, uid: int, fn, *args, keyless: bool = False):
     try:
-        return await reg.run_store(uid, fn, *args)
+        return await reg.run_store(uid, fn, *args, keyless=keyless)
     except Exception as e:
         err = _store_error(e)
         if err is None:
@@ -303,7 +303,7 @@ async def hello(reg, conn, req: dict) -> dict:
         if s.tier1 is not None:
             reg.lock(conn.uid, None, notify=False)
         s.ui = conn
-        st = await _store(reg, conn.uid, s.store.status)
+        st = await _store(reg, conn.uid, s.store.status, keyless=True)
         state = st.get("state") or "locked"
         if state == "unlocked":            # never: the last window's EOF locked the uid
             reg.lock(conn.uid, None, notify=False)
@@ -931,6 +931,7 @@ async def op_migrate_begin(reg, conn, req):
                                   or await _holds_nothing(reg, s))
     if state != "empty" and not retry:
         raise OpError("not-locked")
+    await _refuse_certain_seal_refusal(reg, conn.uid)
     epoch = s.epoch
     await reg.authorize(conn, paths.ACTION_MANAGE, {})
     if conn.closed or s.ui is not conn or s.epoch != epoch:
@@ -972,6 +973,20 @@ async def op_migrate_abandon(reg, conn, req):
     return {"migration_pending": False}
 
 
+async def _refuse_certain_seal_refusal(reg, uid: int) -> None:
+    """A new store sealed here would certainly be refused (a TPM with a signed PCR policy,
+    `pcr-policy`): say so before the .manage dialog, not after the user approved it."""
+    fn = getattr(reg.store_cls, "create_blocked", None)
+    if fn is None:
+        return
+    try:
+        reason = await _store(reg, uid, fn, keyless=True)
+    except OpError:
+        return                     # cannot tell: create() still refuses it after the dialog
+    if reason:
+        raise OpError("seal-refused", reason=reason)
+
+
 async def _holds_nothing(reg, s) -> bool:
     """No entry, history, session, aliases or nicknames, with signed_in false: read without a
     key, so it works while locked. False when it cannot tell."""
@@ -979,8 +994,8 @@ async def _holds_nothing(reg, s) -> bool:
     if fn is None:
         return False
     try:
-        st = await _store(reg, s.uid, s.store.status)
-        return not st.get("signed_in") and bool(await _store(reg, s.uid, fn))
+        st = await _store(reg, s.uid, s.store.status, keyless=True)
+        return not st.get("signed_in") and bool(await _store(reg, s.uid, fn, keyless=True))
     except OpError:
         return False
 
@@ -989,7 +1004,7 @@ async def _migration_pending(reg, s) -> bool:
     if getattr(s, "migrating", False):
         return True
     try:
-        full = await _store(reg, s.uid, s.store.load_settings) or {}
+        full = await _store(reg, s.uid, s.store.load_settings, keyless=True) or {}
     except OpError:
         return False
     return full.get("migration_pending") is True
@@ -1027,6 +1042,7 @@ async def op_reset(reg, conn, req):
         raise OpError("forbidden")
     if not await _resettable(reg, s):
         raise OpError("not-locked")
+    await _refuse_certain_seal_refusal(reg, conn.uid)
     epoch = s.epoch
     await reg.authorize(conn, paths.ACTION_MANAGE, {})
     if conn.closed or s.ui is not conn or s.epoch != epoch:

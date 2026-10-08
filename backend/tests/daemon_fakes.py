@@ -66,6 +66,7 @@ class FakeStore:
     @classmethod
     def reset_all(cls):
         cls.instances = {}
+        cls.blocked_reason = None
 
     @classmethod
     def open(cls, uid):
@@ -106,6 +107,12 @@ class FakeStore:
                 "sealed_with": self.sealed_with if self.exists else None,
                 "synced_at": self.synced_at if self.keys else None,
                 "needs_login": self.needs_login if self.keys else None}
+
+    blocked_reason = None             # what create_blocked() says (class-wide, like a PEM)
+
+    @classmethod
+    def create_blocked(cls):
+        return cls.blocked_reason
 
     def holds_nothing(self):
         return not self.exists or not (self.metas or self.history_items or self.session

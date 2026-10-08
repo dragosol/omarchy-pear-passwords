@@ -271,7 +271,7 @@ driven through polkit with the session text agent:
 | **Move your keys onto the security chip** (`tpm-move`, its own `.manage` dialog) | **Passes.** The rotation, including `renameat2(RENAME_EXCHANGE)`, ran inside the hardened unit (MDWE, the syscall filter) in 1.5 s; `sealed_with: host+tpm2`, both blobs `2a1f877a…`; no `u1000.rotate` left; the next unlock, a grant, the revealed password and its history are the same as before the move. |
 | TPM removed | **Passes.** `unlock` gives `tpm-missing`. With the same TPM back, it opens again. |
 | A different (cleared) TPM, no SRK PEM (non-UKI boot) | **Passes.** `unlock` gives `tpm-cleared`; Start over moved `u1000` aside to `u1000.broken-<time>` and made a new store sealed host+TPM2 (`2a1f877a…`). |
-| A TPM and a `tpm2-pcr-public-key.pem`, new store (`migrate-begin`) | **Passes.** After the dialog: `seal-refused`, `reason: pcr-policy`; no key was written. That run also left an empty `u1000/` skeleton, which is fixed since (`test_seal_reseal.py::RefusedCreateTests`). |
+| A TPM and a `tpm2-pcr-public-key.pem`, new store (`migrate-begin`) | **Passes.** After the dialog: `seal-refused`, `reason: pcr-policy`; no key was written. That run also left an empty `u1000/` skeleton, which is fixed since (`test_seal_reseal.py::RefusedCreateTests`). Since round 2 the refusal comes before the dialog (`test_seal_reseal.py::CreateBlockedTests`). |
 | The same PEM, an existing host-sealed store | **Passes.** The unlock reply says `tpm_move: false`; `tpm-move` answers `seal-refused` (`pcr-policy`) with no dialog; the store stays host-sealed and keeps opening. |
 
 Not run on a real TPM chip (PTT on the owner's laptop): that is the XPS step after this.

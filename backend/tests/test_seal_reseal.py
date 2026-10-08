@@ -528,6 +528,30 @@ class RefusedCreateTests(StoreCase):
         self.assertEqual(vstore.UserStore.open(UID).state(), "empty")
 
 
+class CreateBlockedTests(StoreCase):
+    """Gate finding 1 / audit note (b): known before any dialog that create() would be
+    refused, so migrate-begin and reset can say so before the .manage dialog."""
+
+    def test_a_tpm_with_a_pcr_public_key_blocks_a_new_store(self):
+        with mock.patch.object(seal, "tpm_present", return_value=True), \
+                mock.patch.object(seal, "pcr_public_key_present", return_value="/run/x.pem"), \
+                mock.patch.object(seal, "get_backend", return_value=seal.SystemdCredsBackend()):
+            self.assertEqual(vstore.UserStore.create_blocked(), "pcr-policy")
+
+    def test_otherwise_nothing_is_known_to_block_it(self):
+        for tpm, pem in ((False, "/run/x.pem"), (True, None), (False, None)):
+            with mock.patch.object(seal, "tpm_present", return_value=tpm), \
+                    mock.patch.object(seal, "pcr_public_key_present", return_value=pem), \
+                    mock.patch.object(seal, "get_backend",
+                                      return_value=seal.SystemdCredsBackend()):
+                self.assertIsNone(vstore.UserStore.create_blocked(), (tpm, pem))
+        # The seal service passes an empty --tpm2-public-key=, so it is never blocked.
+        with mock.patch.object(seal, "tpm_present", return_value=True), \
+                mock.patch.object(seal, "pcr_public_key_present", return_value="/run/x.pem"), \
+                mock.patch.object(seal, "get_backend", return_value=seal.SealServiceBackend()):
+            self.assertIsNone(vstore.UserStore.create_blocked())
+
+
 class TpmMoveStateTests(StoreCase):
     """What the window is told before it offers "Move your keys onto the security chip"."""
 

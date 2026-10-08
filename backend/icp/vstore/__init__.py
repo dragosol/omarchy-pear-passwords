@@ -266,6 +266,18 @@ class UserStore:
         return store
 
     @classmethod
+    def create_blocked(cls) -> str | None:
+        """Why create() (and so reset()) would certainly be refused, known before anything is
+        sealed: "pcr-policy" when a TPM is present and sealing through this backend would bind
+        the keys to a signed PCR policy (see SealRefused). None when nothing is known to stop
+        it. Reads no key; the daemon asks before it raises a dialog."""
+        backend = _seal.get_backend()
+        blocked = _seal.tpm_sealing_blocked(backend)     # cheap: the backend and a file
+        if blocked and backend.tpm_present():
+            return blocked
+        return None
+
+    @classmethod
     def reset(cls, uid: int) -> "UserStore":
         """The "Start over" button after tpm-cleared or damaged: rename u<uid> to
         u<uid>.broken-<unix time> (never delete - the files are kept for diagnosis), then
@@ -318,18 +330,19 @@ class UserStore:
         signed_in is whether session.v2 exists (no key needed). sealed_with comes from the
         plaintext keys.json ("host" | "host+tpm2", None when empty). synced_at (unix seconds)
         and needs_login live under K_meta, so they are None while locked."""
+        doc = self._doc                # one read: a lock may wipe it from another thread
         state = self.state()
         try:
             kj = self._read_keys_json()
         except SealError:
             kj = None
         sealed = kj.get("sealed_with") if kj else None
-        unlocked = state == "unlocked"
+        unlocked = state == "unlocked" and doc is not None
         return {"state": state,
                 "signed_in": state != "empty" and _ss.signed_in(self._dir),
                 "sealed_with": sealed if sealed in ("host", "host+tpm2") else None,
-                "synced_at": self._doc.get("synced_at") if unlocked else None,
-                "needs_login": bool(self._doc.get("needs_login")) if unlocked else None}
+                "synced_at": doc.get("synced_at") if unlocked else None,
+                "needs_login": bool(doc.get("needs_login")) if unlocked else None}
 
     @_serialized
     def unlock(self) -> None:
