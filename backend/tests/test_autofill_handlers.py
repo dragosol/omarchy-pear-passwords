@@ -79,12 +79,15 @@ class FakeSession:
         self.uid, self.store, self.ui = uid, store, ui
         self.settings = dict(protocol.DEFAULT_SETTINGS)
         self._unlocked = unlocked
+        self.autofill_enabled = True
+        self.epoch = 0
 
     def unlocked(self):
         return self._unlocked and self.ui is not None
 
     def lock(self):
         self._unlocked = False
+        self.epoch += 1
         self.store.state_value = "locked"
 
 
@@ -248,13 +251,50 @@ class QueryTests(Base):
         self.assertEqual(ids, ["gh2", "gh1", "sited", "gist"])
         self.assertNotIn("other", ids)                       # aliases never match
         for a in r["accounts"]:
+            self.assertEqual(set(a), {"id", "match"})        # no names before a fill
+        self.fill("gh2")                                      # one approved fill...
+        r = self.query()
+        for a in r["accounts"]:
             self.assertEqual(set(a), {"id", "username", "label", "match"})
         self.assertEqual(r["accounts"][0]["label"], "github.com — bob")
         self.assertEqual([a["match"] for a in r["accounts"]],
                          ["exact", "exact", "exact", "related"])
         self.assertNotIn(FAKE_PW, repr(r))
+
+    def test_no_query_ever_unseals_or_prompts(self):
+        self.unlock()
+        self.query()
         self.assertEqual(self.store.unseal_count, 0)
         self.assertEqual(self.reg.dialogs, [])
+
+    def test_names_need_an_approved_fill_on_this_connection_since_the_unlock(self):
+        # escape-autofill-role-ungated: any program of yours can open an autofill
+        # connection; it does not get the account list without a dialog.
+        self.unlock()
+        self.assertEqual(self.fill_error("gh1", origin="https://example.invalid").code,
+                         "no-match")                          # no dialog, no approval
+        self.reg.answers = ["denied"]
+        self.assertEqual(self.fill_error("gh1").code, "denied")
+        for a in self.query()["accounts"]:
+            self.assertNotIn("username", a)
+            self.assertNotIn("label", a)
+        self.fill("gh1")
+        self.assertIn("username", self.query()["accounts"][0])
+        other = FakeConn()
+        self.assertNotIn("username", self.query(conn=other)["accounts"][0])
+        self.session.lock()
+        self.unlock()
+        self.assertNotIn("username", self.query()["accounts"][0])   # a new unlock, again
+
+    def test_switched_off_in_the_window_serves_nothing(self):
+        self.unlock()
+        self.session.autofill_enabled = False
+        for call in (self.query, self.fill):
+            with self.assertRaises(OpError) as cm:
+                call()
+            self.assertEqual(cm.exception.code, "forbidden")
+        self.assertEqual(self.reg.dialogs, [])
+        self.assertEqual(self.store.unseal_count, 0)
 
     def test_no_match_is_an_empty_list(self):
         self.unlock()

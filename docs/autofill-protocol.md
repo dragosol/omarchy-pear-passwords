@@ -16,8 +16,16 @@ The code is `backend/icp/client/autofill.py` (the host),
 ## 1. What you get, and what it costs
 
 - Each fill raises its own Pear dialog (polkit action `io.github.dragosol.pearpasswords.autofill`,
-  "Fill the password for *account* on *site*"), answered with your fingerprint or login
-  password. There is no "remember" and no session: two fills are two dialogs.
+  "A browser extension asks to fill the password for *account* on *site*"), answered with your
+  fingerprint or login password. There is no "remember" and no session: two fills are two
+  dialogs.
+- Autofill is off until you turn it on in the Pear window (Settings, one Pear dialog). Until
+  then the host is refused (`disabled`). Registering a browser is not enough, on purpose: the
+  host program runs for any program of yours, not only for your browser. Once it is on, any
+  program running as you can ask for a fill the way an extension does; it still gets nothing
+  without your approval of that fill's dialog, but if you approve a dialog you did not trigger
+  from your browser, that program gets that password. The Pear window shows when an autofill
+  host is connected.
 - Autofill works only while the Pear Passwords window is open and unlocked. While Pear is
   locked, closed, or not set up, the host says only `locked` or `unavailable`. It does not say
   whether the site has any accounts, and it never raises a dialog.
@@ -29,7 +37,9 @@ The code is `backend/icp/client/autofill.py` (the host),
 
 ## 2. Turning it on (off by default)
 
-Nothing is installed into any browser. As yourself, once per browser:
+Two steps. First, in the Pear window: Settings, "Browser autofill", **On** (one Pear dialog;
+**Off** never asks and disconnects every host at once). Then nothing is installed into any
+browser until you do it, as yourself, once per browser:
 
 ```sh
 pear-passwords-autofill register --browser zen --extension-id '{5ad01040-3351-492c-9a42-1d56b881da78}'
@@ -102,6 +112,8 @@ request for the daemon from `origin` and `id` only.
 -> {"rid":2,"state":"locked"}
 -> {"rid":2,"state":"unavailable"}
 -> {"rid":2,"state":"unlocked","host":"github.com",
+    "accounts":[{"id":"<opaque>","match":"exact"}]}
+-> {"rid":2,"state":"unlocked","host":"github.com",          (after an approved fill)
     "accounts":[{"id":"<opaque>","username":"me@example.com","label":"GitHub — me@example.com",
                  "match":"exact"}]}
 ```
@@ -109,8 +121,10 @@ request for the daemon from `origin` and `id` only.
 - Never raises a dialog and never returns a secret.
 - `locked` and `unavailable` replies carry nothing else: no count, no hint.
 - `accounts`: at most 20, exact matches first, then related ones (section 6), newest change
-  first within each group. `id` is opaque; pass it back unchanged to `fill`. `label` is what
-  the Pear dialog will show.
+  first within each group. `id` is opaque; pass it back unchanged to `fill`. `username` and
+  `label` (what the Pear dialog shows) are included only after a fill through this host
+  process was approved since Pear was last unlocked; before that, show "Account 1, 2, ..."
+  and let the Pear dialog name the account.
 - An empty list means no account for this site.
 
 ### 4.3 fill
@@ -149,6 +163,7 @@ are returned: never notes, a one-time code or a code seed.
 | `too-many` | 8 requests already pending, or the daemon's 4 autofill connections are in use | wait |
 | `too-large` | a message over the size limit | fix the extension |
 | `no-daemon` | the Pear service is not reachable (not installed, or stopped) | say so |
+| `disabled` | autofill is switched off in the Pear window | say "Turn on autofill in Pear Passwords" |
 | `internal` | a daemon bug | report it |
 
 ## 5. Events

@@ -265,6 +265,16 @@ class TooManyTests(HostHarness):
         self.assertEqual(self.recv(), {"rid": 2, "error": "too-many"})
 
 
+class DisabledTests(HostHarness):
+    refuse = "forbidden"
+
+    def test_autofill_switched_off_in_the_window_says_so(self):
+        # escape-autofill-role-ungated: the daemon refuses the role until it is turned on.
+        self.send({"op": "query", "rid": 2, "origin": "https://github.com"})
+        self.assertEqual(self.recv(), {"rid": 2, "error": "disabled"})
+        self.assertIn("disabled", host.HOST_ERRORS)
+
+
 class ConnectTests(unittest.TestCase):
     def serve(self, reply):
         d = tempfile.TemporaryDirectory()

@@ -392,7 +392,9 @@ def register(browser: str, ext_id: str, env: Env | None = None, out=print) -> li
         save_receipt(env, receipt)
         written.append(path)
         out(f"registered {ext_id} for {BROWSERS[browser].title}: {path}")
-    out("Restart the browser if it was running. Every fill still asks you in a Pear dialog.")
+    out("Restart the browser if it was running. Then turn autofill on in the Pear window "
+        "(Settings, Browser autofill): until then the daemon refuses every autofill host. "
+        "Every fill still asks you in a Pear dialog.")
     return written
 
 

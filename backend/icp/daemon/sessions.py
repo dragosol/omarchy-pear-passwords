@@ -118,6 +118,7 @@ class Session:
         self.busy: str | None = None       # "sync" | "signin" | "edit" while Apple work runs
         self.signin = None                 # the live SocketFrontend
         self.migrating = False             # migrate-begin made a store, import not committed
+        self.autofill_enabled = False      # turned on in the window, behind .manage (persisted)
         self.last_ui_request = 0.0
         self.next_sync_at: float | None = None
         self.store_lock = asyncio.Lock()
@@ -317,17 +318,23 @@ class Registry:
                 logger.exception("uid %d: settings unreadable, using defaults", uid)
                 d = {}
             s.settings = validate_settings(d or {})
+            s.autofill_enabled = (d or {}).get("autofill_enabled") is True
             oc = (d or {}).get("old_copy")
             s.old_copy = oc if isinstance(oc, dict) else None
         return s
 
     def attach(self, conn) -> None:
         self.conns.add(conn)
+        if conn.role == "autofill":
+            self.notify_autofill_hosts(conn.uid)
 
     def detach(self, conn) -> None:
         """A connection is gone (EOF, error, or closed by us)."""
+        was = conn in self.conns
         self.conns.discard(conn)
         self.cancel_prompts(conn=conn)
+        if was and conn.role == "autofill":
+            self.notify_autofill_hosts(conn.uid)
         s = self.sessions.get(conn.uid)
         if s is None:
             return
@@ -391,7 +398,8 @@ class Registry:
     def withdraw(self, uid: int, roles=("clip", "migrate")) -> None:
         for c in list(self.conns):
             if c.uid == uid and c.role in roles and not c.closed:
-                c.send_event({"event": "withdraw"})
+                if c.role != "autofill":
+                    c.send_event({"event": "withdraw"})
                 c.close()
 
     # --- autofill visibility ------------------------------------------------------------------
@@ -405,6 +413,11 @@ class Registry:
         except Exception:
             return "unavailable"
         return "unavailable" if st == "empty" or st in protocol.SEAL_STATES else "locked"
+
+    def notify_autofill_hosts(self, uid: int) -> None:
+        """The window shows whether a browser autofill host is connected right now."""
+        self.notify_ui(uid, {"event": "autofill-hosts",
+                             "count": len(self.connections(uid, "autofill"))})
 
     def notify_autofill(self, uid: int) -> None:
         conns = self.connections(uid, "autofill")

@@ -43,7 +43,7 @@ VERSION = "2.0.0"
 
 EXT_OPS = {"status": None, "query": "autofill-query", "fill": "autofill-fill"}
 # Errors the host itself answers with; everything else is the daemon's code passed through.
-HOST_ERRORS = ("bad-request", "unknown-op", "too-large", "too-many", "no-daemon")
+HOST_ERRORS = ("bad-request", "unknown-op", "too-large", "too-many", "no-daemon", "disabled")
 
 _LEN = struct.Struct("=I")           # native byte order, as both browsers send it
 _BAD = object()                      # a frame that was not a JSON object
@@ -229,9 +229,13 @@ class Host:
             self._set_state("unavailable")
 
     def _unreachable(self, rid) -> dict:
-        # The daemon's own refusal (too-many autofill connections) is more useful than a
-        # generic one, and it is a protocol code the extension already knows.
-        return {"rid": rid, "error": "too-many" if self.refused == "too-many" else "no-daemon"}
+        # The daemon's own refusal (too-many autofill connections, or autofill switched off
+        # in the window) is more useful than a generic one.
+        if self.refused == "too-many":
+            return {"rid": rid, "error": "too-many"}
+        if self.refused == "forbidden":
+            return {"rid": rid, "error": "disabled"}
+        return {"rid": rid, "error": "no-daemon"}
 
     # --- extension -> daemon ---------------------------------------------------------------
     def from_extension(self, msg) -> None:
@@ -290,6 +294,8 @@ class Host:
             return
         reply = dict(obj)
         reply["rid"] = self.pending.pop(drid)
+        if reply.get("error") == "forbidden":
+            reply["error"] = "disabled"       # autofill was switched off in the window
         self.send(reply)
 
     # --- loop ------------------------------------------------------------------------------

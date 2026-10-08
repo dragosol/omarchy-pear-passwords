@@ -273,6 +273,10 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_autofill_reveals_nothing_while_locked_and_prompts_per_fill(self):
         await self.import_fixture()
+        af, hello = await self.h.hello("autofill")
+        self.assertEqual(hello.get("error"), "forbidden")         # off until turned on
+        r = await self.ui.call("autofill-enable", enabled=True, timeout=30)
+        self.assertTrue(r["autofill"]["enabled"])
         await self.ui.call("lock")
         af, hello = await self.h.hello("autofill")
         self.assertNotIn("error", hello, hello)
@@ -287,10 +291,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.ui.call("unlock", timeout=30)
         q = await af.call("autofill-query", origin="https://github.com", timeout=30)
         self.assertEqual(q["state"], "unlocked")
-        gh = [a for a in q["accounts"] if a["username"] == "dev@example.test"]
-        self.assertEqual(len(gh), 1, q)
         for a in q["accounts"]:
-            self.assertNotIn("password", a)
+            self.assertEqual(set(a), {"id", "match"})            # no names before a fill
+        gh = [a for a in q["accounts"]
+              if a["id"] == ids.entry_id("github.com", "dev@example.test")]
+        self.assertEqual(len(gh), 1, q)
         self.assertEqual(len(self.authority.actions()), n + 1)   # only the window's unlock
 
         f = await af.call("autofill-fill", origin="https://github.com", id=gh[0]["id"],

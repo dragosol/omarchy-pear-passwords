@@ -161,6 +161,7 @@ class FramingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await c1.event("focus"))["event"], "focus")
 
     async def test_autofill_connection_cap(self):
+        await self.h.enable_autofill()
         conns = []
         for _ in range(protocol.MAX_AUTOFILL_CONNS):
             c, reply = await self.h.hello("autofill")

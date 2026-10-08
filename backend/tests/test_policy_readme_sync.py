@@ -70,6 +70,7 @@ class PolicyReadmeSyncTests(unittest.TestCase):
             "reset": (paths.ACTION_MANAGE, "starting over"),
             "purge-old-copy": (paths.ACTION_MANAGE, "old 1.x copy"),
             "clip-history-check": (paths.ACTION_MANAGE, "clipboard history"),
+            "autofill-enable": (paths.ACTION_MANAGE, "turning browser autofill on"),
             "autofill-fill": (paths.ACTION_AUTOFILL, "Every browser fill"),
         }
         self.assertEqual(set(when), set(protocol.PROMPT_ACTION))

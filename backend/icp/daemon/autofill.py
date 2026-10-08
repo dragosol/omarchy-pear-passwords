@@ -7,6 +7,14 @@ and treats that only as being as trustworthy as the browser that reported it.
 
 The rules these handlers implement (docs/protocol.md 'Autofill' is the normative text):
 
+- Off until the user turns it on in the window (op autofill-enable, behind .manage): hello
+  refuses the role, and both ops refuse with "forbidden" once it is turned off again. pear-exec
+  runs the autofill role for any program of yours, so the browser manifest alone is no opt-in.
+- A query names accounts (username, label) only to a connection that has had a fill approved
+  since the last unlock; before that it gives ids and match kinds only. Any program of yours
+  that gets one fill dialog approved receives that one password - the dialog says a browser
+  extension is asking, and the window shows whether an autofill host is connected.
+
 - A locked Pear reveals nothing. Unless the uid's tier-1 UI session is unlocked, both ops
   answer as if no account exists for any site: autofill-query returns {"state": "locked"} with
   no other field, autofill-fill raises OpError("locked"). Neither ever unseals a key, raises a
@@ -251,6 +259,20 @@ def _open_session(reg: SessionRegistry, uid: int):
     return session
 
 
+def _require_enabled(reg: SessionRegistry, uid: int) -> None:
+    """Autofill turned off in the window since this connection's hello: serve nothing."""
+    session = reg.get(uid)
+    if session is not None and not getattr(session, "autofill_enabled", False):
+        raise OpError("forbidden")
+
+
+def _approved(conn, session) -> bool:
+    """Has this connection had a fill approved since the uid last unlocked? Only then does a
+    query name accounts: any program of yours can run `pear-exec autofill`, so the list of
+    usernames is not handed to a connection the user has not approved once."""
+    return getattr(conn, "autofill_epoch", None) == getattr(session, "epoch", 0)
+
+
 def _closed_state(reg: SessionRegistry, uid: int) -> str:
     """"locked" or "unavailable" for a uid whose tier 1 is not open.
 
@@ -296,12 +318,15 @@ async def handle_autofill_query(session_registry: SessionRegistry, conn: Connect
     empty, tpm-missing, tpm-cleared or damaged): no count, no hint whether the site has
     accounts, and the origin is validated but not used. Unlocked: returns
         {"state": "unlocked", "host": <parsed host>,
-         "accounts": [{"id", "username", "label", "match": "exact"|"related"}, ...]}
-    ranked by match_rank, then newest mdat, then label; at most 20 accounts. Never includes a
-    password, notes, a code or any other entry's data.
+         "accounts": [{"id", "match": "exact"|"related"[, "username", "label"]}, ...]}
+    ranked by match_rank, then newest mdat, then label; at most 20 accounts. "username" and
+    "label" appear only once a fill on this connection has been approved since the last
+    unlock; before that the ids are all a query gives away. Never includes a password, notes,
+    a code or any other entry's data.
 
     Raises OpError("bad-origin" | "insecure-origin" | "bad-request")."""
     reg, uid = session_registry, conn.uid
+    _require_enabled(reg, uid)
     host = parse_origin(_field(req, "origin"))
     session = _open_session(reg, uid)
     if session is None:
@@ -320,9 +345,13 @@ async def handle_autofill_query(session_registry: SessionRegistry, conn: Connect
         if rank is not None:
             ranked.append((rank, -float(meta.mdat or 0), account_label(meta).casefold(), meta))
     ranked.sort(key=lambda r: r[:3])
-    accounts = [{"id": m.id, "username": m.username or "", "label": account_label(m),
-                 "match": "exact" if rank == 0 else "related"}
-                for rank, _, _, m in ranked[:MAX_ACCOUNTS]]
+    named = _approved(conn, session)
+    accounts = []
+    for rank, _, _, m in ranked[:MAX_ACCOUNTS]:
+        a = {"id": m.id, "match": "exact" if rank == 0 else "related"}
+        if named:
+            a["username"], a["label"] = m.username or "", account_label(m)
+        accounts.append(a)
     return {"state": "unlocked", "host": host, "accounts": accounts}
 
 
@@ -349,6 +378,7 @@ async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connecti
     window flash. A fill that fails after approval because the store went away answers
     "locked" (an id that vanished answers "no-match")."""
     reg, uid = session_registry, conn.uid
+    _require_enabled(reg, uid)
     origin = _field(req, "origin")
     entry_id = _field(req, "id")
     host = parse_origin(origin)
@@ -386,6 +416,7 @@ async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connecti
         reply = {"id": entry_id, "username": meta.username or "",
                  "password": secrets.password or ""}
         secrets = None
+        conn.autofill_epoch = getattr(session, "epoch", 0)
     except OpError:
         _notify(reg, uid, entry_id, host, "failed")
         raise

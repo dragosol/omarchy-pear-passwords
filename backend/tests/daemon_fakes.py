@@ -428,6 +428,10 @@ class Harness:
         self.clients.append(c)
         return c
 
+    async def enable_autofill(self, uid=UID) -> None:
+        """What `autofill-enable {enabled:true}` in the window leaves behind."""
+        (await self.reg.session_for(uid)).autofill_enabled = True
+
     async def hello(self, role="ui", peer=None, **fields) -> tuple[Client, dict]:
         c = await self.connect(peer)
         reply = await c.call("hello", role=role, proto=2, rid=0, **fields)

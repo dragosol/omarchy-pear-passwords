@@ -270,6 +270,7 @@ class PromptRuleTests(unittest.IsolatedAsyncioTestCase):
         self.auth.started.clear()
         pending = self.ui.send("delete", id="e.1")
         await asyncio.to_thread(self.auth.started.wait, 5)
+        await self.h.enable_autofill(4242)
         af, _ = await self.h.hello("autofill")
         reg = self.h.reg
         self.assertTrue(reg.prompt_pending(4242, "ui"))

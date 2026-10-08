@@ -308,6 +308,8 @@ async def hello(reg, conn, req: dict) -> dict:
         return {**_hello_base(), "state": state, "signed_in": bool(st.get("signed_in")),
                 "sealed_with": st.get("sealed_with"), "synced_at": None, "needs_login": None,
                 "settings": dict(s.settings),
+                "autofill": {"enabled": bool(s.autofill_enabled),
+                             "hosts": len(reg.connections(conn.uid, "autofill"))},
                 "old_copy": ({"dir": oc.get("dir"), "migrated_at": oc.get("migrated_at")}
                              if oc else None)}
     if conn.role in protocol.TICKET_ROLES:
@@ -328,6 +330,11 @@ async def hello(reg, conn, req: dict) -> dict:
                     "dir": t.extra.get("dir")}
         return {**_hello_base(), "purpose": "import"}
     if conn.role == "autofill":
+        # Opt-in, enforced here: `pear-passwords-autofill register` only writes a browser
+        # manifest, and pear-exec runs the autofill role for any program of yours. Until the
+        # user turns autofill on in the window (behind .manage), no autofill host is served.
+        if not s.autofill_enabled:
+            raise OpError("forbidden")
         if len(reg.connections(conn.uid, "autofill")) >= protocol.MAX_AUTOFILL_CONNS:
             raise OpError("too-many")
         return {**_hello_base(), "state": reg.autofill_state(s)}
@@ -830,6 +837,23 @@ async def op_settings(reg, conn, req):
     return {"settings": dict(s.settings)}
 
 
+async def op_autofill_enable(reg, conn, req):
+    """Turn browser autofill on (one .manage dialog) or off (no dialog; every autofill host
+    connected right now is disconnected)."""
+    s = _session(reg, conn)
+    if s.ui is not conn:
+        raise OpError("forbidden")
+    enabled = _need(req, "enabled", bool)
+    if enabled and not s.autofill_enabled:
+        await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    await _save_setting_keys(reg, s, autofill_enabled=True if enabled else None)
+    s.autofill_enabled = enabled
+    if not enabled:
+        reg.withdraw(conn.uid, roles=("autofill",))
+    return {"autofill": {"enabled": enabled,
+                         "hosts": len(reg.connections(conn.uid, "autofill"))}}
+
+
 # --- ui: migration and cleanup ------------------------------------------------------------------
 
 async def _save_setting_keys(reg, s, **changes) -> None:
@@ -1152,4 +1176,5 @@ HANDLERS = {
     "import-file": op_import_file, "import-key": op_import_key,
     "import-commit": op_import_commit, "purge-result": op_purge_result,
     "autofill-query": op_autofill_query, "autofill-fill": op_autofill_fill,
+    "autofill-enable": op_autofill_enable,
 }

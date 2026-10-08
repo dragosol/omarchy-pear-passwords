@@ -113,6 +113,7 @@ class LockEffectTests(unittest.IsolatedAsyncioTestCase):
         self.st = self.h.seed()
         self.ui, self.peer = await self.h.ui()
         await self.ui.call("unlock")
+        await self.h.enable_autofill()
         self.af, hello = await self.h.hello("autofill")
         self.assertEqual(hello["state"], "unlocked")
 

@@ -82,6 +82,7 @@ ROLE_OPS: dict[str, frozenset[str]] = {
         "unlock", "lock", "release", "grant", "reveal", "totp", "history", "copy", "set",
         "create", "delete", "totp-preview", "signin", "answer", "signout", "sync", "settings",
         "migrate-begin", "reset", "purge-old-copy", "clip-history-check", "cancel",
+        "autofill-enable",
     }),
     "clip": frozenset({"redeem", "clip-result"}),
     "migrate": frozenset({"import-file", "import-key", "import-commit", "purge-result"}),
@@ -101,6 +102,7 @@ PROMPT_ACTION: dict[str, str] = {
     "reset": paths.ACTION_MANAGE,
     "purge-old-copy": paths.ACTION_MANAGE,
     "clip-history-check": paths.ACTION_MANAGE,
+    "autofill-enable": paths.ACTION_MANAGE,      # turning it on only; off never asks
     "autofill-fill": paths.ACTION_AUTOFILL,
 }
 # Rate-limit bucket per role: the UI and the browser never starve each other.
@@ -126,7 +128,7 @@ UNLOCK_REFUSALS = ("dismissed", "denied", "no-agent", "busy", "rate-limited", "e
 # --- events (daemon -> client, no rid unless noted) ------------------------------------------
 EVENTS: dict[str, frozenset[str]] = {
     "ui": frozenset({"locked", "synced", "sync-failed", "grant-expired", "clip", "focus",
-                     "needs-login", "autofill", "migrated",
+                     "needs-login", "autofill", "autofill-hosts", "migrated",
                      # sign-in stream, these three carry the signin request's rid
                      "stage", "out", "ask"}),
     "clip": frozenset({"withdraw"}),

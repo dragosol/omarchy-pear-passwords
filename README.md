@@ -44,15 +44,18 @@ Omarchy's own shell components.
   | `wifi` | Wi-Fi networks |
 
 - **Keyboard first.** Arrows to move, Tab into the details, Enter to copy, Esc to go back.
-- **Browser autofill, if you want it.** Off by default. Bring your own extension and register
-  it with one command; every fill asks first. See
+- **Browser autofill, if you want it.** Off by default. Turn it on in the window, bring your own
+  extension and register it with one command; every fill asks first. See
   [Autofill](#autofill-bring-your-own-extension).
 
 ## How unlocking works
 
 Pear 2.0 keeps every key in a small system service, `pear-passwordsd`, which runs as its own
 user (`pear-passwords`), not as you. Nothing in your home directory can decrypt your passwords,
-and no program running as you can talk to the service: only the Pear window can.
+and no program running as you can talk to the service: only the Pear window can, plus browser
+autofill hosts once you turn autofill on in the window. While autofill is on, any program
+running as you can connect the way a browser does; it still gets a password only if you approve
+that fill's dialog (see [Autofill](#autofill-bring-your-own-extension)).
 
 You see two kinds of dialog, both drawn by Omarchy's own polkit agent, and nothing else ever
 asks for a password:
@@ -61,8 +64,8 @@ asks for a password:
 | --- | --- | --- |
 | `io.github.dragosol.pearpasswords.unlock` | Unlock Pear Passwords to show your accounts | Each time you open Pear, and after it locks |
 | `io.github.dragosol.pearpasswords.reveal` | Use the saved password for $(account) | The first reveal, copy, code, notes, history or edit of one account |
-| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | Signing in or out, adding or deleting, moving from 1.x, starting over, deleting the old 1.x copy, checking clipboard history |
-| `io.github.dragosol.pearpasswords.autofill` | Fill the password for $(account) on $(origin) | Every browser fill, if you set up autofill |
+| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | Signing in or out, adding or deleting, moving from 1.x, starting over, deleting the old 1.x copy, checking clipboard history, turning browser autofill on |
+| `io.github.dragosol.pearpasswords.autofill` | A browser extension asks to fill the password for $(account) on $(origin) | Every browser fill, if you set up autofill |
 
 1. **Opening Pear** asks once. Approving releases the list of accounts: names, sites and
    usernames, never a password. The list shows straight away from the last sync, with "synced
@@ -211,8 +214,11 @@ addons.mozilla.org could not be reviewed with it. What Pear ships is a generic n
 host, `io.github.dragosol.pearpasswords`, which any extension can talk to. The message format
 is in [docs/autofill-protocol.md](docs/autofill-protocol.md).
 
-It is **off by default**. No installer writes a browser manifest. To turn it on for one
-browser, with the id of the extension you use:
+It is **off by default**, in two places. First turn it on in the Pear window: Settings,
+"Browser autofill", **On** (one dialog; **Off** never asks and disconnects every browser at
+once). Until then the service refuses every autofill host, whatever is registered.
+No installer writes a browser manifest, so then register it for one browser, with the id of
+the extension you use:
 
 ```bash
 pear-passwords-autofill register --browser zen --extension-id <id>
@@ -229,8 +235,11 @@ How a fill works:
 
 - It works only while the Pear window is open and unlocked. While Pear is locked the host
   answers only "locked", and says nothing about which sites have accounts.
-- **Every fill shows its own dialog**: "Fill the password for GitHub — me on github.com". No
-  approval carries over to the next fill, and the browser never gets the window's open account.
+- **Every fill shows its own dialog**: "A browser extension asks to fill the password for
+  GitHub — me on github.com". No approval carries over to the next fill, and the browser never
+  gets the window's open account.
+- Until a fill through it has been approved, a browser connection learns which accounts exist
+  for a site only as opaque ids, not their usernames.
 - The account must match the site: the same host, or a subdomain or parent domain of a website
   saved with the account. Lookalike and public-suffix matches (`co.uk`, `github.io`) never
   count.
@@ -240,6 +249,12 @@ How a fill works:
 
 What to know before you turn it on:
 
+- **Any program running as you can then ask the way your browser does.** The host program is
+  set-gid so that only it can reach the service, but anything of yours can start it. Such a
+  program still gets nothing without a dialog, and the dialog says a browser extension is
+  asking; but if you approve a fill you did not just ask your browser for, it gets that
+  password. The window shows when an autofill host is connected. Leave autofill off if you do
+  not use it.
 - **The browser then holds that password**, and so does the extension. Pear's protection ends
   where the browser's begins.
 - **The site is only as trustworthy as the browser that reports it.** A well-behaved extension
@@ -311,7 +326,7 @@ again; local history and nicknames are lost). Turning PTT off by mistake is not 
 | Who | Outcome |
 | --- | --- |
 | Someone with a copy of your home directory (backup, cloud sync, stolen disk image of `/home`) | **Protected.** After the move to 2.0 nothing in your home decrypts anything. |
-| A program running as you (malware, a compromised app) | **Mostly protected.** It cannot reach the service, read the vault, unseal the keys or read the Pear window's memory, and it cannot get the list or a password without you approving a dialog. What it can still do is below. |
+| A program running as you (malware, a compromised app) | **Mostly protected.** It cannot reach the service (except as an autofill host while autofill is on), read the vault, unseal the keys or read the Pear window's memory, and it cannot get the list or a password without you approving a dialog, unless it controls your desktop (below). What it can still do is below. |
 | Another account on this computer | **Protected.** Each user's vault is separate and needs that user's own approval. |
 | You, logged in over SSH | **Protected.** The dialogs are refused outside an active local session, and Pear only starts under your real desktop. |
 | Someone on the network | **Protected.** Every connection to Apple is verified (below). |
@@ -326,6 +341,10 @@ What a program running as you can still do, because no Linux desktop can stop it
 - capture the screen while you reveal a password (Pear asks Hyprland to keep its window out of
   screen sharing, which is best effort);
 - start Pear itself, so you see a Pear dialog you did not ask for: **deny it**;
+- while browser autofill is on, connect as an autofill host and ask for a fill: you see "A
+  browser extension asks to fill the password for …" (and the window says an autofill host is
+  connected). If you approve a fill you did not just ask your browser for, that program gets
+  that one password;
 - kill your desktop shell and show its own dialog to phish your **login password**. Anything
   with your login password can also become root with sudo, so this is not Pear-specific. A
   fingerprint cannot be replayed (see the hardening option below);

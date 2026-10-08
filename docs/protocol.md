@@ -81,7 +81,7 @@ Role rules:
 |---|---|
 | `ui` | At most one per uid. A second `ui` hello gets `{"rid":0,"error":"already-running"}` and is closed; the existing UI gets `{"event":"focus"}`. |
 | `clip`, `migrate` | `ticket` required. It must be live (10 s), unused, issued on this uid's UI connection for this role, and the client's `PPid` must equal that UI's pid with a matching UI start time. Otherwise `{"rid":0,"error":"bad-ticket"}` and close. The ticket is consumed by the hello, success or not. More than 5 bad tickets per uid per minute: further `clip`/`migrate` hellos for that uid are refused with `bad-ticket` for the rest of the minute. |
-| `autofill` | No ticket, no parent binding. At most **4** live autofill connections per uid; the 5th gets `{"rid":0,"error":"too-many"}` and is closed. |
+| `autofill` | Refused with `{"rid":0,"error":"forbidden"}` and closed until the user turns autofill on in the window (`autofill-enable`, section 6). No ticket, no parent binding: `pear-exec autofill` runs for any program of the user, so this switch, not the browser manifest, is the opt-in. At most **4** live autofill connections per uid; the 5th gets `{"rid":0,"error":"too-many"}` and is closed. |
 
 Replies:
 
@@ -91,6 +91,7 @@ Replies:
 {"rid":0,"proto":2,"version":"2.0.0","state":"locked","signed_in":true,
  "sealed_with":"host","synced_at":null,"needs_login":null,
  "settings":{"grant_s":120,"idle_lock_s":0,"clip_timeout_s":30},
+ "autofill":{"enabled":false,"hosts":0},
  "old_copy":{"dir":"/home/u/.config/icp.v1-backup-20261008","migrated_at":1791450000.0}}
 ```
 
@@ -101,6 +102,7 @@ Replies:
 - `sealed_with`: `"host"`, `"host+tpm2"`, or `null` when `empty`.
 - `synced_at`, `needs_login`: `null` while locked (they live under the metadata key).
 - `old_copy`: the v1 backup recorded by a migration, or `null`.
+- `autofill`: whether browser autofill is turned on, and how many autofill hosts are connected.
 
 `clip` (after the ticket is checked):
 
@@ -230,7 +232,7 @@ lease: a locked uid does not sync.
 | `io.github.dragosol.pearpasswords.unlock` | Unlock Pear Passwords to show your accounts | `unlock` |
 | `io.github.dragosol.pearpasswords.reveal` | Use the saved password for $(account) | `grant` |
 | `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | `create`, `delete`, `signin`, `signout`, `migrate-begin`, `reset`, `purge-old-copy`, `clip-history-check` |
-| `io.github.dragosol.pearpasswords.autofill` | Fill the password for $(account) on $(origin) | `autofill-fill` |
+| `io.github.dragosol.pearpasswords.autofill` | A browser extension asks to fill the password for $(account) on $(origin) | `autofill-fill` |
 
 All four: `auth_self` for active local sessions, `no` for any and inactive, no `_keep`, owner
 annotation `unix-user:pear-passwords`. No other op ever raises a dialog.
@@ -441,6 +443,7 @@ the next grant; `idle_lock_s` restarts the idle clock.
 {"op":"purge-old-copy","rid":20}           -> {"rid":20,"ticket":"<43 chars>","ttl":10}
 {"op":"reset","rid":21}                    -> {"rid":21,"state":"empty"}
 {"op":"clip-history-check","rid":22,"items":["...","..."]}  -> {"rid":22,"matches":[0,4]}
+{"op":"autofill-enable","rid":23,"enabled":true} -> {"rid":23,"autofill":{"enabled":true,"hosts":0}}
 ```
 
 - `migrate-begin`: needs state `empty`, or a store an earlier `migrate-begin` created that
@@ -459,6 +462,9 @@ the next grant; `idle_lock_s` restarts the idle clock.
   entries and no iCloud session": the fresh store already has new sealed keys and tier 1
   stays open on this connection, so the sign-in the UI then offers needs only its own
   `.manage` dialog. No `locked` event is sent; a later `hello` reports `locked`.
+- `autofill-enable`: turning browser autofill on raises `.manage` (once; it is then remembered
+  in state.json); turning it off never asks and closes every autofill connection of the uid.
+  Until it is on, an autofill `hello` is `forbidden`.
 - `clip-history-check`: needs tier 1. Raises `.manage`. At most 1000 items of at most 1024
   characters each, and the whole request must still fit one 64 KiB line, which binds first:
   the window sends only single-line history items without spaces of 4 to 256 characters,
@@ -538,11 +544,13 @@ if their sha256 still matches.
 {"event":"grant-expired","id":"<id>"}
 {"event":"clip","id":"<id>","field":"password","outcome":"pasted"}
 {"event":"autofill","id":"<id>","origin":"github.com","outcome":"filled"|"dismissed"|"denied"|"failed"}
+{"event":"autofill-hosts","count":1}
 {"event":"migrated","counts":{...}}
 {"event":"focus"}
 ```
 
-`focus` asks the window to raise itself (`hyprctl dispatch focuswindow`).
+`focus` asks the window to raise itself (`hyprctl dispatch focuswindow`). `autofill-hosts` is
+sent whenever an autofill host connects or goes, so the window can show that one is connected.
 
 ### 9.2 Sign-in stream (to the UI, carrying the signin rid)
 
@@ -609,6 +617,12 @@ The autofill role is `pear-exec autofill`, started by a browser through the nati
 host `io.github.dragosol.pearpasswords` (wrapper `/usr/local/lib/pear-passwords/libexec/pear-autofill-host`).
 It never gets a tier-1 or tier-2 grant and never uses the window's grants.
 
+**Off until turned on in the window.** The `hello` is `forbidden` until `autofill-enable`, and
+both ops answer `forbidden` once it is turned off again. Any program running as the user can
+start `pear-exec autofill`, so once autofill is on, any such program can ask for fills: each
+fill is still its own dialog, which says a browser extension is asking, and the window shows
+when an autofill host is connected.
+
 **A locked Pear reveals nothing.** Both ops work only while the uid's tier 1 is unlocked in the
 Pear window. Otherwise they say nothing about any site.
 
@@ -635,6 +649,8 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
   -> {"rid":1,"state":"locked"}
   -> {"rid":1,"state":"unavailable"}
   -> {"rid":1,"state":"unlocked","host":"github.com",
+      "accounts":[{"id":"<id>","match":"exact"}]}
+  -> {"rid":1,"state":"unlocked","host":"github.com",        (after an approved fill)
       "accounts":[{"id":"<id>","username":"me","label":"GitHub — me","match":"exact"}]}
 
 {"op":"autofill-fill","rid":2,"origin":"https://github.com","id":"<id>"}
@@ -646,7 +662,9 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
 - `autofill-query` never prompts. Locked, without a UI connection, or for a uid the daemon
   has not seen since it started: only `{"state":"locked"}` (the autofill `hello` says the
   same); empty or a seal state: only `{"state":"unavailable"}`. Unlocked: up to
-  20 accounts ranked by match, then newest change, then label. Never a secret.
+  20 accounts ranked by match, then newest change, then label. `username` and `label` are
+  included only once a fill on this connection has been approved since the uid last
+  unlocked; before that a query gives ids and match kinds only. Never a secret.
 - `autofill-fill` raises `.autofill` every time with `account` and `origin` (the host), in the
   `autofill` rate-limit bucket (one outstanding, 3 answered per minute per uid). An unknown
   id and a non-matching id both give `no-match`. After approval the daemon re-checks that the
@@ -731,6 +749,7 @@ traceback.
 | `reset` | ui | `.manage` | tpm-cleared or damaged | `{state:"empty"}` |
 | `purge-old-copy` | ui | `.manage` | an old_copy record | `{ticket, ttl:10}` |
 | `clip-history-check` | ui | `.manage` | tier 1 | `{matches}` |
+| `autofill-enable` | ui | `.manage` | – | `{autofill:{enabled, hosts}}` |
 | `redeem` | clip | – | ticket at hello | `{value, sensitive, timeout}` |
 | `clip-result` | clip | – | after redeem | `{ok:true}` |
 | `import-file` | migrate | – | purpose import | `{ok, size?, sha256?}` |

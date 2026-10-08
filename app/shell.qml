@@ -76,6 +76,9 @@ ShellRoot {
     property bool signedIn: false
     property string sealedWith: ""
     property var settings: ({ grant_s: 120, idle_lock_s: 0, clip_timeout_s: 30 })
+    // Browser autofill: off until turned on here (one .manage dialog); how many hosts are on.
+    property bool autofillEnabled: false
+    property int autofillHosts: 0
     property var oldCopy: null
     property real syncedAt: 0
     property bool syncing: false
@@ -274,6 +277,8 @@ ShellRoot {
         root.signedIn = !!m.signed_in;
         root.sealedWith = m.sealed_with || "";
         if (m.settings) root.settings = m.settings;
+        root.autofillEnabled = !!(m.autofill && m.autofill.enabled);
+        root.autofillHosts = (m.autofill && m.autofill.hosts) || 0;
         root.oldCopy = m.old_copy || null;
         if (root.vaultState === "empty") { v1Check.check(); return; }
         // Opening the window is the request to see it: ask once, straight away. Never for a
@@ -321,6 +326,9 @@ ShellRoot {
             root.showFlash(m.outcome === "filled" ? "Filled a password on " + (m.origin || "a site")
                          : m.outcome === "failed" ? "A browser fill failed"
                          : "A browser fill was not approved");
+            return;
+        case "autofill-hosts":
+            root.autofillHosts = m.count || 0;
             return;
         case "migrated":
             root.migrateResult = Object.assign({}, root.migrateResult, { counts: m.counts || {} });
@@ -1043,6 +1051,15 @@ ShellRoot {
         });
     }
 
+    // On asks once (.manage); Off never asks and disconnects every autofill host.
+    function setAutofill(on) {
+        root.send("autofill-enable", { enabled: on }, function (d) {
+            if (d.error) { root.showFlash(root.errorWords(d)); return; }
+            root.autofillEnabled = !!(d.autofill && d.autofill.enabled);
+            root.autofillHosts = (d.autofill && d.autofill.hosts) || 0;
+        });
+    }
+
     function purgeOldCopy() {
         root.purging = true;
         root.send("purge-old-copy", {}, function (d) {
@@ -1555,6 +1572,28 @@ ShellRoot {
             ColumnLayout {
                 anchors.fill: parent
                 spacing: 0
+
+                // Any program of yours can run the autofill role once autofill is on, so the
+                // window says when one is connected: a dialog for a fill you did not ask your
+                // browser for is then one to deny.
+                Rectangle {
+                    Layout.fillWidth: true
+                    visible: root.autofillHosts > 0
+                    implicitHeight: 30
+                    color: Theme.panel
+                    Text {
+                        textFormat: Text.PlainText
+                        anchors.fill: parent
+                        anchors.leftMargin: 14
+                        anchors.rightMargin: 10
+                        verticalAlignment: Text.AlignVCenter
+                        text: "A browser autofill host is connected. Approve a fill only when you just asked your browser for one."
+                        color: Theme.dim
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                        elide: Text.ElideRight
+                    }
+                }
 
                 // Apple wants an interactive sign-in. This used to be a desktop notification
                 // telling you to run a terminal command, which is a dead end with nowhere to
@@ -3959,6 +3998,45 @@ ShellRoot {
                         font.family: Theme.uiFont
                         font.pixelSize: Theme.fSmall
                         wrapMode: Text.Wrap
+                    }
+
+                    // ---- browser autofill
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.topMargin: 24
+                        text: "Browser autofill"
+                        color: Theme.fg
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                    }
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        Layout.topMargin: 6
+                        text: "Lets a browser extension you registered with pear-passwords-autofill ask for a password. "
+                            + "Every fill is its own dialog. While this is on, any program running as you can ask the same "
+                            + "way, so approve a fill only right after you asked your browser for one."
+                            + (root.autofillHosts > 0 ? " Connected now: " + root.autofillHosts + "." : "")
+                        color: Theme.dim
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                        wrapMode: Text.Wrap
+                    }
+                    RowLayout {
+                        Layout.topMargin: 8
+                        spacing: 6
+                        AppButton {
+                            text: "Off"
+                            active: !root.autofillEnabled
+                            fontSize: Theme.fSmall
+                            onClicked: if (root.autofillEnabled) root.setAutofill(false)
+                        }
+                        AppButton {
+                            text: "On"
+                            active: root.autofillEnabled
+                            fontSize: Theme.fSmall
+                            onClicked: if (!root.autofillEnabled) root.setAutofill(true)
+                        }
                     }
 
                     // ---- clipboard history

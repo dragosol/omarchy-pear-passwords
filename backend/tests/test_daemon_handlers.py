@@ -10,7 +10,7 @@ from unittest import mock
 from daemon_fakes import UID, Harness, meta, secrets
 
 from icp import vstore
-from icp.daemon import handlers, paths, protocol
+from icp.daemon import handlers, paths, polkit, protocol
 from icp.daemon.context import NeedsLogin
 from icp.errors import AppleError
 
@@ -38,6 +38,7 @@ class HelloAndUnlockTests(Base):
                                  "synced_at": None, "needs_login": None,
                                  "settings": {"grant_s": 120, "idle_lock_s": 0,
                                               "clip_timeout_s": 30},
+                                 "autofill": {"enabled": False, "hosts": 0},
                                  "old_copy": None})
 
     async def test_unlock_then_sync_event_after_the_reply(self):
@@ -439,6 +440,7 @@ class AutofillDispatchTests(Base):
                              isinstance(reg.get(conn.uid), protocol.Session))
             seen["role"] = conn.role
             return {"state": "locked"}
+        await self.ui.call("autofill-enable", enabled=True)
         af, hello = await self.h.hello("autofill")
         self.assertEqual(hello["state"], "locked")
         from icp.daemon import autofill
@@ -450,6 +452,46 @@ class AutofillDispatchTests(Base):
         self.assertEqual((await af.event("state"))["state"], "unlocked")
         for op in ("unlock", "grant", "redeem", "import-file"):
             self.assertEqual((await af.call(op))["error"], "forbidden")
+
+
+class AutofillOptInTests(Base):
+    """escape-autofill-role-ungated: the daemon, not the browser manifest, is the opt-in."""
+
+    async def test_autofill_hello_is_refused_until_turned_on_in_the_window(self):
+        af, hello = await self.h.hello("autofill")
+        self.assertEqual(hello.get("error"), "forbidden")
+        self.assertEqual(self.dialogs(), [])
+        self.assertFalse(self.ui.hello["autofill"]["enabled"])
+
+    async def test_turning_it_on_asks_once_and_off_never_asks_and_disconnects(self):
+        r = await self.ui.call("autofill-enable", enabled=True)
+        self.assertEqual(r["autofill"], {"enabled": True, "hosts": 0})
+        self.assertEqual(self.dialogs(), [paths.ACTION_MANAGE])
+        self.assertTrue(self.h.store().load_settings().get("autofill_enabled"))
+        af, hello = await self.h.hello("autofill")
+        self.assertNotIn("error", hello)
+        self.assertEqual((await self.ui.event("autofill-hosts"))["count"], 1)
+        await self.ui.call("autofill-enable", enabled=True)       # already on: no dialog
+        self.assertEqual(self.dialogs(), [paths.ACTION_MANAGE])
+        r = await self.ui.call("autofill-enable", enabled=False)
+        self.assertEqual(r["autofill"]["enabled"], False)
+        self.assertEqual(self.dialogs(), [paths.ACTION_MANAGE])  # off never asks
+        self.assertNotIn("autofill_enabled", self.h.store().load_settings())
+        af2, hello = await self.h.hello("autofill")
+        self.assertEqual(hello.get("error"), "forbidden")
+
+    async def test_a_denied_dialog_leaves_it_off(self):
+        self.h.authority.outcome = polkit.DENIED
+        r = await self.ui.call("autofill-enable", enabled=True)
+        self.assertEqual(r.get("error"), "denied")
+        af, hello = await self.h.hello("autofill")
+        self.assertEqual(hello.get("error"), "forbidden")
+
+    async def test_only_the_window_may_turn_it_on(self):
+        await self.ui.call("autofill-enable", enabled=True)
+        af, _ = await self.h.hello("autofill")
+        self.assertEqual((await af.call("autofill-enable", enabled=True))["error"],
+                         "forbidden")
 
 
 if __name__ == "__main__":
