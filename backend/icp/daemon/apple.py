@@ -543,6 +543,10 @@ def delete(ctx: "UserContext", id: str) -> None:
     from ..cli import push
 
     meta = ctx.store.get_meta(id)
+    # _pair matches only the live access groups, so deleting a Recently Deleted copy by its
+    # domain and username would remove the live login. Read-only, as in push_set.
+    if getattr(meta, "recently_deleted", False) or getattr(meta, "kind", "login") == "passkey":
+        raise FieldError("id", "a Recently Deleted or passkey-only row is read-only")
     push.require_delete()   # before any network traffic: see the switch in cli/push.py
     zone = _open_zone(ctx)
     push.delete_entry(zone, meta.domain, meta.username)

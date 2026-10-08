@@ -730,6 +730,23 @@ def test_delete_when_enabled_removes_both_records_and_tombstones(monkeypatch, ed
     assert store.applied == [([], {eid})]
 
 
+@pytest.mark.parametrize("flag", ["recently_deleted", "passkey"])
+def test_delete_refuses_read_only_rows_before_any_network(monkeypatch, edit_env, flag):
+    # A Recently Deleted copy keeps the live account's domain and username, and _pair matches
+    # only the live access groups: deleting it by those would remove the live login.
+    monkeypatch.setattr(push, "RECORD_DELETE_VERIFIED", True)
+    monkeypatch.setattr(push, "delete_entry",
+                        lambda z, d, u: edit_env["pushed"].append(("delete", d, u)) or 2)
+    c = _cred("github.com", "alex", "pw", recently_deleted=flag == "recently_deleted",
+              kind="passkey" if flag == "passkey" else "login")
+    m = _meta_for(c)
+    store = FakeStore(session=JOINED, metas=[m])
+    with pytest.raises(apple.FieldError) as e:
+        apple.delete(_ctx(store), m.id)
+    assert e.value.field == "id"
+    assert edit_env["pushed"] == [] and edit_env["opened"] == 0 and store.applied == []
+
+
 # --------------------------------------------------------------------------- frontends
 
 class JsonFrontendCancelTests(unittest.TestCase):

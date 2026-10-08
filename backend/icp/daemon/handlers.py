@@ -802,7 +802,11 @@ async def op_create(reg, conn, req):
 async def op_delete(reg, conn, req):
     id = _need_id(req)
     s = _tier1(reg, conn)
-    await _store(reg, conn.uid, s.store.get_meta, id)
+    meta = await _store(reg, conn.uid, s.store.get_meta, id)
+    # Read-only rows, as in op_set. A Recently Deleted copy keeps the live account's domain and
+    # username, so a delete would remove the LIVE login. Refused before any dialog.
+    if getattr(meta, "recently_deleted", False) or getattr(meta, "kind", "login") == "passkey":
+        raise OpError("invalid", field="id")
     if s.busy:
         raise OpError("busy-sync")
     epoch = s.epoch

@@ -840,6 +840,23 @@ class FeatureFlagTests(Base):
         self.assertEqual((await self.ui.call("features", get=True))["features"]["passkeys"],
                          False)
 
+    async def test_delete_refuses_read_only_rows_before_any_dialog(self):
+        # A Recently Deleted copy keeps the live login's domain and username, so deleting it in
+        # iCloud would remove the live login. Refused with the flags on or off (a client can
+        # compute a hidden row's id), before the .manage dialog and without reaching apple.
+        await self.h.unlock(self.ui)
+        for flags in ({}, {"passkeys": True, "apple_deleted": True}):
+            if flags:
+                await self.ui.call("features", set=flags)
+            before = self.dialogs()
+            for rid in ("rd", "pk"):
+                r = await self.ui.call("delete", id=rid)
+                self.assertEqual((r["error"], r["field"]), ("invalid", "id"), (flags, rid))
+            self.assertEqual(self.dialogs(), before)
+        self.assertNotIn("delete", [c[0] for c in self.h.apple.calls])
+        self.assertEqual(await self.ui.call("delete", id="e.1"),
+                         {"rid": self.ui.rid, "deleted": True})
+
     async def test_hidden_rows_are_never_offered_to_autofill(self):
         from icp.daemon import autofill
         for m in (self.st.metas["pk"], self.st.metas["rd"]):
