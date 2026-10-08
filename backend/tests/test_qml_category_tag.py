@@ -160,6 +160,34 @@ class WindowWiringTests(unittest.TestCase):
         self.assertIn("Timer { id: openTimer; interval: 200;", src)
         self.assertIn("Timer { id: closeTimer; interval: 300;", src)
 
+    def test_a_read_only_title_opens_no_rename(self):
+        # Audit #2: a click on the title raised the account's dialog and opened rename on a
+        # Recently Deleted or passkey-only row, for a set the daemon always refuses.
+        self.assertIn('return !!s && (!!s.recently_deleted || s.kind === "passkey");',
+                      function_body("selectedReadOnly"))
+        title = CODE[CODE.index("HoverHandler { id: hTitle }"):]
+        area = title[title.index("MouseArea {"):]
+        area = area[:area.index("root.renaming = true;")]
+        self.assertIn("enabled: !root.selectedReadOnly()", area)
+        self.assertIn("onClicked: if (!root.selectedReadOnly()) root.withGrant(", area)
+        hint = title[title.index('text: "rename"'):][:400]
+        self.assertIn("opacity: hTitle.hovered && !root.selectedReadOnly() ? 1 : 0", hint)
+
+    def test_read_only_notes_only_reveal(self):
+        # Audit #2: the second "show notes" opened the notes editor (polkit #2, then a refusal).
+        act = function_body("fieldAction")
+        self.assertIn('else if (key === "notes")\n            root.loadNotes(root.notesLoaded && '
+                      '!root.selectedReadOnly()\n                           ? function () { '
+                      'root.openEditor("notes"); } : null);', act)
+        self.assertLess(act.index('if (root.selectedReadOnly() && (key === "change" || '
+                                  'key.indexOf("edit") === 0)) return;'),
+                        act.index("root.withGrant("))
+
+    def test_the_drop_down_spans_the_list_column(self):
+        # The selected row's highlight and its icons showed right of a narrower drop-down.
+        box = element_of("search")
+        self.assertIn("panel.width: parent.width - search.x - search.panel.x", box)
+
     def test_passkeys_and_deleted_wait_for_their_flags(self):
         js = qmlscan.read(CATS_JS)
         self.assertRegex(js, r'key: "passkeys",[^\n]*flag: "passkeys"')
@@ -211,6 +239,18 @@ class TagsRowTests(unittest.TestCase):
         body = function_body("tagsProblem")
         self.assertIn('"a tag is 1 to 32 letters, digits, - or _"', body)
         self.assertIn('"at most 16 tags"', body)
+
+    def test_wifi_tags_show_read_only(self):
+        # A Wi-Fi network has no notes Apple syncs, so no "edit" and no "Add tags"; the
+        # daemon refuses set {tags} for it (test_wifi_details_refused.py).
+        rows = function_body("fieldRows")
+        wifi = rows[rows.index("if (s.is_wifi) {"):]
+        wifi = wifi[:wifi.index("const sites = root.allSites();")]
+        self.assertIn('rows.push({ key: "tags", label: "Tags", value: "#" + wifiTags.join("  #"),',
+                      wifi)
+        self.assertIn("chips: wifiTags, actions: [] });", wifi)
+        self.assertIn("if (wifiTags.length)", wifi)
+        self.assertNotIn("edittags", wifi)
 
     def test_the_detail_tags_wrap_and_are_never_cut(self):
         flow = element_of("chipFlow")
@@ -912,6 +952,91 @@ Item {
     }
 }
 """
+
+
+ROWS_QML = """import QtQuick
+import QtTest
+
+Item {
+    id: root
+    property var selected: null
+    property string selectedId: "e.1"
+    property string revealed: ""
+    property bool notesLoaded: false
+    property string notesText: ""
+    property string totpCode: ""
+    property bool tagEditing: false
+    property var calls: []
+    function note(what) { root.calls = root.calls.concat([what]); }
+    function withGrant(fn) { root.note("grant"); }
+    function loadNotes(then) { root.note(then ? "load+edit" : "load"); }
+    function openEditor(mode) { root.note("editor " + mode); }
+    function copyField(f) { root.note("copy " + f); }
+    function copyPassword() { root.note("copy password"); }
+    function doReveal() { root.note("reveal"); }
+    function loadTotp() { root.note("totp"); }
+    function openDomain(d) { root.note("open " + d); }
+    %(functions)s
+    TestCase {
+        name: "Rows"
+        function keys(rows) { return rows.map(function (r) { return r.key; }); }
+        function tagsRow(rows) { return rows.filter(function (r) { return r.label === "Tags"; })[0]; }
+        function test_read_only_rows_never_open_an_editor() {
+            const ro = [{ recently_deleted: true, kind: "login", has_notes: true, tags: ["a"] },
+                        { recently_deleted: false, kind: "passkey", has_notes: true, has_password: false }];
+            for (let i = 0; i < ro.length; i++) {
+                root.selected = Object.assign({ username: "me", domain: "x.example", sites: [] }, ro[i]);
+                verify(root.selectedReadOnly());
+                root.notesLoaded = true; root.notesText = "body";
+                root.calls = [];
+                root.fieldAction("notes");                 // the second "show notes"
+                for (const k of ["editnotes", "edittags", "editsites", "edittotp", "change"])
+                    root.fieldAction(k);
+                compare(root.calls, ["load"], JSON.stringify(ro[i]));
+            }
+            root.selected = { username: "me", domain: "x.example", sites: [], has_notes: true, kind: "login" };
+            verify(!root.selectedReadOnly());
+            root.calls = [];
+            root.fieldAction("notes");
+            compare(root.calls, ["load+edit"]);
+        }
+        function test_wifi_tags_show_without_an_edit() {
+            root.notesLoaded = false;
+            root.selected = { is_wifi: true, username: "Home", domain: "AirPort", kind: "login",
+                              tags: ["home", "family"] };
+            const t = tagsRow(root.fieldRows());
+            verify(t !== undefined, "no Tags row for Wi-Fi");
+            compare(t.chips, ["home", "family"]);
+            compare(t.actions, []);
+            compare(t.key, "tags");
+            root.selected = { is_wifi: true, username: "Home", domain: "AirPort", kind: "login", tags: [] };
+            compare(tagsRow(root.fieldRows()), undefined);
+            compare(keys(root.fieldRows()), ["username", "password"]);
+        }
+    }
+}
+"""
+
+
+@unittest.skipUnless(QMLTESTRUNNER, "qmltestrunner (qt6-declarative) not installed")
+class FieldRowsRuntimeTests(unittest.TestCase):
+    """fieldRows, withoutEdits, selectedReadOnly and fieldAction from shell.qml, under Qt."""
+
+    def test_rows_and_actions(self):
+        funcs = "\n    ".join(function_text(n) for n in
+                              ("fieldRows", "withoutEdits", "allSites", "selectedReadOnly",
+                               "fieldAction"))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "tst_rows.qml")
+            with open(path, "w") as f:
+                f.write(ROWS_QML % {"functions": funcs})
+            env = {"PATH": "/usr/bin", "QT_QPA_PLATFORM": "offscreen", "HOME": d,
+                   "XDG_RUNTIME_DIR": d}
+            r = subprocess.run([QMLTESTRUNNER, "-input", path], capture_output=True, text=True,
+                               timeout=120, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for t in ("test_read_only_rows_never_open_an_editor", "test_wifi_tags_show_without_an_edit"):
+            self.assertIn(f"PASS   : qmltestrunner::Rows::{t}()", r.stdout)
 
 
 @unittest.skipUnless(QMLTESTRUNNER, "qmltestrunner (qt6-declarative) not installed")

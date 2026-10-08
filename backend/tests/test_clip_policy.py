@@ -50,6 +50,8 @@ class FakeCompositor:
         self.source = None
         self.device = None
         self.mimes = []
+        self.hold_sync = False
+        self.held = []
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self._next_server_id = 0xFF000000
@@ -96,6 +98,9 @@ class FakeCompositor:
             return
         if iface == "wl_display" and op == 0:            # sync
             cb = r.uint()
+            if self.hold_sync and self.source is not None:
+                self.held.append(cb)                     # a compositor slow to answer
+                return
             self._event(cb, 0, struct.pack("=I", 1))
             self._event(1, 1, struct.pack("=I", cb))
             return
@@ -176,6 +181,12 @@ class FakeCompositor:
     def cancel(self):
         self._event(self.source, 1)
 
+    def answer_held_syncs(self):
+        for cb in self.held:
+            self._event(cb, 0, struct.pack("=I", 1))
+            self._event(1, 1, struct.pack("=I", cb))
+        self.held = []
+
     def names(self):
         with self.lock:
             return [(i.split("_")[0], n, a) for i, n, a in self.requests]
@@ -223,8 +234,10 @@ class HolderTable:
 
 class ClipHarness:
     def __init__(self, test, value=b"hunter2-secret", sensitive=True, timeout=1.5, grace=0.4,
-                 managers=(EXT,), daemon=None):
+                 managers=(EXT,), daemon=None, hold_sync=False):
         self.fc = FakeCompositor(managers)
+        self.fc.hold_sync = hold_sync
+        self.offered = []
         test.addCleanup(self.fc.close)
         self.holders = HolderTable()
         conn = wayland.Connection(self.fc.client_sock)
@@ -237,7 +250,8 @@ class ClipHarness:
         self.fc.wait_selected()
 
     def _run(self, daemon):
-        self.result = clip.serve(self.dc, self.offer, daemon)
+        self.result = clip.serve(self.dc, self.offer, daemon,
+                                 on_offered=lambda: self.offered.append(time.monotonic()))
 
     def finish(self, timeout=5.0):
         self.thread.join(timeout)
@@ -463,6 +477,65 @@ class LifetimeTests(unittest.TestCase):
         self.assertEqual(bytes(o.value), b"\0\0\0")
 
 
+class OfferedReportTests(unittest.TestCase):
+    """The window says "copied" only on pear-clip's {"event": "offered"}: that waits for the
+    compositor to answer a sync sent after set_selection."""
+
+    def wait(self, pred, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not pred():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+    def test_offered_waits_for_the_compositor(self):
+        h = ClipHarness(self, timeout=5, hold_sync=True)
+        self.wait(lambda: h.fc.held)
+        time.sleep(0.2)
+        self.assertEqual(h.offered, [])                 # set_selection sent, not yet answered
+        self.assertFalse(h.offer.offered)
+        h.fc.answer_held_syncs()
+        self.wait(lambda: h.offered)
+        self.assertEqual(len(h.offered), 1)
+        self.assertEqual(h.paste({4242}), b"hunter2-secret")
+        self.assertEqual(h.finish(), "pasted")
+        self.assertEqual(len(h.offered), 1)
+
+    def test_a_paste_right_behind_the_answer_is_not_dropped(self):
+        h = ClipHarness(self, timeout=5, hold_sync=True)
+        self.wait(lambda: h.fc.held)
+        r, w = os.pipe()
+        h.holders.set(r, {4242})
+        with h.fc.lock:                                  # one write: answer and paste together
+            cb = h.fc.held.pop()
+            msg = (struct.pack("=II", cb, (12 << 16) | 0) + struct.pack("=I", 1)
+                   + struct.pack("=II", 1, (12 << 16) | 1) + struct.pack("=I", cb))
+            send = _string("text/plain;charset=utf-8")
+            msg += struct.pack("=II", h.fc.source, ((8 + len(send)) << 16) | 0) + send
+            h.fc.server.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                         array.array("i", [w]))])
+        os.close(w)
+        self.assertEqual(read_all(r), b"hunter2-secret")
+        self.assertEqual(h.finish(), "pasted")
+        self.assertEqual(len(h.offered), 1)
+
+    def test_no_answer_is_a_failure_never_offered(self):
+        with mock.patch.object(clip, "OFFER_CONFIRM_S", 0.3):
+            h = ClipHarness(self, timeout=5, hold_sync=True)
+            self.assertEqual(h.finish(), "failed")
+        self.assertEqual(h.offered, [])
+        self.assertEqual(h.offer.error, "the compositor did not answer")
+
+    def test_no_data_control_is_never_offered(self):
+        fc = FakeCompositor(managers=())
+        self.addCleanup(fc.close)
+        dc = wayland.DataControl(wayland.Connection(fc.client_sock))
+        offer = Offer(bytearray(b"x"), True, 5, HolderTable())
+        seen = []
+        self.assertEqual(clip.serve(dc, offer, None, on_offered=lambda: seen.append(1)), "failed")
+        self.assertEqual(seen, [])
+        self.assertIn("data-control", offer.error)
+
+
 class HintTests(unittest.TestCase):
     def test_sensitive_offers_the_hint_and_serves_secret(self):
         h = ClipHarness(self, sensitive=True, timeout=5)
@@ -615,6 +688,81 @@ class FakeDaemon:
 
 
 class RunTests(unittest.TestCase):
+    def start_run(self, d, fc, out, ticket="A" * 43):
+        """clip.run() against FakeDaemon `d` and FakeCompositor `fc`, in a thread."""
+        import io
+        wl_path = os.path.join(d.dir.name, "wayland-9")
+        lsn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        lsn.bind(wl_path)
+        lsn.listen(1)
+        self.addCleanup(lsn.close)
+
+        def bridge():
+            s, _ = lsn.accept()
+            fc.client_sock.close()
+            fc.server.close()
+            fc.server = s
+            fc.thread = threading.Thread(target=fc._loop, daemon=True)
+            fc.thread.start()
+        threading.Thread(target=bridge, daemon=True).start()
+        result = {}
+        t = threading.Thread(target=lambda: result.setdefault(
+            "rc", clip.run(io.StringIO(ticket + "\n"), d.path, wl_path, identify=HolderTable(),
+                           out=out)))
+        t.start()
+        return t, result
+
+    @staticmethod
+    def lines(out):
+        return [json.loads(x) for x in out.getvalue().splitlines()]
+
+    def test_stdout_says_offered_before_the_paste_then_the_outcome(self):
+        import io
+        d = FakeDaemon(self, timeout=5)
+        fc = FakeCompositor()
+        self.addCleanup(fc.close)
+        out = io.StringIO()
+        t, result = self.start_run(d, fc, out)
+        deadline = time.monotonic() + 5
+        while '"offered"' not in out.getvalue():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        self.assertEqual(self.lines(out), [{"event": "offered"}])     # nothing pasted yet
+        self.assertEqual(read_all(fc.paste()), b"hunter2-secret")
+        t.join(10)
+        self.assertEqual(result.get("rc"), 0)
+        self.assertEqual(self.lines(out), [{"event": "offered"},
+                                           {"event": "done", "outcome": "pasted"}])
+        self.assertNotIn("hunter2", out.getvalue())
+
+    def test_stdout_says_why_when_never_offered(self):
+        import io
+        d = FakeDaemon(self, timeout=5)
+        fc = FakeCompositor(managers=())
+        self.addCleanup(fc.close)
+        out = io.StringIO()
+        t, result = self.start_run(d, fc, out)
+        t.join(10)
+        self.assertEqual(result.get("rc"), 0)
+        lines = self.lines(out)
+        self.assertEqual([x["event"] for x in lines], ["error", "done"])
+        self.assertIn("data-control", lines[0]["reason"])
+        self.assertEqual(lines[1]["outcome"], "failed")
+        self.assertEqual([q["op"] for q in d.seen], ["hello", "redeem", "clip-result"])
+        self.assertNotIn("hunter2", out.getvalue())
+
+    def test_stdout_says_why_before_the_clipboard(self):
+        import io
+        out = io.StringIO()
+        self.assertEqual(clip.run(io.StringIO("bad\n"), "/nonexistent", "/x", out=out), 2)
+        out2 = io.StringIO()
+        self.assertEqual(clip.run(io.StringIO("A" * 43 + "\n"), "/nonexistent/sock", "/x",
+                                  out=out2), 3)
+        for o in (out, out2):
+            lines = self.lines(o)
+            self.assertEqual([x["event"] for x in lines], ["error"])
+            self.assertTrue(lines[0]["reason"])
+
     def test_end_to_end_with_ticket_on_stdin(self):
         import io
         d = FakeDaemon(self, timeout=5)

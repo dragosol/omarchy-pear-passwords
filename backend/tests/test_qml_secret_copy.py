@@ -124,7 +124,24 @@ class SourceTests(unittest.TestCase):
     def test_the_clip_outcome_names_a_selection(self):
         # copy-text tickets carry field "text"; its clip event must not read "Username pasted".
         self.assertIn('field === "text" ? "Selection"', function_text("clipWords"))
-        self.assertIn('"Selection copied — clears after one paste or "', function_text("copyText"))
+        self.assertIn('clipComponent.createObject(root, { ticket: d.ticket, words: "Selection", running: true });',
+                      function_text("copyText"))
+
+    def test_copied_is_said_only_after_offered(self):
+        # The VM: the toast said "copied" while pear-exec had refused the clip role and nothing
+        # was on the clipboard. Only pear-clip's {"event":"offered"} line may say it.
+        self.assertEqual(CODE.count('" copied — clears after one paste or "'), 1)
+        for fn in ("copyField", "copyText"):
+            self.assertNotIn("copied", function_text(fn), fn)
+        comp = element_of("clipComponent")
+        offered = comp[comp.index('if (m.event === "offered" && !clipProc.failed && !clipProc.offered) {'):]
+        offered = offered[:offered.index("} else if")]
+        self.assertIn('root.showFlash(clipProc.words + " copied — clears after one paste or "', offered)
+        # An error line, or an exit before "offered", is a failure toast with its reason.
+        self.assertIn('} else if (m.event === "error") {', comp)
+        self.assertIn("onExited: function (code) {\n                clipProc.fail(", comp)
+        self.assertIn("if (clipProc.offered || clipProc.failed) return;", comp)
+        self.assertIn('root.showFlash("Couldn\'t copy — " + reason);', function_text("clipFailed"))
 
     def test_the_guard_swallows_copy_and_cut(self):
         fn = function_text("guardSecretKeys")
