@@ -12,8 +12,10 @@ the things that must be decided in exactly one place:
   and a running sign-in, and wipes the store's keys - synchronously, so a PrepareForSleep
   handler can release its inhibitor knowing nothing is left.
 - run_store(): blocking UserStore and Apple calls go to a worker thread under the uid's store
-  lock. A lock that lands while such a call runs wipes the keys at once and again when the call
-  returns, so a sync finishing late cannot leave them in memory.
+  lock. A lock that lands while such a call runs marks the uid locked at once; the store's own
+  mutex makes the key wipe wait for the store method in progress (never a half-applied sync or
+  a meta.v2 sealed from a wiped doc), and run_store wipes again when the call returns, so a
+  sync finishing late cannot leave the keys in memory.
 """
 
 from __future__ import annotations

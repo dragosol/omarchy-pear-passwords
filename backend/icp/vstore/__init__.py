@@ -114,9 +114,11 @@ class SyncItem:
 # The implementation modules import the exceptions and dataclasses above, so they come in only
 # once those exist.
 import datetime as _dt  # noqa: E402
+import functools as _functools  # noqa: E402
 import hmac as _hmac  # noqa: E402
 import logging as _logging  # noqa: E402
 import os as _os  # noqa: E402
+import threading as _threading  # noqa: E402
 import time as _time  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 
@@ -135,8 +137,21 @@ _TIERS = ("list", "secret")
 _KEYS_FORMAT = 2
 
 
+def _serialized(fn):
+    """Run the method under the store's own mutex. The daemon calls the store from a worker
+    thread (run_store) and lock() from the event loop; without this a lock landing mid-call
+    wiped the keys under a running apply_sync, leaving a half-applied sync or an encrypted
+    `null` written over meta.v2. lock() now waits for the call in progress to finish."""
+    @_functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._mx:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class UserStore:
-    """One uid's v2 store. Not thread-safe: the daemon serializes calls per uid."""
+    """One uid's v2 store. Every method that reads or writes keys or meta holds the store's
+    mutex, so lock() never interleaves with a call in progress."""
 
     unseal_count: int
     """How many times SK_secret was unsealed by this object. A test hook: sync must leave it 0."""
@@ -153,6 +168,7 @@ class UserStore:
         self._doc: dict | None = None
         self._nick: dict | None = None
         self._fail: str | None = None
+        self._mx = _threading.RLock()
 
     def __repr__(self) -> str:
         return f"<UserStore u{self.uid} {self.state()}>"
@@ -265,6 +281,7 @@ class UserStore:
                 "synced_at": self._doc.get("synced_at") if unlocked else None,
                 "needs_login": bool(self._doc.get("needs_login")) if unlocked else None}
 
+    @_serialized
     def unlock(self) -> None:
         """Unseal RK_list, derive the subkeys, load meta. Raises SealError. Deletes any
         keys/*.prev left by an earlier re-seal once this unlock has succeeded."""
@@ -297,6 +314,7 @@ class UserStore:
         self._fail = None
         self._drop_prev()
 
+    @_serialized
     def lock(self) -> None:
         """Wipe RK_list, every subkey, the plaintext meta and any cached session. Idempotent.
         There is no partial lock: 2.0 has no sync lease."""
@@ -306,6 +324,7 @@ class UserStore:
         self._rk = self._sub = self._pk = None
         self._doc = self._nick = None
 
+    @_serialized
     def reseal_if_tpm_available(self) -> bool:
         """After a successful unlock: if a TPM2 is present and keys.json says "host", re-seal
         both key blobs with host+tpm2, verify the new blobs, keep the old ones as *.prev, and
@@ -363,6 +382,7 @@ class UserStore:
         return True
 
     # --- tier 1: metadata ---------------------------------------------------------------------
+    @_serialized
     def list_meta(self) -> list[Meta]:
         """Every live entry's Meta. Raises StoreLocked."""
         self._need_unlocked()
@@ -370,11 +390,13 @@ class UserStore:
         out.sort(key=lambda m: (m.title.lower(), m.username.lower(), m.id))
         return out
 
+    @_serialized
     def get_meta(self, id: str) -> Meta:
         """One live entry's Meta. Raises StoreLocked or EntryNotFound."""
         self._need_unlocked()
         return _meta.to_meta(id, self._live(id), self._nick.get(id, ""))
 
+    @_serialized
     def set_sync_status(self, *, synced_at: float | None = None,
                         needs_login: bool | None = None) -> None:
         """Record the outcome of a sync (fields left None are unchanged). Raises StoreLocked."""
@@ -386,6 +408,7 @@ class UserStore:
         self._write_meta()
 
     # --- tier 2: one entry ---------------------------------------------------------------------
+    @_serialized
     def open_entry(self, id: str) -> Secrets:
         """Unseal SK_secret, open entries/<id>.box, check the id inside it, wipe SK_secret at
         once, and return the plaintext. Increments unseal_count. The caller owns the result
@@ -403,6 +426,7 @@ class UserStore:
             sk.wipe()
         return _entries.from_payload(payload)
 
+    @_serialized
     def history(self, id: str) -> list[tuple[str, str]]:
         """Earlier values of the entry's password, newest first, as (iso8601 date, value):
         the local history boxes merged with Apple's own history. Unseals SK_secret like
@@ -424,6 +448,7 @@ class UserStore:
             sk.wipe()
         return _merge_history(local, current.get("apple_history") or [])
 
+    @_serialized
     def set_secrets(self, id: str, s: Secrets) -> None:
         """Replace one entry's secrets after a successful iCloud push: move the old box into
         history/<id>/ without decrypting it, seal the new one to PK_secret, update pwmac and
@@ -436,6 +461,7 @@ class UserStore:
         self._write_meta()
 
     # --- sync ----------------------------------------------------------------------------------
+    @_serialized
     def apply_sync(self, items: Iterable[SyncItem], deleted: set[str]) -> dict:
         """Upsert what iCloud returned, using PK_secret and pwmac only.
 
@@ -471,12 +497,18 @@ class UserStore:
                 self._replace_secrets(it.id, rec, it.secrets, source="local", when=now)
                 counts["added"] += 1
                 continue
+            hist_before = tuple(h.get("n") for h in rec.get("hist") or [])
             touched = self._replace_secrets(it.id, rec, it.secrets, source="local", when=now)
             if touched or not _meta.same_fields(rec, fields):
                 rec.update(fields)
                 counts["changed"] += 1
             else:
                 counts["unchanged"] += 1
+            if tuple(h.get("n") for h in rec.get("hist") or []) != hist_before:
+                # A box moved into history: record it now, so a crash before the end of the
+                # sync cannot leave a history box meta does not know (and a stale pwmac that
+                # would file the current password as history on the next sync).
+                self._write_meta()
         for id in gone:
             rec = entries.get(id) if isinstance(id, str) else None
             if rec is not None and not rec.get("deleted"):
@@ -485,6 +517,7 @@ class UserStore:
         self._write_meta()
         return counts
 
+    @_serialized
     def pwmac_matches(self, texts: list[str]) -> list[int]:
         """Indexes of `texts` whose HMAC(K_pwmac, text) equals some entry's current pwmac.
         Used by clip-history-check; compares MACs only, no SK. Raises StoreLocked."""
@@ -495,30 +528,36 @@ class UserStore:
                 if isinstance(t, str) and _keys.pwmac(k, t) in known]
 
     # --- session, aliases, nicknames (tier 1 subkeys) -------------------------------------------
+    @_serialized
     def load_session(self) -> dict:
         """The former session.enc contents ({} when signed out). Raises StoreLocked."""
         self._need_unlocked()
         return _ss.load_session(self._dir, self._sub["session"], self.uid)
 
+    @_serialized
     def save_session(self, d: dict) -> None:
         """Replace session.v2. An empty dict removes it (sign-out). Raises StoreLocked."""
         self._need_unlocked()
         _ss.save_session(self._dir, self._sub["session"], self.uid, d)
 
+    @_serialized
     def load_aliases(self) -> list[dict]:
         """Hide My Email aliases as plain dicts. Raises StoreLocked."""
         self._need_unlocked()
         return _ss.load_aliases(self._dir, self._sub["aliases"], self.uid)
 
+    @_serialized
     def save_aliases(self, aliases: list[dict]) -> None:
         self._need_unlocked()
         _ss.save_aliases(self._dir, self._sub["aliases"], self.uid, aliases)
 
+    @_serialized
     def load_nicknames(self) -> dict[str, str]:
         """Local nicknames by entry id. Raises StoreLocked."""
         self._need_unlocked()
         return dict(self._nick)
 
+    @_serialized
     def save_nicknames(self, names: dict[str, str]) -> None:
         self._need_unlocked()
         _ss.save_nicknames(self._dir, self._sub["nicknames"], self.uid, names)
@@ -528,6 +567,7 @@ class UserStore:
         """device.json (plaintext 0600, the Apple device identity - not a key). {} if absent."""
         return _ss.load_device(self._dir)
 
+    @_serialized
     def save_device(self, d: dict) -> None:
         _fmt.ensure_dir(self._dir)
         _ss.save_device(self._dir, d)
@@ -540,12 +580,14 @@ class UserStore:
         Works while locked."""
         return _ss.load_settings(self._dir)
 
+    @_serialized
     def save_settings(self, d: dict) -> None:
         """Validated by the caller; written as given."""
         _fmt.ensure_dir(self._dir)
         _ss.save_settings(self._dir, d)
 
     # --- migration from 1.x --------------------------------------------------------------------
+    @_serialized
     def import_v1(self, files: dict[str, bytes], key: bytes) -> dict:
         """Convert a v1 vault (protocol.IMPORT_FILES contents, keyed by file name) opened with
         the 32-byte v1 key into this store.
@@ -599,8 +641,12 @@ class UserStore:
         _fmt.atomic_write(self._keys_dir() / _paths.KEYS_JSON, _fmt.dumps(d))
 
     def _write_meta(self) -> None:
-        _fmt.write_sealed(self._dir, _paths.META_FILE, bytes(self._sub["meta"]),
-                          _fmt.KIND_META, self.uid, self._doc)
+        # Take both at once: never seal a None doc (an encrypted `null` would replace meta.v2).
+        sub, doc = self._sub, self._doc
+        if sub is None or doc is None:
+            raise StoreLocked("the store was locked")
+        _fmt.write_sealed(self._dir, _paths.META_FILE, bytes(sub["meta"]),
+                          _fmt.KIND_META, self.uid, doc)
 
     def _verify_blob(self, backend, tier: str, blob, want) -> None:
         if blob is None:

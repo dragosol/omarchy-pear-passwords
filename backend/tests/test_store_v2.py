@@ -445,3 +445,63 @@ class SourceRuleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LockRaceTests(StoreCase):
+    """crypto-lock-race-corrupts-meta / function-lock-races-apply-sync: Registry.lock() runs on
+    the event loop while a worker thread is inside a store call."""
+
+    def test_lock_waits_for_a_running_apply_sync(self):
+        import threading
+        import time
+        from unittest import mock
+        from icp.vstore import entries as E
+        a, b = item("a.example.test", "me", "OLD-a"), item("b.example.test", "me", "b1")
+        s = vstore.UserStore.create(UID)
+        s.apply_sync([a, b], set())
+        started, proceed = threading.Event(), threading.Event()
+        real = E.EntryFiles.write
+
+        def write(files, id, blob):
+            real(files, id, blob)
+            if id == a.id:
+                started.set()
+                proceed.wait(5)
+        errors = []
+
+        def sync():
+            try:
+                s.apply_sync([item("a.example.test", "me", "NEW-a"),
+                              item("b.example.test", "me", "b2")], set())
+            except Exception as e:                       # noqa: BLE001
+                errors.append(e)
+        with mock.patch.object(E.EntryFiles, "write", write):
+            worker = threading.Thread(target=sync)
+            worker.start()
+            self.assertTrue(started.wait(5))
+            locker = threading.Thread(target=s.lock)     # what Registry.lock() does
+            locker.start()
+            time.sleep(0.2)
+            self.assertTrue(locker.is_alive(), "lock() wiped the keys under a running sync")
+            proceed.set()
+            worker.join(5)
+            locker.join(5)
+        self.assertEqual(errors, [])
+        self.assertEqual(s.state(), "locked")
+        s2 = vstore.UserStore.open(UID)
+        s2.unlock()
+        self.assertEqual(s2.open_entry(a.id).password, "NEW-a")
+        self.assertEqual([v for _, v, *_ in s2.history(a.id)], ["OLD-a"])
+        self.assertEqual(s2.open_entry(b.id).password, "b2")
+
+    def test_meta_is_never_sealed_as_null(self):
+        s = self.populated(1)
+        before = (self.udir / "meta.v2").read_bytes()
+        s._doc = None                       # the doc already wiped, the meta key not yet
+        with self.assertRaises(vstore.StoreLocked):
+            s._write_meta()
+        self.assertEqual((self.udir / "meta.v2").read_bytes(), before)
+        s.lock()
+        s2 = vstore.UserStore.open(UID)
+        s2.unlock()
+        self.assertEqual(len(s2.list_meta()), 1)
