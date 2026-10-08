@@ -406,6 +406,19 @@ class ShapeTests(unittest.TestCase):
         self.assertEqual(_leaks(shape, PK_KEY), [])
         self.assertNotIn("v_Data", items[3])
 
+    def test_string_values_inside_a_metadata_blob_never_show(self):
+        # Apple's blobs hold plist strings as well as data, and short ones look like names
+        # ("Bank", an account): only the blob's own top-level names may come out.
+        blob = {"title": "Bank", "acct": "kim", "totp": {"secret": "JBSWY3DP"}, "n": 3}
+        items = [{"class": "inet", "agrp": "com.apple.password-manager", "srvr": "bank.example",
+                  "acct": "kim", "v_Data": plistlib.dumps(blob, fmt=plistlib.FMT_BINARY)}]
+        shape = host.strip_and_shape(items)
+        slot = shape[("inet", "com.apple.password-manager")]
+        self.assertEqual(slot["inner_keys"], {"title", "acct", "totp", "n"})
+        self.assertEqual(slot["keys"], {"class", "agrp", "srvr", "acct", "v_Data"})
+        for value in ("Bank", "kim", "JBSWY3DP", "bank.example"):
+            self.assertNotIn(value, repr(shape))
+
     def test_from_items_exposes_it(self):
         store = CredentialStore.from_items([_login("a.example", "me", "pw")])
         self.assertEqual(store.item_shape[("inet", "com.apple.cfnetwork")]["count"], 1)
