@@ -227,6 +227,38 @@ class LifecycleTests(StoreCase):
             self.assertEqual(moved.read_bytes(), data, rel)
 
 
+    def _aside(self):
+        return [d for d in os.listdir(self.root) if d.startswith(f"u{UID}.broken-")]
+
+    def test_reset_deletes_a_store_that_keeps_nothing_when_asked(self):
+        # Round 2 gate, bug 3: every start-over of an import left another u<uid>.broken-<ts>
+        # holding only key wrappers.
+        vstore.UserStore.create(UID).lock()
+        fresh = vstore.UserStore.reset(UID, discard_empty=True)
+        self.assertEqual(fresh.state(), "unlocked")
+        self.assertEqual(self._aside(), [])
+        fresh.lock()
+        vstore.UserStore.reset(UID, discard_empty=True)
+        self.assertEqual(self._aside(), [])
+
+    def test_reset_keeps_a_store_that_keeps_nothing_by_default(self):
+        # After tpm-cleared or damaged the daemon never asks: the files stay for diagnosis.
+        vstore.UserStore.create(UID).lock()
+        vstore.UserStore.reset(UID)
+        self.assertEqual(len(self._aside()), 1)
+
+    def test_reset_never_deletes_a_store_that_keeps_something(self):
+        s = self.populated()
+        old = self.snapshot()
+        s.lock()
+        vstore.UserStore.reset(UID, discard_empty=True)
+        aside = self._aside()
+        self.assertEqual(len(aside), 1)
+        for rel, data in old.items():
+            moved = self.root / rel.replace(f"u{UID}", aside[0], 1)
+            self.assertEqual(moved.read_bytes(), data, rel)
+
+
 class HoldsNothingTests(StoreCase):
     """Round 2 audit, problem 3: migrate-begin may replace a store only when it keeps
     nothing anyone could lose, and that has to be known without a key."""

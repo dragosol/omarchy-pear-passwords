@@ -39,7 +39,7 @@ class VstoreShapeTests(unittest.TestCase):
 
     def test_user_store_methods(self):
         expected = {
-            "open": ["uid"], "create": ["uid"], "reset": ["uid"],
+            "open": ["uid"], "create": ["uid"], "reset": ["uid", "discard_empty"],
             "state": [], "status": [], "unlock": [], "lock": [],
             "reseal_if_tpm_available": [], "tpm_move_state": [], "list_meta": [],
             "get_meta": ["id"],

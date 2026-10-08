@@ -278,12 +278,19 @@ class UserStore:
         return None
 
     @classmethod
-    def reset(cls, uid: int) -> "UserStore":
+    def reset(cls, uid: int, discard_empty: bool = False) -> "UserStore":
         """The "Start over" button after tpm-cleared or damaged: rename u<uid> to
         u<uid>.broken-<unix time> (never delete - the files are kept for diagnosis), then
-        create() a fresh store. Returns it unlocked."""
+        create() a fresh store. Returns it unlocked.
+
+        With discard_empty (the daemon passes it only for a store that opens normally, never
+        after tpm-cleared or damaged), a store that keeps nothing (_keeps_nothing: only key
+        wrappers and settings, as an abandoned 1.x import or a store never signed in leaves)
+        is deleted once it has been renamed: there is nothing in it to diagnose, and every
+        "start over" of an import used to leave another copy behind (round 2 gate, bug 3)."""
         d = _paths.user_dir(uid)
         if _os.path.lexists(d):
+            empty = discard_empty and not _os.path.islink(d) and _keeps_nothing(d)
             aside = _paths.user_aside_dir(uid, "broken", _time.time())
             n = 1
             while _os.path.lexists(aside):
@@ -291,7 +298,14 @@ class UserStore:
                 n += 1
             _os.rename(d, aside)
             _fmt.fsync_dir(d.parent)
-            _log.warning("u%d: store moved aside to %s for diagnosis", uid, aside.name)
+            if empty:
+                try:
+                    _remove_tree(aside)
+                    _log.info("u%d: the old store held nothing; removed", uid)
+                except (OSError, StoreError):
+                    _log.warning("u%d: could not remove %s; kept", uid, aside.name)
+            else:
+                _log.warning("u%d: store moved aside to %s for diagnosis", uid, aside.name)
         return cls.create(uid)
 
     def state(self) -> StoreState:
@@ -310,19 +324,7 @@ class UserStore:
         never signed in) may be replaced by a migrate-begin without a dead end."""
         if not self._has_keys():
             return True
-        for name in (_paths.SESSION_FILE, _paths.ALIASES_FILE, _paths.NICKNAMES_FILE):
-            if _os.path.lexists(self._dir / name):
-                return False
-        for sub in (_paths.ENTRIES_DIR, _paths.HISTORY_DIR):
-            try:
-                with _os.scandir(self._dir / sub) as it:
-                    if any(True for _ in it):
-                        return False
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return False              # cannot tell: treat it as holding something
-        return True
+        return _keeps_nothing(self._dir)
 
     def status(self) -> dict:
         """What hello reports: {state, signed_in, sealed_with, synced_at, needs_login}.
@@ -986,6 +988,25 @@ class UserStore:
         rec.update({"v": v, "pwmac": pwm, "smac": sm, "apple_n": len(s.apple_history or []),
                     "has_totp": bool(s.totp_secret), "has_notes": bool(s.notes)})
         return True
+
+
+def _keeps_nothing(d) -> bool:
+    """No entry or history box, no iCloud session, no aliases and no nicknames under the
+    store directory d, read without a key. False when it cannot tell."""
+    d = _Path(d)
+    for name in (_paths.SESSION_FILE, _paths.ALIASES_FILE, _paths.NICKNAMES_FILE):
+        if _os.path.lexists(d / name):
+            return False
+    for sub in (_paths.ENTRIES_DIR, _paths.HISTORY_DIR):
+        try:
+            with _os.scandir(d / sub) as it:
+                if any(True for _ in it):
+                    return False
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False                  # cannot tell: treat it as holding something
+    return True
 
 
 def _remove_tree(path) -> None:

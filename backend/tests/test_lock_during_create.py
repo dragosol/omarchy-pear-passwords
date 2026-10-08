@@ -35,10 +35,10 @@ class _Gate:
         orig = getattr(FakeStore, name).__func__
         gate = self
 
-        def slow(cls, uid):
+        def slow(cls, uid, **kw):
             gate.started.set()
             gate.proceed.wait(10)
-            return orig(cls, uid)
+            return orig(cls, uid, **kw)
         return mock.patch.object(FakeStore, name, classmethod(slow))
 
 

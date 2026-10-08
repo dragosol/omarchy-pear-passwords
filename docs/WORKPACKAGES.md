@@ -132,7 +132,8 @@ only `tpm_move_state()`; `reseal_if_tpm_available()` runs on the `tpm-move` op, 
 state and the `unlock` refusal reason. `open_entry` is called once per grant and the result is
 kept only for the grant. Migration: `migrate-begin` calls `UserStore.create(uid)`; `import-key`
 uses `v1_key_opens` / `v1_key_from_passphrase`; `import-commit` calls `store.import_v1(files,
-key)`. `reset` calls `UserStore.reset(uid)`. Settings live in `load_settings` /
+key)`. `reset` calls `UserStore.reset(uid, discard_empty)` (true only for a store that opens
+normally: one that keeps nothing is then deleted instead of moved aside). Settings live in `load_settings` /
 `save_settings`.
 
 ### 4.4 WP4 roles and pear-exec

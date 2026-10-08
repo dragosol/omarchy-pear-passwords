@@ -67,6 +67,7 @@ class FakeStore:
     def reset_all(cls):
         cls.instances = {}
         cls.blocked_reason = None
+        cls.resets = []
 
     @classmethod
     def open(cls, uid):
@@ -90,8 +91,11 @@ class FakeStore:
         st.calls.append("create")
         return st
 
+    resets: list = []                  # discard_empty of every reset(), in order
+
     @classmethod
-    def reset(cls, uid):
+    def reset(cls, uid, discard_empty=False):
+        cls.resets.append(discard_empty)
         old = cls.open(uid)
         new = cls(uid)
         new.settings = dict(old.settings)

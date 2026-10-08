@@ -363,6 +363,7 @@ class MigrationTests(Base):
         self.assertEqual(r, {"rid": self.ui.rid, "state": "empty"})
         self.assertEqual(self.dialogs()[self.dialogs_before:], [paths.ACTION_MANAGE])
         self.assertIn("reset", self.h.store().calls)
+        self.assertEqual(FakeStore.resets[-1], True)
         self.assertNotIn("migration_pending", self.h.store().settings)
         r = await self.ui.call("signin", mode="login")
         self.assertNotEqual(r.get("error"), "migration-pending")
@@ -391,11 +392,15 @@ class MigrationTests(Base):
         self.assertIsNotNone(m)
         self.assertIn("reset", self.h.store().calls)
         self.assertEqual(self.dialogs(), [paths.ACTION_MANAGE])
+        # It opens normally and keeps nothing: deleted, not one more u<uid>.broken-<time>
+        # (round 2 gate, bug 3).
+        self.assertEqual(FakeStore.resets, [True])
 
     async def test_a_store_that_holds_nothing_can_be_reset(self):
         self.h.seed(n=0, signed_in=False)
         r = await self.ui.call("reset")
         self.assertEqual(r, {"rid": self.ui.rid, "state": "empty"})
+        self.assertEqual(FakeStore.resets, [True])
 
     async def test_a_signed_in_store_without_entries_is_not_replaced(self):
         self.h.seed(n=0, signed_in=True)
@@ -630,6 +635,13 @@ class ResetTests(Base):
         self.assertIn("reset", self.h.store().calls)
         self.assertTrue(self.h.reg.get(UID).unlocked())
         self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK, paths.ACTION_MANAGE])
+        self.assertEqual(FakeStore.resets, [False])     # damaged: always kept for diagnosis
+
+    async def test_a_tpm_cleared_store_is_kept_even_when_it_holds_nothing(self):
+        st = self.h.store()
+        st.exists, st.keys, st.recorded_state = True, False, "tpm-cleared"
+        self.assertEqual((await self.ui.call("reset"))["state"], "empty")
+        self.assertEqual(FakeStore.resets, [False])
 
 
 class AutofillDispatchTests(Base):

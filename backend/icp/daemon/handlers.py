@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import functools
 import hashlib
 import logging
 import math
@@ -963,7 +964,10 @@ async def op_migrate_begin(reg, conn, req):
         raise OpError("cancelled")
     if s.unlocked():
         reg.lock(conn.uid, None, notify=False)
-    make = reg.store_cls.reset if retry else reg.store_cls.create
+    # A retry replaces a store that opens normally and keeps nothing: it is deleted, not
+    # kept as another u<uid>.broken-<time> (round 2 gate, bug 3).
+    make = (functools.partial(reg.store_cls.reset, discard_empty=state in OPENS) if retry
+            else reg.store_cls.create)
     epoch = await _replace_store(reg, s, conn, make)
     s.migrating = True
     try:
@@ -994,6 +998,11 @@ async def op_migrate_abandon(reg, conn, req):
     await _save_setting_keys(reg, s, migration_pending=None)
     logger.info("uid %d: the unfinished 1.x import was abandoned", conn.uid)
     return {"migration_pending": False}
+
+
+# States of a store that opens normally: only such a store, when it keeps nothing, is deleted
+# rather than moved aside by a reset.
+OPENS = ("locked", "unlocked")
 
 
 async def _refuse_certain_seal_refusal(reg, uid: int) -> None:
@@ -1072,10 +1081,14 @@ async def op_reset(reg, conn, req):
         raise OpError("cancelled")
     if not await _resettable(reg, s):
         raise OpError("not-locked")
+    # Only a store that opens normally (an import never committed, or one that keeps nothing)
+    # may be deleted when it keeps nothing; after tpm-cleared or damaged it is always kept.
+    discard = await _store(reg, conn.uid, s.store.state) in OPENS
     reg.lock(conn.uid, None, notify=False)
     reg.withdraw(conn.uid, roles=("migrate",))
     s.migrating = False
-    epoch = await _replace_store(reg, s, conn, reg.store_cls.reset)
+    epoch = await _replace_store(reg, s, conn,
+                                 functools.partial(reg.store_cls.reset, discard_empty=discard))
     try:
         await _save_setting_keys(reg, s, migration_pending=None)
     except OpError:
