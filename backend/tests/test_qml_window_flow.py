@@ -220,8 +220,11 @@ DRIVER = r'''
                 check(!clipCountdown.visible, "a countdown before offered");
                 waitFor(function () { return root.flash === "Selection copied — clears after one paste or 30 s"; },
                         10000, "the copied toast after offered (flash: " + root.flash + ")");
-                // The status bar counts the live offer down until pear-clip's "done".
-                check(clipCountdown.visible && /^Selection on clipboard · (30|29) s$/.test(clipCountdown.text),
+                // The toast holds the status bar's slot; once it goes, the countdown of the
+                // live offer takes it until pear-clip's "done".
+                check(!clipCountdown.visible, "the countdown over the copied toast");
+                root.flash = "";
+                check(clipCountdown.visible && /^Selection on clipboard · (30|29|28) s$/.test(clipCountdown.text),
                       "no countdown while offered: " + clipCountdown.visible + " " + clipCountdown.text);
                 waitFor(function () { return root.flash.indexOf("Selection pasted") === 0; }, 10000,
                         "the clip event for the selection (flash: " + root.flash + ")");

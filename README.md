@@ -116,7 +116,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "1303a1fec2d9bbe4f403e6b2c278164096908a6b58b672c67e28572a9b9ea78d  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "0b3f854a2e545dd5bde875cb776651275cf741e470c7b5a1c961b20937852a00  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -316,8 +316,10 @@ What to know before you turn it on:
   copy nothing at all.
 - Pear gives the copy only to a reader it can identify: a program of yours whose open files
   it can see, or the compositor's X11 bridge, which reads for X11 (XWayland) apps such as
-  Steam, JetBrains IDEs or Wine, so pasting into those works too. Pear cannot tell which X11
-  app asked, so the bridge counts as one reader. Refused, without using up the paste:
+  Steam, JetBrains IDEs or Wine, so pasting into those works too on Hyprland. Pear cannot
+  tell which X11 app asked, so the bridge counts as one reader and gets the copy exactly
+  once. (A compositor started with file capabilities, such as Arch's sway, hides its open
+  files, so X11 pastes are refused there.) Refused, without using up the paste:
   clipboard-history watchers, a reader nobody can identify, and non-dumpable programs (as
   some security-minded apps are), Pear's own window included. So a copied password cannot
   be pasted back into Pear itself, or into such a program.

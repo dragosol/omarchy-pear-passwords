@@ -69,7 +69,7 @@ ShellRoot {
     // The importer reports the 1.x extension's id when it found that extension's old
     // connection file; the command then needs only to be pasted. It is never run for you.
     readonly property string registerCommand:
-        "pear-passwords-autofill register --browser zen --extension-id "
+        "pear-passwords-autofill register --browser zen \\\n    --extension-id "
         + (/^\{[0-9a-f-]{36}\}$/.test(root.migrateResult.extension_id || "")
            ? "'" + root.migrateResult.extension_id + "'" : "<your extension's id>")
     readonly property var legacyUnits: ["icp-host.service", "icp-sync.timer", "icp-sync.service",
@@ -3275,6 +3275,7 @@ ShellRoot {
                         Text {
                             textFormat: Text.PlainText
                             Layout.fillWidth: true
+                            visible: !clipCountdown.visible
                             text: root.flash ? root.flash
                                 : root.status ? root.status
                                 : !root.appUnlocked ? "locked"
@@ -3287,16 +3288,18 @@ ShellRoot {
                             opacity: root.appUnlocked || root.flash ? 1 : 0.45
                         }
                         // The live clipboard offer and how long it stays: "Password on clipboard · 27 s".
+                        // It takes the main slot rather than a slot of its own (a narrow window has
+                        // no room for both), once the "copied" toast, which says the same, is gone.
                         Text {
                             id: clipCountdown
                             textFormat: Text.PlainText
-                            visible: root.clipLive
-                            Layout.maximumWidth: 260
+                            visible: root.clipLive && !root.flash
+                            Layout.fillWidth: true
                             text: root.clipLabel + " on clipboard · " + root.clipLeft + " s"
                             color: Theme.accent
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fSmall
-                            elide: Text.ElideRight
+                            elide: Text.ElideLeft
                         }
                         // The one open account and how long it stays open: "GitHub open 1:58".
                         Text {
@@ -4729,7 +4732,7 @@ ShellRoot {
                                 textFormat: TextEdit.PlainText
                                 readOnly: true
                                 selectByMouse: true
-                                wrapMode: TextEdit.WrapAnywhere
+                                wrapMode: TextEdit.WrapAtWordBoundaryOrAnywhere
                                 text: root.registerCommand
                                 color: Theme.fg
                                 selectionColor: Theme.selected
@@ -5153,7 +5156,7 @@ ShellRoot {
                             textFormat: TextEdit.PlainText
                             readOnly: true
                             selectByMouse: true
-                            wrapMode: TextEdit.WrapAnywhere
+                            wrapMode: TextEdit.WrapAtWordBoundaryOrAnywhere
                             text: root.registerCommand
                             color: Theme.fg
                             selectionColor: Theme.selected

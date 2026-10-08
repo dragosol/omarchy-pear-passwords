@@ -390,7 +390,11 @@ class ClipCountdownSourceTests(unittest.TestCase):
         item = element_of("clipCountdown")
         self.assertIn("textFormat: Text.PlainText", item)
         self.assertIn('text: root.clipLabel + " on clipboard · " + root.clipLeft + " s"', item)
-        self.assertIn("visible: root.clipLive", item)
+        self.assertIn("visible: root.clipLive && !root.flash", item)
+        # It shares the main slot: the count/toast Text gives way to it, so the bar never
+        # carries both (x-audit #1: at 960 px the count shrank to "4 of 4…").
+        self.assertIn("Layout.fillWidth: true", item)
+        self.assertIn("visible: !clipCountdown.visible", CODE)
         self.assertNotRegex(item, r"TapHandler|MouseArea|onClicked")
         self.assertIn("(root.settings.clip_timeout_s || 30) * 1000", function_text("clipOffered"))
 
@@ -409,6 +413,7 @@ Item {{
     id: root
     width: 400; height: 40
     property var settings: ({{ clip_timeout_s: 5 }})
+    property string flash: ""
     {clip_countdown_block()}
     QtObject {{ id: first }}
     QtObject {{ id: second }}
@@ -441,6 +446,13 @@ Item {{
             verify(clipCountdown.visible);
             root.clipDone(first);
             verify(!clipCountdown.visible);
+            // A toast takes the slot while it shows; the countdown comes back after it.
+            root.clipOffered(second, "Password");
+            root.flash = "Password copied";
+            verify(!clipCountdown.visible);
+            root.flash = "";
+            verify(clipCountdown.visible);
+            root.clipDone(second);
         }}
     }}
 }}
