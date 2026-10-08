@@ -432,6 +432,26 @@ def test_raw_seed_bytes_are_kept_and_duplicates_collapse_to_the_newest():
     assert items.to_sync_item(older).secrets.totp_secret == raw
 
 
+def test_duplicates_keep_the_older_items_seed_notes_and_sites():
+    # function-duplicate-collapse-drops-totp-notes: the older item held the only seed and the
+    # recovery codes; collapsing to the newest must not drop them.
+    raw = b"\x02" * 20
+    older = _cred("x.com", "a", "p1", mdat=1.0, totp={"secret": raw}, notes="recovery codes",
+                  sites=("login.x.com",))
+    newer = _cred("x.com", "a", "p2", mdat=2.0)
+    got = items.to_sync_items([older, newer])
+    assert len(got) == 1
+    s, m = got[0].secrets, got[0].meta
+    assert s.password == "p2" and s.notes == "recovery codes" and s.totp_secret == raw
+    assert m.has_totp and m.has_notes and m.sites == ["login.x.com"]
+    # a second, different seed is kept too, in the notes
+    other = _cred("x.com", "a", "p0", mdat=0.5, totp={"secret": b"\x03" * 20})
+    got = items.to_sync_items([older, newer, other])
+    assert got[0].secrets.totp_secret == raw
+    assert "otpauth://totp/?secret=" in got[0].secrets.notes
+    assert "recovery codes" in got[0].secrets.notes
+
+
 # --------------------------------------------------------------------------- edits
 
 @pytest.fixture

@@ -223,6 +223,47 @@ def _split_account(key: str) -> tuple[str, str]:
     return domain, username
 
 
+def merge_duplicate(kept: tuple[Meta, Secrets], dropped: tuple[Meta, Secrets]
+                    ) -> tuple[Meta, Secrets]:
+    """Fold an older item for the same (domain, username) into the kept one, so collapsing two
+    items never loses what only the older one held (a code seed, notes, a website):
+
+    - notes: taken when the kept item has none; different notes are appended below;
+    - a code seed: taken when the kept item has none; a different second seed is written into
+      the notes as an otpauth link, since one entry holds one code;
+    - websites and Apple's password history: the union.
+    The older password itself becomes history (the caller does that). Deterministic, so the
+    importer and every sync compute the same entry."""
+    km, ks = kept
+    m, s = dropped
+    notes = ks.notes or ""
+    if s.notes and s.notes != notes and s.notes not in notes:
+        notes = f"{notes}\n\n{s.notes}" if notes else s.notes
+    seed, params = ks.totp_secret, dict(ks.totp_params or {})
+    if s.totp_secret and not seed:
+        seed, params = s.totp_secret, dict(s.totp_params or {})
+    elif s.totp_secret and bytes(s.totp_secret) != bytes(seed):
+        secret = base64.b32encode(bytes(s.totp_secret)).decode("ascii").rstrip("=")
+        link = f"otpauth://totp/?secret={secret}"
+        p = s.totp_params or {}
+        if p.get("digits"):
+            link += f"&digits={int(p['digits'])}"
+        if p.get("period"):
+            link += f"&period={int(p['period'])}"
+        line = f"Second verification code (from a duplicate item): {link}"
+        if line not in notes:
+            notes = f"{notes}\n\n{line}" if notes else line
+    hist = list(ks.apple_history or [])
+    for h in s.apple_history or []:
+        if h not in hist:
+            hist.append(h)
+    sites = list(km.sites) + [x for x in m.sites if x not in km.sites and x != km.domain]
+    ks2 = Secrets(password=ks.password, notes=notes, totp_secret=seed, apple_history=hist,
+                  totp_params=params)
+    km2 = Meta(**{**vars(km), "sites": sites, "has_notes": bool(notes), "has_totp": bool(seed)})
+    return km2, ks2
+
+
 def to_canonical(v1: V1Vault) -> dict:
     """The 2.0 model of a v1 vault:
 
@@ -234,17 +275,21 @@ def to_canonical(v1: V1Vault) -> dict:
     nothing 1.x remembered is dropped; it reappears if the account comes back.
 
     1.x could list one (domain, username) twice. 2.0 keeps one entry per pair, as a sync does
-    (ids.collapse: the newest wins), and files each older item's different password into
-    that entry's history with the item's own date."""
+    (ids.collapse: the newest wins), files each older item's different password into that
+    entry's history with the item's own date, and folds the rest of the older item into it
+    (merge_duplicate: notes, a code seed, websites)."""
     parts = [credential_parts(c) for c in v1.credentials]
     kept, dropped = collapse(parts, key=lambda p: entry_id(p[0].domain, p[0].username),
                              mdat=lambda p: p[0].mdat)
+    passwords = {id: ms[1].password for id, ms in kept.items()}
+    for id, ms in sorted(dropped, key=lambda d: -d[1][0].mdat):     # newest first, stable
+        kept[id] = merge_duplicate(kept[id], ms)
     out_entries: dict = {}
     for id, (m, s) in kept.items():
         out_entries[id] = {"meta": _meta.fields_from(m), "secrets": canonical_secrets(s),
                            "deleted": False, "history": []}
     for id, (m, s) in dropped:
-        current = kept[id][1].password
+        current = passwords[id]
         hist = out_entries[id]["history"]
         if s.password and s.password != current and s.password not in (h[2] for h in hist):
             hist.append([m.mdat, SOURCE_LOCAL, s.password])

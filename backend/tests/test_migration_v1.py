@@ -10,6 +10,7 @@ import ast
 import base64
 import json
 import os
+import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -282,6 +283,26 @@ class ImportTests(StoreCase):
         self.s.save_settings({"grant_s": 30, "idle_lock_s": 0, "clip_timeout_s": 30})
         self.s.import_v1(self.files, v1_key())
         self.assertEqual(self.s.load_settings()["grant_s"], 30)
+
+
+class DuplicateItemTests(unittest.TestCase):
+    def test_collapsing_a_duplicate_keeps_its_seed_and_notes(self):
+        # function-duplicate-collapse-drops-totp-notes
+        older = {"domain": "example.test", "username": "alex", "password": "OLD", "mdat": 100,
+                 "notes": "recovery codes", "totp": {"secret": "JBSWY3DPEHPK3PXP"},
+                 "sites": ["login.example.test"]}
+        newer = {"domain": "example.test", "username": "alex", "password": "NEW", "mdat": 200}
+        canon = legacy.to_canonical(legacy.V1Vault(credentials=[older, newer]))
+        (id, e), = canon["entries"].items()
+        self.assertEqual(e["secrets"]["password"], "NEW")
+        self.assertEqual(e["secrets"]["notes"], "recovery codes")
+        self.assertTrue(e["secrets"]["totp_secret"])
+        self.assertTrue(e["meta"]["has_totp"] and e["meta"]["has_notes"])
+        self.assertEqual(e["meta"]["sites"], ["login.example.test"])
+        self.assertEqual([h[2] for h in e["history"]], ["OLD"])
+        # the same answer whichever order the two items come in
+        again = legacy.to_canonical(legacy.V1Vault(credentials=[newer, older]))
+        self.assertEqual(legacy.digest(again), legacy.digest(canon))
 
 
 class LegacySourceTests(StoreCase):

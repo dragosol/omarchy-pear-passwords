@@ -52,6 +52,12 @@ def to_sync_items(credentials, nicknames: dict | None = None) -> list[SyncItem]:
     """Every credential as a SyncItem, one per id. Two password items for the same account
     (it happens: a site saved twice, or over two protocols) collapse to the newest, which is
     also the one any Apple device fills."""
-    kept, _ = _ids.collapse((to_sync_item(c, nicknames) for c in credentials),
-                            key=lambda it: it.id, mdat=lambda it: it.meta.mdat)
+    kept, dropped = _ids.collapse((to_sync_item(c, nicknames) for c in credentials),
+                                  key=lambda it: it.id, mdat=lambda it: it.meta.mdat)
+    # What only the older item held (notes, a code seed, websites) is folded in, exactly as
+    # the 1.x importer does, so nothing is lost and the first sync rewrites nothing.
+    for id, it in sorted(dropped, key=lambda d: -d[1].meta.mdat):  # newest first, stable
+        k = kept[id]
+        m, s = _legacy.merge_duplicate((k.meta, k.secrets), (it.meta, it.secrets))
+        kept[id] = SyncItem(id=id, meta=m, secrets=s)
     return list(kept.values())
