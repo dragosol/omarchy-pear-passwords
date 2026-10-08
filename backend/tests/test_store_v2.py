@@ -486,6 +486,48 @@ class TagMetaTests(StoreCase):
         self.assertEqual(counts["changed"], 1)
         self.assertEqual(s.get_meta(it.id).tags, ["a"])
 
+    def passkey(self, domain, username, **kw):
+        it = item(domain, username, pw="", **kw)
+        it.meta.kind, it.meta.has_passkey, it.meta.has_password = "passkey", True, False
+        return it
+
+    def test_a_passkey_only_row_gaining_a_password_files_no_blank_history(self):
+        # The passkey-only row and the login for the same account share one id.
+        s = vstore.UserStore.create(UID)
+        pk = self.passkey("pk.example.test", "kim", notes="n")
+        s.apply_sync([pk], set())
+        login = item("pk.example.test", "kim", pw="first", notes="n")
+        self.assertEqual(login.id, pk.id)
+        self.assertEqual(s.apply_sync([login], set())["changed"], 1)
+        m = s.get_meta(pk.id)
+        self.assertEqual((m.kind, m.has_password, m.history_count), ("login", True, 0))
+        self.assertEqual(s._doc["entries"][pk.id]["hist"], [])
+        self.assertEqual(s.open_entry(pk.id).password, "first")
+        # A real change after that is history as always.
+        s.apply_sync([item("pk.example.test", "kim", pw="second", notes="n")], set())
+        self.assertEqual(s.get_meta(pk.id).history_count, 1)
+        self.assertEqual([p for _, p in s.history(pk.id)][:1], ["first"])
+
+    def test_a_blank_password_box_is_never_history(self):
+        # The same for a login whose box held no password (no kind recorded on it).
+        s = vstore.UserStore.create(UID)
+        s.apply_sync([item("b.example.test", "me", pw="")], set())
+        s.apply_sync([item("b.example.test", "me", pw="now")], set())
+        self.assertEqual(s.get_meta(ids.entry_id("b.example.test", "me")).history_count, 0)
+
+    def test_a_login_turning_passkey_only_keeps_its_password_as_history(self):
+        s = vstore.UserStore.create(UID)
+        login = item("pk.example.test", "kim", pw="real")
+        s.apply_sync([login], set())
+        s.apply_sync([self.passkey("pk.example.test", "kim")], set())
+        m = s.get_meta(login.id)
+        self.assertEqual((m.kind, m.has_password, m.history_count), ("passkey", False, 1))
+        self.assertEqual([p for _, p in s.history(login.id)], ["real"])
+        # Back to a login: the passkey-only box (no password) is not filed on top of it.
+        s.apply_sync([item("pk.example.test", "kim", pw="again")], set())
+        self.assertEqual(s.get_meta(login.id).history_count, 1)
+        self.assertEqual([p for _, p in s.history(login.id)], ["real"])
+
     def test_fields_from_normalises(self):
         from icp.vstore import meta as vmeta
         m = item("x.example.test", "me").meta

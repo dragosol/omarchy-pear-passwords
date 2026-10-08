@@ -981,7 +981,12 @@ class UserStore:
         """Seal `s` as the entry's current box if it differs from what meta says the box
         holds. A different password moves the old box into history first; other changes
         re-seal in place. Returns whether a box was written. Meta is updated in `rec` and
-        written by the caller. Uses PK_secret only."""
+        written by the caller. Uses PK_secret only.
+
+        A box that held no password (a passkey-only row, which shares its id with a login for
+        the same account) is never history: it would file a blank "previous password" and take
+        a history slot from a real one. A password removed (the login gone, the passkey kept)
+        is a real previous password and is kept as history."""
         k = self._sub["pwmac"]
         pwm = _keys.pwmac(k, s.password)
         sm = _keys.smac(k, _entries.rest_canonical(s))
@@ -989,7 +994,8 @@ class UserStore:
         has_box = files.exists(id)
         if has_box and rec.get("pwmac") == pwm and rec.get("smac") == sm:
             return False
-        if has_box and rec.get("pwmac") not in (None, pwm):
+        no_password = rec.get("kind") == "passkey" or rec.get("pwmac") == _keys.pwmac(k, "")
+        if has_box and rec.get("pwmac") not in (None, pwm) and not no_password:
             hist = rec.setdefault("hist", [])
             n = files.next_number(id, [h["n"] for h in hist])
             if files.move_to_history(id, n):
