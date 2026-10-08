@@ -24,7 +24,8 @@
 #   ./install.sh --app-only  only report whether the system part is installed and matches this
 #                            checkout (exit 0), is missing (3) or is another version (4).
 #                            Writes nothing except retiring hash-matched 1.x files once 2.0 is
-#                            installed. The plugin runs it when the shell loads.
+#                            installed. (The plugin makes the same VERSION comparison itself,
+#                            read-only, when the shell loads; it does not run this script.)
 #
 # Re-run it after `omarchy plugin update`, then run the root command it prints again.
 set -euo pipefail
@@ -155,7 +156,7 @@ say "Downloading the locked wheels"
 # match its version and platform. --require-hashes checks every one against the lock files;
 # root checks them again before installing.
 pipenv="$PP_STAGE_CACHE/pip"
-[ -x "$pipenv/bin/python" ] || /usr/bin/python3 -m venv "$pipenv"
+pp_pip_venv "$pipenv"
 "$pipenv/bin/python" -m pip download --quiet --disable-pip-version-check --no-input \
   --require-hashes --only-binary :all: --no-deps -d "$stage.new/wheels" \
   -r "$stage.new/backend/requirements.lock" -r "$stage.new/backend/build-requirements.lock"
@@ -173,7 +174,8 @@ fi
 state="$(system_state)"
 echo
 case "$state" in
-  current) echo "The system part is already installed at exactly this version. Nothing else to do." ; exit 0 ;;
+  current) echo "The system part is already installed at exactly this version. Nothing else to do."
+           echo "To repair or reinstall it anyway, the same root command as for an install:" ;;
   other)   echo "One step left: update the system part. Run this command (it asks for your password):" ;;
   *)       echo "One step left: install the system part. Run this command (it asks for your password):" ;;
 esac
@@ -190,3 +192,10 @@ Check that the hash matches the one in the release notes for $version, at
 https://github.com/dragosol/omarchy-pear-passwords/releases - it is what proves the files
 root installs are the reviewed ones. Then open Pear Passwords from the launcher.
 NOTE
+if [ "$state" = missing ] && [ -e "$PP_LAUNCHER_1X" ]; then
+  cat <<NOTE
+
+The 1.x launcher stays until the 2.0 one exists. After the root command, run
+./install.sh --app-only once to remove it (moving your vault into 2.0 removes it too).
+NOTE
+fi

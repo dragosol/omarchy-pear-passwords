@@ -131,6 +131,26 @@ class UserFilesTests(unittest.TestCase):
         self.assertNotRegex(code, r"rm[^\n]*\.config/icp")
         self.assertNotRegex(code, r"mv[^\n]*\.config/icp")
 
+    def test_download_venv_is_rebuilt_after_a_python_minor_upgrade(self):
+        # installer-stale-pip-venv-after-python-upgrade: bin/python still runs, but its
+        # lib/pythonX.Y is the old minor's, so `python -m pip` has no pip.
+        venv = os.path.join(self.home, ".cache/pear-passwords/pip")
+        os.makedirs(os.path.join(venv, "bin"))
+        os.makedirs(os.path.join(venv, "lib/python3.0/site-packages/pip"))
+        os.symlink("/usr/bin/python3", os.path.join(venv, "bin/python"))
+        proc = self.bash(f'pp_pip_venv "{venv}" && "{venv}/bin/python" -m pip --version')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(venv, "lib/python3.0")))
+        # a matching venv is reused, not rebuilt
+        marker = os.path.join(venv, "keep")
+        open(marker, "w").close()
+        self.assertEqual(self.bash(f'pp_pip_venv "{venv}"').returncode, 0)
+        self.assertTrue(os.path.exists(marker))
+        with open(os.path.join(ROOT, "install.sh")) as f:
+            body = f.read()
+        self.assertIn('pp_pip_venv "$pipenv"', body)
+        self.assertNotIn('[ -x "$pipenv/bin/python" ] ||', body)
+
     def test_app_only_reports_without_writing(self):
         if os.path.exists("/usr/local/lib/pear-passwords"):
             self.skipTest("a system install exists on this machine")

@@ -57,6 +57,19 @@ pp_user_ours() {
   grep -qxF "$h $name" <<< "$RELEASED_USER"
 }
 
+# pp_pip_venv DIR: install.sh's throwaway download venv at DIR, made by /usr/bin/python3 and
+# rebuilt whenever it no longer matches it. After a Python minor upgrade the old venv's
+# bin/python (a symlink) still runs, but looks for pip under the new lib/pythonX.Y and fails.
+pp_pip_venv() {
+  local d=$1 want have
+  want=$(/usr/bin/python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+  have=$("$d/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
+  if [[ ! -x $d/bin/python || $have != "$want" || ! -d $d/lib/python$want/site-packages/pip ]]; then
+    rm -rf -- "$d"
+    /usr/bin/python3 -m venv "$d"
+  fi
+}
+
 # Has this user's vault been moved into 2.0? The daemon's state is not readable from here, so
 # the sign is the migration's rename: a v1 backup exists and ~/.config/icp does not.
 pp_migrated() {
