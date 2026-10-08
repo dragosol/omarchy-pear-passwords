@@ -285,6 +285,50 @@ class MigrationTests(Base):
         self.assertIsNotNone(m2)
         self.assertIn("reset", self.h.store().calls)
 
+    async def _pending_after_a_closed_window(self):
+        m = await self.migrate()
+        m.close()
+        self.ui.close()
+        await asyncio.sleep(0.1)
+        self.ui, self.peer = await self.h.ui()
+        self.assertTrue(self.ui.hello["migration_pending"])
+        self.dialogs_before = len(self.dialogs())
+
+    async def test_no_v1_vault_left_clears_the_pending_import(self):
+        # audit: migration_pending dead end. ~/.config/icp is gone, so the window cannot
+        # offer the move again; without a way out every "Sign in to iCloud" failed with
+        # migration-pending. The window abandons the record (no dialog) and signs in.
+        await self._pending_after_a_closed_window()
+        r = await self.ui.call("migrate-abandon")
+        self.assertEqual(r, {"rid": self.ui.rid, "migration_pending": False})
+        self.assertEqual(len(self.dialogs()), self.dialogs_before)     # no dialog
+        self.assertNotIn("migration_pending", self.h.store().settings)
+        await self.ui.call("unlock")
+        r = await self.ui.call("signin", mode="login")
+        self.assertNotEqual(r.get("error"), "migration-pending")
+        ui2_hello = self.ui.hello
+        del ui2_hello
+        self.ui.close()
+        await asyncio.sleep(0.1)
+        self.ui, self.peer = await self.h.ui()
+        self.assertFalse(self.ui.hello["migration_pending"])
+
+    async def test_abandon_with_nothing_pending_is_a_no_op(self):
+        self.h.seed()
+        r = await self.ui.call("migrate-abandon")
+        self.assertEqual(r["migration_pending"], False)
+        self.assertEqual(self.dialogs(), [])
+
+    async def test_reset_leaves_a_pending_import(self):
+        await self._pending_after_a_closed_window()
+        r = await self.ui.call("reset")
+        self.assertEqual(r, {"rid": self.ui.rid, "state": "empty"})
+        self.assertEqual(self.dialogs()[self.dialogs_before:], [paths.ACTION_MANAGE])
+        self.assertIn("reset", self.h.store().calls)
+        self.assertNotIn("migration_pending", self.h.store().settings)
+        r = await self.ui.call("signin", mode="login")
+        self.assertNotEqual(r.get("error"), "migration-pending")
+
     async def test_migrate_begin_refused_with_a_store(self):
         self.h.seed()
         self.assertEqual((await self.ui.call("migrate-begin"))["error"], "not-locked")

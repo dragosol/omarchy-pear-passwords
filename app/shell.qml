@@ -106,7 +106,7 @@ ShellRoot {
         if (root.migrateStep !== "") return "migrate";
         if (root.appUnlocked) return "list";
         if (root.migrationPending && root.vaultState === "locked")
-            return !root.v1Checked ? "connecting" : (root.v1Present ? "migrate" : "locked");
+            return !root.v1Checked ? "connecting" : (root.v1Present ? "migrate" : "migration-pending");
         switch (root.vaultState) {
         case "empty": return !root.v1Checked ? "connecting"
                            : root.v1Present ? "migrate"
@@ -424,12 +424,14 @@ ShellRoot {
             root.v1Checked = true;
             if (root.v1Present && root.migrateStep === "") root.migrateStep = "intro";
             if (root.migrationPending && !root.v1Present) {
-                // Nothing left to import (the 1.x vault is gone): carry on as a normal store.
-                root.migrationPending = false;
-                if (root.vaultState === "locked" && !root.autoAuthTried && !root.headless) {
-                    root.autoAuthTried = true;
-                    root.authenticate();
-                }
+                // Nothing left to import (the 1.x vault is gone): the daemon drops its record
+                // of the unfinished move (no dialog), and this is an ordinary store again.
+                root.abandonMigration(function () {
+                    if (root.vaultState === "locked" && !root.autoAuthTried && !root.headless) {
+                        root.autoAuthTried = true;
+                        root.authenticate();
+                    }
+                });
             }
             if (root.snapshotPath) snapshotTimer.start();
         }
@@ -622,10 +624,22 @@ ShellRoot {
 
     // After tpm-cleared or damaged: new keys, then sign in again. The daemon moves the old
     // files aside rather than deleting them.
+    // An import that never committed, with nothing left to import or "Start fresh instead"
+    // chosen: tell the daemon, which otherwise refuses a fresh sign-in (migration-pending).
+    // No dialog. If it fails, the migration-pending screen offers Start over (reset).
+    function abandonMigration(then) {
+        root.send("migrate-abandon", {}, function (d) {
+            if (d.error) { root.status = root.errorWords(d); return; }
+            root.migrationPending = false;
+            if (then) then();
+        });
+    }
+
     function startOver() {
         root.send("reset", {}, function (d) {
             root.startOverConfirm = false;
             if (d.error) { root.status = root.errorWords(d); return; }
+            root.migrationPending = false;
             root.vaultState = d.state || "empty";
             root.lockReason = "";
             root.status = "";
@@ -947,6 +961,7 @@ ShellRoot {
         case "apple": return "iCloud refused it" + (d.detail ? ": " + d.detail : "");
         case "busy-sync": return "a sync is running — try again in a moment";
         case "seal-unavailable": return "the system key service didn't answer — try again in a moment";
+        case "migration-pending": return "the move from 1.x isn't finished — finish it or start fresh first";
         case "invalid": return "that " + (d.field || "value") + " isn't valid";
         case "dismissed": case "cancelled": return "cancelled";
         case "denied": return "not approved";
@@ -3622,7 +3637,8 @@ ShellRoot {
             anchors.fill: parent
             color: Theme.bg
             visible: ["connecting", "not-installed", "launcher", "daemon-failed", "abi-mismatch",
-                      "empty", "migrate-keyring", "tpm-missing", "tpm-cleared", "damaged"].indexOf(root.screen) >= 0
+                      "empty", "migrate-keyring", "migration-pending", "tpm-missing", "tpm-cleared",
+                      "damaged"].indexOf(root.screen) >= 0
             MouseArea { anchors.fill: parent }
 
             ColumnLayout {
@@ -3697,6 +3713,7 @@ ShellRoot {
                     }
                     AppButton {
                         visible: root.screen === "tpm-cleared" || root.screen === "damaged"
+                                 || root.screen === "migration-pending"
                         text: root.startOverConfirm ? "Yes, start over" : "Start over…"
                         onClicked: root.startOverConfirm ? root.startOver() : root.startOverConfirm = true
                     }
@@ -4019,7 +4036,12 @@ ShellRoot {
                             font.pixelSize: Theme.fSmall
                             font.underline: hFresh.hovered
                             HoverHandler { id: hFresh; cursorShape: Qt.PointingHandCursor }
-                            TapHandler { onTapped: { root.migrateStep = ""; root.v1Present = false; } }
+                            TapHandler {
+                                onTapped: {
+                                    root.migrateStep = ""; root.v1Present = false;
+                                    if (root.migrationPending) root.abandonMigration(null);
+                                }
+                            }
                         }
                         Item { Layout.fillWidth: true }
                         AppButton {
@@ -4326,6 +4348,7 @@ ShellRoot {
         case "abi-mismatch": return "Python was upgraded";
         case "empty": return "No passwords yet";
         case "migrate-keyring": return "Your 1.x vault needs a passphrase first";
+        case "migration-pending": return "The move from 1.x didn't finish";
         case "tpm-missing": return "The security chip is switched off";
         case "tpm-cleared": return "The security chip refused the keys";
         case "damaged": return "Pear Passwords can't read its data";
@@ -4356,6 +4379,10 @@ ShellRoot {
                  + "protected by a passphrase. To keep your password history and nicknames, set one in 1.3.2 "
                  + "with the command below, then check again. Starting fresh instead signs this computer in to "
                  + "iCloud again and leaves the 1.x vault and its keyring entry where they are.";
+        case "migration-pending":
+            return "An earlier move from Pear Passwords 1.x stopped before it finished, and there is no 1.x "
+                 + "vault in ~/.config/icp to finish it from. Nothing was imported. Starting over makes new "
+                 + "keys, and then you sign in to iCloud to bring in your passwords.";
         case "tpm-missing":
             return "The security chip (PTT) is switched off. Turn it back on in the BIOS and your "
                  + "passwords come back.";

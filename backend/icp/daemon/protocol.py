@@ -82,7 +82,8 @@ ROLE_OPS: dict[str, frozenset[str]] = {
     "ui": frozenset({
         "unlock", "lock", "release", "grant", "reveal", "totp", "history", "copy", "set",
         "create", "delete", "totp-preview", "signin", "answer", "signout", "sync", "settings",
-        "migrate-begin", "reset", "purge-old-copy", "clip-history-check", "cancel",
+        "migrate-begin", "migrate-abandon", "reset", "purge-old-copy", "clip-history-check",
+        "cancel",
         "autofill-enable",
     }),
     "clip": frozenset({"redeem", "clip-result"}),

@@ -130,6 +130,31 @@ class MigrationScreenTests(unittest.TestCase):
         self.assertIn("icp passphrase", function_body("stateCommand"))
         self.assertIn("v1Check.check()", function_body("stateAction"))
 
+    def test_a_pending_import_with_no_vault_left_is_not_a_dead_end(self):
+        # audit: migration_pending dead end. With ~/.config/icp gone the window cleared only
+        # its own flag; every "Sign in to iCloud" then failed with migration-pending.
+        settle = function_body("settle")
+        branch = settle[settle.index("if (root.migrationPending && !root.v1Present)"):]
+        self.assertIn("root.abandonMigration(", branch[:branch.index("\n            }")])
+        self.assertNotRegex(branch[:200], r"root\.migrationPending = false;")
+        abandon = function_body("abandonMigration")
+        self.assertRegex(abandon, r'send\(\s*"migrate-abandon"')
+        self.assertIn("root.migrationPending = false", abandon)
+        # "Start fresh instead" over an unfinished move abandons it too.
+        fresh = CODE[CODE.index('text: "Start fresh instead"'):]
+        fresh = fresh[:fresh.index("AppButton")]
+        self.assertIn("if (root.migrationPending) root.abandonMigration(", fresh)
+        # Its own words, and Start over (reset, .manage) as the way out if that fails.
+        screen = CODE[CODE.index("readonly property string screen:"):]
+        screen = screen[:screen.index("\n    }\n")]
+        self.assertIn('"migration-pending"', screen)
+        self.assertIn('case "migration-pending"', function_body("stateTitle"))
+        self.assertIn('case "migration-pending"', function_body("stateBody"))
+        self.assertIn('case "migration-pending"', function_body("errorWords"))
+        self.assertRegex(CODE, r'root\.screen === "tpm-cleared" \|\| root\.screen === "damaged"\s*'
+                               r'\|\| root\.screen === "migration-pending"')
+        self.assertIn("root.migrationPending = false", function_body("startOver"))
+
     def test_units_that_were_not_stopped_are_shown_with_the_command(self):
         # function-legacy-units-not-stopped
         self.assertIn("migrateResult.units_not_stopped", CODE)

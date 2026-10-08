@@ -913,6 +913,26 @@ async def op_migrate_begin(reg, conn, req):
     return {"ticket": token, "ttl": protocol.TICKET_TTL_S}
 
 
+async def op_migrate_abandon(reg, conn, req):
+    """The window found no 1.x vault left to import (or the user chose to start fresh) while
+    an import that never committed is recorded: drop the record so the store is an ordinary
+    one again and "Sign in to iCloud" works. No dialog: it reveals nothing and changes no
+    key, and the sign-in that follows raises its own .manage dialog. A running importer is
+    withdrawn first."""
+    s = _session(reg, conn)
+    if s.ui is not conn:
+        raise OpError("forbidden")
+    if await _store(reg, conn.uid, s.store.state) == "empty":
+        return {"migration_pending": False}
+    if not await _migration_pending(reg, s):
+        return {"migration_pending": False}
+    reg.withdraw(conn.uid, roles=("migrate",))
+    s.migrating = False
+    await _save_setting_keys(reg, s, migration_pending=None)
+    logger.info("uid %d: the unfinished 1.x import was abandoned", conn.uid)
+    return {"migration_pending": False}
+
+
 async def _migration_pending(reg, s) -> bool:
     if getattr(s, "migrating", False):
         return True
@@ -939,23 +959,37 @@ async def op_purge_old_copy(reg, conn, req):
     return {"ticket": token, "ttl": protocol.TICKET_TTL_S}
 
 
+async def _resettable(reg, s) -> bool:
+    """reset is the way out of tpm-cleared, damaged, and an import that never committed."""
+    state = await _store(reg, s.uid, s.store.state)
+    if state in ("tpm-cleared", "damaged"):
+        return True
+    return state != "empty" and await _migration_pending(reg, s)
+
+
 async def op_reset(reg, conn, req):
     s = _session(reg, conn)
     if s.ui is not conn:
         raise OpError("forbidden")
-    if await _store(reg, conn.uid, s.store.state) not in ("tpm-cleared", "damaged"):
+    if not await _resettable(reg, s):
         raise OpError("not-locked")
     epoch = s.epoch
     await reg.authorize(conn, paths.ACTION_MANAGE, {})
     if conn.closed or s.ui is not conn or s.epoch != epoch:
         raise OpError("cancelled")
-    if await _store(reg, conn.uid, s.store.state) not in ("tpm-cleared", "damaged"):
+    if not await _resettable(reg, s):
         raise OpError("not-locked")
     reg.lock(conn.uid, None, notify=False)
+    reg.withdraw(conn.uid, roles=("migrate",))
+    s.migrating = False
     s.store = await _store(reg, conn.uid, reg.store_cls.reset, conn.uid)
     if conn.closed or s.ui is not conn:
         reg._wipe_store(s)
         raise OpError("cancelled")
+    try:
+        await _save_setting_keys(reg, s, migration_pending=None)
+    except OpError:
+        logger.warning("uid %d: could not clear the pending migration record", conn.uid)
     # The old keys are gone and the fresh store holds nothing; tier 1 stays open on it so the
     # sign-in that follows needs only its own dialog.
     reg.open_tier1(s, conn)
@@ -1186,7 +1220,8 @@ HANDLERS = {
     "copy": op_copy, "set": op_set, "create": op_create, "delete": op_delete,
     "totp-preview": op_totp_preview, "signin": op_signin, "answer": op_answer,
     "signout": op_signout, "sync": op_sync, "settings": op_settings,
-    "migrate-begin": op_migrate_begin, "reset": op_reset, "purge-old-copy": op_purge_old_copy,
+    "migrate-begin": op_migrate_begin, "migrate-abandon": op_migrate_abandon,
+    "reset": op_reset, "purge-old-copy": op_purge_old_copy,
     "clip-history-check": op_clip_history_check,
     "redeem": op_redeem, "clip-result": op_clip_result,
     "import-file": op_import_file, "import-key": op_import_key,

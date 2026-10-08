@@ -105,7 +105,9 @@ Replies:
 - `autofill`: whether browser autofill is turned on, and how many autofill hosts are connected.
 - `migration_pending`: an earlier `migrate-begin` created keys but its import never committed
   (the window was closed at the passphrase step). The window then offers the move again; a
-  `signin` with mode `login` is refused with `migration-pending` until it has.
+  `signin` with mode `login` is refused with `migration-pending` until it has, or until the
+  record is dropped: `migrate-abandon` (no dialog; the window sends it when no importable 1.x
+  vault is left or "Start fresh instead" is chosen) or `reset` (`.manage`).
 
 `clip` (after the ticket is checked):
 
@@ -449,6 +451,7 @@ the next grant; `idle_lock_s` restarts the idle clock.
 {"op":"migrate-begin","rid":19}            -> {"rid":19,"ticket":"<43 chars>","ttl":10}
 {"op":"purge-old-copy","rid":20}           -> {"rid":20,"ticket":"<43 chars>","ttl":10}
 {"op":"reset","rid":21}                    -> {"rid":21,"state":"empty"}
+{"op":"migrate-abandon","rid":24}          -> {"rid":24,"migration_pending":false}
 {"op":"clip-history-check","rid":22,"items":["...","..."]}  -> {"rid":22,"matches":[0,4]}
 {"op":"autofill-enable","rid":23,"enabled":true} -> {"rid":23,"autofill":{"enabled":true,"hosts":0}}
 ```
@@ -464,7 +467,13 @@ the next grant; `idle_lock_s` restarts the idle clock.
   Raises `.manage` and issues a
   `migrate`/`purge` ticket; the importer deletes exactly the recorded files whose sha256
   still matches and reports `purge-result`. The record is cleared afterwards.
-- `reset`: allowed in `tpm-cleared` and `damaged` only (else `not-locked`). Raises `.manage`;
+- `migrate-abandon`: no dialog. Drops a recorded `migration_pending` (and withdraws a
+  running importer), so the store is an ordinary one and `signin` works again. The window
+  sends it when it finds no importable 1.x vault left, or when you choose "Start fresh
+  instead" over an unfinished move. It reveals nothing and changes no key; with nothing
+  pending it is a no-op. Reply `{migration_pending:false}`.
+- `reset`: allowed in `tpm-cleared`, `damaged`, and while an import that never committed is
+  recorded (`migration_pending`; else `not-locked`). Raises `.manage`;
   the old directory is renamed aside, never deleted. The reply `state:"empty"` means "no
   entries and no iCloud session": the fresh store already has new sealed keys and tier 1
   stays open on this connection, so the sign-in the UI then offers needs only its own
@@ -762,7 +771,8 @@ traceback.
 | `sync` | ui | – | – | `{queued:true}` or `{skipped}` |
 | `settings` | ui | – | – | `{settings}` |
 | `migrate-begin` | ui | `.manage` | state empty | `{ticket, ttl:10}` |
-| `reset` | ui | `.manage` | tpm-cleared or damaged | `{state:"empty"}` |
+| `migrate-abandon` | ui | – | – | `{migration_pending:false}` |
+| `reset` | ui | `.manage` | tpm-cleared, damaged or migration_pending | `{state:"empty"}` |
 | `purge-old-copy` | ui | `.manage` | an old_copy record | `{ticket, ttl:10}` |
 | `clip-history-check` | ui | `.manage` | tier 1 | `{matches}` |
 | `autofill-enable` | ui | `.manage` | – | `{autofill:{enabled, hosts}}` |
