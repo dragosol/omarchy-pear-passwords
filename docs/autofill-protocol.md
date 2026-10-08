@@ -32,8 +32,9 @@ The code is `backend/icp/client/autofill.py` (the host),
 - After an approved fill, **the browser and the extension hold that one password.** Whatever
   can read the extension's memory or the page's form can read it. The origin is only as
   trustworthy as the browser that reported it.
-- At most 3 answered autofill dialogs per minute and one open at a time. The window has its
-  own separate allowance, so a page cannot use autofill to block it.
+- One autofill dialog open at a time, and after 3 dismissed or denied ones in a minute no more
+  for the rest of it (approvals are not counted). The window has its own separate allowance,
+  so a page cannot use autofill to block it.
 
 ## 2. Turning it on (off by default)
 
@@ -154,7 +155,7 @@ are returned: never notes, a one-time code or a code seed.
 | `no-agent` | no polkit agent is running (the desktop shell may be restarting) | ask the user to try again |
 | `busy` | the agent is showing another dialog | try again later |
 | `prompt-pending` | an autofill dialog is already open | wait for it |
-| `rate-limited` | 3 answered dialogs in the last minute; `retry_after` is in seconds | wait |
+| `rate-limited` | 3 dismissed or denied dialogs in the last minute; `retry_after` is in seconds | wait |
 | `cancelled` | the fill was cancelled (for example the daemon saw the port close) | nothing |
 | `bad-origin` | the origin is malformed (section 6) | fix the extension |
 | `insecure-origin` | the origin is not https | do not offer autofill on this page |

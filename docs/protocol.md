@@ -250,18 +250,22 @@ annotation `unix-user:pear-passwords`. No other op ever raises a dialog.
 
 | polkit result | code | counted against the limit |
 |---|---|---|
-| authorized | (success) | yes |
+| authorized | (success) | no |
 | challenge failed with `polkit.dismissed` | `dismissed` | yes |
-| not authorized | `denied` | yes |
-| no agent registered (G7) | `no-agent` | no |
+| not authorized after a challenge | `denied` | yes |
+| not authorized without a challenge (a policy `no`, an agent that died mid-dialog) | `denied` | no |
+| no agent registered (G7), or polkitd/the bus unreachable | `no-agent` | no |
+| polkitd refused the call itself (`NotAuthorized`, a bad subject) | `internal` | no |
 | agent busy with another dialog | `busy` | no |
 | cancelled by the daemon (EOF, `cancel`, superseded `grant`) | `cancelled` | no |
 
 - Rate limits, per uid and **bucket** (`ui` for the window's ops, `autofill` for the browser's):
   - one outstanding dialog per bucket: a second prompt-raising op gets `prompt-pending`
     (except `grant`, which supersedes a pending `grant`: the old one gets `cancelled`);
-  - at most **3 answered** dialogs per rolling minute per bucket; the 4th prompt-raising op
-    gets `{"error":"rate-limited","retry_after":<seconds>}` without a dialog.
+  - at most **3 refused** (dismissed or denied) dialogs per rolling minute per bucket and
+    action; the next op raising that action gets
+    `{"error":"rate-limited","retry_after":<seconds>}` without a dialog. Approvals are not
+    counted, so opening one account after another never runs into the limit.
 - For `unlock` a refusal is a normal reply, not an error (section 6.1). For every other op it
   is `{"rid":n,"error":"<code>"}`.
 
@@ -669,7 +673,7 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
   included only once a fill on this connection has been approved since the uid last
   unlocked; before that a query gives ids and match kinds only. Never a secret.
 - `autofill-fill` raises `.autofill` every time with `account` and `origin` (the host), in the
-  `autofill` rate-limit bucket (one outstanding, 3 answered per minute per uid). An unknown
+  `autofill` rate-limit bucket (one outstanding, 3 refused per minute per uid). An unknown
   id and a non-matching id both give `no-match`. After approval the daemon re-checks that the
   uid is still unlocked and the entry still matches, opens the entry and replies with
   username and password only. It also sends the UI an `autofill` event.
@@ -709,7 +713,7 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
 | `denied` | polkit refused (wrong password, failed fingerprint, policy) |
 | `no-agent` | no polkit agent; not counted against the rate limit |
 | `busy` | the agent is showing another dialog; not counted |
-| `rate-limited` | 3 answered dialogs in the last minute in this bucket; has `retry_after` |
+| `rate-limited` | 3 dismissed or denied dialogs of this action in the last minute in this bucket; has `retry_after` |
 | `prompt-pending` | this bucket already has a dialog open |
 | `cancelled` | cancelled by `cancel`, a superseding `grant`, or EOF |
 | `busy-sync` | a sync, sign-in or edit for this uid is already running |

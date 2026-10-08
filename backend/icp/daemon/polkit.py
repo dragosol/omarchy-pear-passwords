@@ -52,7 +52,21 @@ DENIED = "denied"
 NO_AGENT = "no-agent"
 BUSY = "busy"
 CANCELLED = "cancelled"
-COUNTED = frozenset({AUTHORIZED, DISMISSED, DENIED})
+INTERNAL = "internal"                  # polkitd refused the call itself: a bug, never "no agent"
+# "Not authorized" without a challenge: polkit decided with no dialog answered (a policy "no",
+# or an agent that died mid-dialog). Reported as denied, never counted against the limit.
+DENIED_UNANSWERED = "denied-unanswered"
+# Only answers that said no count: an approval never holds up the next account's dialog.
+COUNTED = frozenset({DISMISSED, DENIED})
+
+# D-Bus errors that mean polkitd or the bus could not be reached (transient, like no agent).
+_TRANSPORT_ERRORS = ("transport", "org.freedesktop.DBus.Error.ServiceUnknown",
+                     "org.freedesktop.DBus.Error.NameHasNoOwner",
+                     "org.freedesktop.DBus.Error.NoReply", "org.freedesktop.DBus.Error.Timeout",
+                     "org.freedesktop.DBus.Error.TimedOut",
+                     "org.freedesktop.DBus.Error.Disconnected",
+                     "org.freedesktop.DBus.Error.NoServer",
+                     "org.freedesktop.DBus.Error.Spawn.ChildExited")
 
 # Characters a details value may not carry into the dialog: controls, format characters (which
 # include every bidi override and zero-width joiner), surrogates, private use, unassigned, and
@@ -105,9 +119,15 @@ def classify(result: tuple | None, *, error: str | None, elapsed: float,
     if cancelled:
         return CANCELLED
     if error is not None:
-        # polkitd itself failed the call: no daemon, a bad subject, or the agent errored out.
-        # The dialog cannot be shown either way; the UI says to retry or restart the shell.
-        return BUSY if error.endswith(".Cancelled") else NO_AGENT
+        if error.endswith(".Cancelled"):
+            return BUSY
+        if error in _TRANSPORT_ERRORS:
+            # polkitd or the bus is not there right now; the UI says to retry.
+            return NO_AGENT
+        # polkitd refused the call itself (NotAuthorized: the owner annotation is missing;
+        # a refused subject; InvalidArgs): a real fault, never shown as "shell restarting".
+        logger.error("polkit refused the check: %s", error)
+        return INTERNAL
     is_authorized, is_challenge, details = result
     if is_authorized:
         return AUTHORIZED
@@ -117,7 +137,7 @@ def classify(result: tuple | None, *, error: str | None, elapsed: float,
         return BUSY if dismissed else NO_AGENT
     if dismissed:
         return DISMISSED
-    return DENIED
+    return DENIED if is_challenge else DENIED_UNANSWERED
 
 
 class SystemBus:

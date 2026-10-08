@@ -109,8 +109,9 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
 `test_daemon_polkit.py`.
 
 - Only the ops in protocol.md section 5 raise a dialog, with user interaction allowed only
-  while handling one of them; one outstanding and three answered dialogs per minute per bucket
-  (`ui` and `autofill`). Tests: `test_daemon_polkit.py`, `test_protocol_contract.py`.
+  while handling one of them; one outstanding dialog per bucket (`ui` and `autofill`), and at
+  most three refused (dismissed or denied) dialogs per minute per bucket and action; approvals
+  are not counted. A polkitd refusal of the call itself is `internal`, never "no agent". Tests: `test_daemon_polkit.py`, `test_protocol_contract.py`.
 - The scheduler and the Apple pipeline never import or name the polkit module, and no
   `AllowUserInteraction` appears in them. Tests: `test_scheduler_no_prompt.py`,
   `test_repo_guards.py::BackgroundNeverPromptsTests`.

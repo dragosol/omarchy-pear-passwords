@@ -5,7 +5,8 @@ connection, its settings, and what is running for it. The Registry holds every s
 the things that must be decided in exactly one place:
 
 - authorize(): the only way any handler raises a polkit dialog. It enforces one outstanding
-  dialog per (uid, bucket) and PROMPT_ANSWERED_PER_MIN answered dialogs per rolling minute,
+  dialog per (uid, bucket) and PROMPT_ANSWERED_PER_MIN refused (dismissed or denied) dialogs
+  per (uid, bucket, action) per rolling minute,
   supersedes a pending `grant` with a new one, and cancels on EOF.
 - lock(): every lock trigger in docs/protocol.md 4.2 ends here. It marks the uid locked first,
   then wipes the grant, revokes tickets, withdraws clip and migrate processes, cancels dialogs
@@ -35,7 +36,8 @@ from . import paths, protocol
 from .context import Cancelled
 from .grants import GrantTable
 from .peer import start_time_of
-from .polkit import AUTHORIZED, CANCELLED, COUNTED, NO_AGENT, Authority, Subject, sanitize
+from .polkit import (AUTHORIZED, CANCELLED, COUNTED, DENIED, DENIED_UNANSWERED, NO_AGENT,
+                     Authority, Subject, sanitize)
 from .protocol import OpError
 from .tickets import TicketBook
 
@@ -233,7 +235,9 @@ class Registry:
                 self._cancel(old)            # a new grant supersedes the pending one
             else:
                 raise OpError("prompt-pending")
-        answered = self._answered.setdefault(key, deque())
+        # Answers that said no are counted per action, so dismissing reveal dialogs never
+        # holds up an unlock, and approvals are not counted at all.
+        answered = self._answered.setdefault((*key, action), deque())
         now = self.clock()
         while answered and now - answered[0] >= 60:
             answered.popleft()
@@ -254,7 +258,9 @@ class Registry:
                 del self._pending[key]
         if p.cancelled:
             outcome = CANCELLED
-        if outcome in COUNTED:
+        if outcome == DENIED_UNANSWERED:
+            outcome = DENIED                     # reported as such, but nobody answered it
+        elif outcome in COUNTED:
             answered.append(self.clock())
         if outcome == AUTHORIZED and conn.closed:
             outcome = CANCELLED                  # nobody left to use the approval

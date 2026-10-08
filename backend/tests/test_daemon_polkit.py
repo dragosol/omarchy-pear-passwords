@@ -103,10 +103,11 @@ class AuthorityTests(unittest.TestCase):
             ((True, False, {}), 3.0, polkit.AUTHORIZED),
             ((False, True, {"polkit.dismissed": "true"}), 3.0, polkit.DISMISSED),
             ((False, True, {}), 3.0, polkit.DENIED),
-            ((False, False, {}), 0.01, polkit.DENIED),            # not a challenge: policy
+            ((False, False, {}), 0.01, polkit.DENIED_UNANSWERED),  # not a challenge: policy
             ((False, True, {}), 0.01, polkit.NO_AGENT),           # G7: nobody saw a dialog
             ((False, True, {"polkit.dismissed": "true"}), 0.01, polkit.BUSY),
-            ("org.freedesktop.PolicyKit1.Error.Failed", 0.01, polkit.NO_AGENT),
+            ("org.freedesktop.PolicyKit1.Error.Failed", 0.01, polkit.INTERNAL),
+            ("org.freedesktop.DBus.Error.ServiceUnknown", 0.01, polkit.NO_AGENT),
             ("org.freedesktop.PolicyKit1.Error.Cancelled", 0.01, polkit.BUSY),
         ]
         for reply, seconds, expected in cases:
@@ -146,6 +147,26 @@ class AuthorityTests(unittest.TestCase):
                          clock=self.clock)
         with self.assertRaises(ValueError):
             auth.check(self.subject, "org.freedesktop.systemd1.manage-units", {}, "x")
+
+    def test_a_polkit_refusal_of_the_call_is_internal_not_no_agent(self):
+        # Gate bug 7: NotAuthorized (no owner annotation) looked like "shell restarting".
+        for err in ("org.freedesktop.PolicyKit1.Error.NotAuthorized",
+                    "org.freedesktop.DBus.Error.InvalidArgs",
+                    "org.freedesktop.PolicyKit1.Error.Failed"):
+            self.assertEqual(classify(None, error=err, elapsed=0.01, cancelled=False),
+                             polkit.INTERNAL, err)
+        for err in ("transport", "org.freedesktop.DBus.Error.ServiceUnknown",
+                    "org.freedesktop.DBus.Error.NoReply"):
+            self.assertEqual(classify(None, error=err, elapsed=0.01, cancelled=False),
+                             polkit.NO_AGENT, err)
+        self.assertEqual(classify(None, error="org.freedesktop.PolicyKit1.Error.Cancelled",
+                                  elapsed=1, cancelled=False), polkit.BUSY)
+
+    def test_a_denial_without_a_challenge_is_unanswered(self):
+        self.assertEqual(classify((False, False, {}), error=None, elapsed=0.2, cancelled=False),
+                         polkit.DENIED_UNANSWERED)
+        self.assertEqual(classify((False, True, {}), error=None, elapsed=2.3, cancelled=False),
+                         polkit.DENIED)
 
     def test_classify_error_and_cancel(self):
         self.assertEqual(classify(None, error="x", elapsed=9, cancelled=True), polkit.CANCELLED)
@@ -213,11 +234,37 @@ class PromptRuleTests(unittest.IsolatedAsyncioTestCase):
     async def test_rate_limit_error_shape_for_other_ops(self):
         await self.ui.call("unlock")
         self.auth.outcome = polkit.DISMISSED
-        for _ in range(2):
+        for _ in range(3):
             self.assertEqual((await self.ui.call("grant", id="e.0"))["error"], "dismissed")
         r = await self.ui.call("grant", id="e.0")
         self.assertEqual(r["error"], "rate-limited")
         self.assertIn("retry_after", r)
+
+    async def test_approvals_never_hold_up_the_next_dialog(self):
+        # Gate bug 6: unlock plus two accounts used up the minute; the third account (or a
+        # reopened window) got rate-limited with no dialog.
+        await self.ui.call("unlock")
+        for i in range(6):
+            r = await self.ui.call("grant", id=f"e.{i % 2}")
+            self.assertNotIn("error", r, i)
+        self.assertEqual(len(self.auth.calls), 7)
+
+    async def test_refusals_count_per_action(self):
+        await self.ui.call("unlock")
+        self.auth.outcome = polkit.DISMISSED
+        for _ in range(3):
+            await self.ui.call("grant", id="e.0")
+        self.assertEqual((await self.ui.call("grant", id="e.0"))["error"], "rate-limited")
+        self.assertEqual((await self.ui.call("delete", id="e.1"))["error"], "dismissed")
+
+    async def test_an_unanswered_denial_is_not_counted(self):
+        # Gate bug 8: an agent that dies mid-dialog (or a policy "no") is denied, not counted.
+        await self.ui.call("unlock")
+        self.auth.outcome = polkit.DENIED_UNANSWERED
+        for _ in range(5):
+            self.assertEqual((await self.ui.call("grant", id="e.0"))["error"], "denied")
+        self.auth.outcome = polkit.AUTHORIZED
+        self.assertNotIn("error", await self.ui.call("grant", id="e.0"))
 
     async def test_one_outstanding_dialog_per_bucket(self):
         await self.ui.call("unlock")

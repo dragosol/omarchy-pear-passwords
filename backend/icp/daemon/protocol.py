@@ -50,7 +50,8 @@ CLIP_REREQUEST_GRACE_S = 1.5
 IDLE_LOCK_S_DEFAULT = 0              # idle relock is off unless the user turns it on
 IDLE_LOCK_S_CHOICES = (0, 300, 900, 1800)
 REVEAL_HIDE_AFTER_S = 20
-PROMPT_ANSWERED_PER_MIN = 3          # per (uid, bucket); no-agent and busy do not count
+PROMPT_ANSWERED_PER_MIN = 3          # dismissed/denied per (uid, bucket, action); approvals,
+                                     # no-agent, busy and unanswered denials do not count
 PROMPT_OUTSTANDING = 1               # per (uid, bucket)
 NO_AGENT_FAST_FAIL_S = 0.3           # G7 fallback: a non-dismissed failure this fast = no agent
 MAX_AUTOFILL_CONNS = 4               # per uid
@@ -170,7 +171,7 @@ ERRORS: dict[str, str] = {
     "denied": "polkit said no (wrong password, fingerprint failure, policy)",
     "no-agent": "no polkit agent registered; not counted against the rate limit",
     "busy": "the agent is showing another dialog; not counted",
-    "rate-limited": "PROMPT_ANSWERED_PER_MIN answered prompts in the last minute",
+    "rate-limited": "PROMPT_ANSWERED_PER_MIN refused prompts of this action in the last minute",
     "prompt-pending": "this bucket already has a dialog open",
     "cancelled": "the request was cancelled (cancel op, superseded, or EOF)",
     # work

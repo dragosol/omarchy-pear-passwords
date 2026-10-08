@@ -254,8 +254,9 @@ How a fill works:
 - The account must match the site: the same host, or a subdomain or parent domain of a website
   saved with the account. Lookalike and public-suffix matches (`co.uk`, `github.io`) never
   count.
-- Fills are rate-limited like the window's dialogs: one at a time, at most three answered a
-  minute, and the browser's dialogs never block the window's.
+- Fills are rate-limited like the window's dialogs: one at a time, and after three dismissed
+  or denied fill dialogs in a minute, no more for the rest of it; the browser's dialogs never
+  block the window's.
 - Only `https://` pages.
 
 What to know before you turn it on:
