@@ -120,8 +120,8 @@ class WindowWiringTests(unittest.TestCase):
     def test_the_drop_down_lines_up_with_the_avatars(self):
         src = qmlscan.strip_comments(qmlscan.read(SEARCH_QML))
         panel = src[src.index('objectName: "catPanel"'):][:400]
-        self.assertIn("x: -4\n", panel)
-        self.assertIn("width: Math.max(catSearch.width + 4, 264)", panel)
+        self.assertIn("x: -6\n", panel)
+        self.assertIn("width: Math.max(catSearch.width + 6, 266)", panel)
 
     def test_the_window_going_inactive_closes_the_list(self):
         conn = CODE[CODE.index("function onStateChanged()"):]

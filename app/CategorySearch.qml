@@ -292,11 +292,11 @@ TextField {
         id: catPanel
         objectName: "catPanel"
         visible: catSearch.catOpen
-        // Lined up with the list's avatars (x 10 in the window, the field sits at 14), so no
-        // sliver of them shows beside the drop-down.
-        x: -4
+        // Its border just left of the list's avatars (x 10 in the window), so no sliver of
+        // them shows beside the drop-down.
+        x: -6
         y: catSearch.height
-        width: Math.max(catSearch.width + 4, 264)
+        width: Math.max(catSearch.width + 6, 266)
         height: popupCol.implicitHeight + 12
         color: Theme.bg
         border.width: 1
