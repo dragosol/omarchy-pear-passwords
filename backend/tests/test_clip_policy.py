@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from icp.client import clip, watchers, wayland
 from icp.client.channel import Channel
@@ -330,6 +331,30 @@ class ReaderRuleTests(unittest.TestCase):
         self.assertEqual(h.paste({200}), b"hunter2-secret")
         self.assertEqual(h.finish(), "pasted")
         self.assertEqual(h.offer.served, 1)
+
+    def test_a_partly_delivered_write_is_the_paste(self):
+        # audit: a reader that shrinks its pipe to 4096 bytes and stalls got part of a long
+        # value without using up the copy, again and again. Any byte written is the paste.
+        import fcntl
+        value = bytes(range(256)) * 64                      # 16 KiB, a long note
+        h = ClipHarness(self, value=value, timeout=5, grace=0.2)
+        r, w = os.pipe()
+        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)
+        h.holders.set(r, {300})
+        n = len(h.offer.log)
+        with mock.patch.object(clip, "WRITE_DEADLINE_S", 0.2):
+            h.fc._event(h.fc.source, 0, _string("text/plain;charset=utf-8"), fd=w)
+            os.close(w)
+            deadline = time.monotonic() + 5
+            while len(h.offer.log) == n:                    # never read while it writes
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+        got = read_all(r)
+        self.assertTrue(0 < len(got) < len(value))
+        self.assertEqual(h.offer.log[-1][1], "pasted-partly")
+        self.assertIsNotNone(h.offer.pasted_at)
+        self.assertEqual(h.paste({200}), b"")                # nobody else gets it now
+        self.assertEqual(h.finish(), "pasted")
 
     def test_a_vanished_holder_is_dropped_by_the_identifier(self):
         ident = clip.make_identifier(set(), describe=lambda pid: None)

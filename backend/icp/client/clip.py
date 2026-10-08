@@ -202,7 +202,7 @@ class Offer:
                 # Only the paste that already happened may ask again, and only briefly.
                 if (readers.pids == self.paste_holders
                         and self.now() - self.pasted_at <= self.grace):
-                    if _write_all(fd, self.value):
+                    if _write_all(fd, self.value) > 0:
                         self.served += 1
                         self.log.append((mime, "re-served"))
                     else:
@@ -215,14 +215,18 @@ class Offer:
                 self.refused_watchers += 1
                 self.log.append((mime, "watcher"))
                 return
-            if not _write_all(fd, self.value):
-                # The reader went away (EPIPE) or never read: nothing was pasted.
+            written = _write_all(fd, self.value)
+            if written == 0:
+                # The reader went away (EPIPE) or never read: not one byte left us.
                 self.log.append((mime, "undelivered"))
                 return
+            # Any byte that reached the pipe is the paste, whole or not: otherwise a reader
+            # that shrinks its pipe and stalls could take part of a long value again and again
+            # without ever using up the copy.
             self.served += 1
             self.pasted_at = self.now()
             self.paste_holders = readers.pids
-            self.log.append((mime, "pasted"))
+            self.log.append((mime, "pasted" if written == len(self.value) else "pasted-partly"))
         finally:
             os.close(fd)
 
@@ -256,29 +260,31 @@ class Offer:
             self.value[i] = 0
 
 
-def _write_all(fd: int, data) -> bool:
+def _write_all(fd: int, data) -> int:
     """Write without ever blocking the loop for long: a reader that never reads loses.
-    True only when every byte went into the pipe."""
+    Returns how many bytes went into the pipe (0 = nothing left us)."""
     os.set_blocking(fd, False)
     view = memoryview(data)
+    total = 0
     deadline = time.monotonic() + WRITE_DEADLINE_S
     try:
         while view:
             try:
                 n = os.write(fd, view)
                 if n <= 0:
-                    return False
+                    return total
+                total += n
                 view = view[n:]
             except BlockingIOError:
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    return False
+                    return total
                 select.select([], [fd], [], left)
             except OSError as e:
                 if e.errno in (errno.EPIPE, errno.EBADF):
-                    return False
+                    return total
                 raise
-        return True
+        return total
     finally:
         view.release()
 

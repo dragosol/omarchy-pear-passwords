@@ -68,7 +68,9 @@ a locked computer does not sync.
   `test_qml_grant_flow.py`, `test_qml_secret_copy.py`, `test_pear_exec_env.py`.
 - **pear-clip** speaks the Wayland data-control protocol itself and holds the value in memory.
   It identifies each reader by the pipe it hands over: Omarchy's history watcher gets nothing,
-  any other reader is the one counted paste, and the offer is withdrawn after that paste or
+  any other reader is the one counted paste (as soon as one byte of the value reaches its
+  pipe, so a reader that stalls part-way has used it up; a request whose pipe has no reader
+  left, or takes no byte, is not a paste), and the offer is withdrawn after that paste or
   30 s. It never uses `wl-copy` (which stages its input in `/tmp`). Tests:
   `test_clip_policy.py`, `test_repo_guards.py::ClipboardGuardTests`.
 
