@@ -282,6 +282,21 @@ class PasskeyTests(unittest.TestCase):
         (c,) = store.all()
         self.assertTrue(c.has_passkey)
 
+    def test_a_passkey_for_another_account_does_not_mark_the_login(self):
+        store = CredentialStore.from_items([
+            _login("github.com", "alex", "pw"),
+            _passkey("github.com", PK_KEY, CID, acct="bob")])
+        by = {c.username: c for c in store.all()}
+        self.assertFalse(by["alex"].has_passkey)
+        self.assertEqual((by["bob"].kind, by["bob"].domain), ("passkey", "github.com"))
+
+    def test_www_and_case_still_find_the_login(self):
+        store = CredentialStore.from_items([
+            _login("www.GitHub.com", "alex", "pw"),
+            _passkey("github.com", PK_KEY, CID, acct="alex")])
+        (c,) = store.all()
+        self.assertTrue(c.has_passkey)
+
     def test_an_ambiguous_account_gives_an_empty_user_never_a_guess(self):
         store = CredentialStore.from_items([
             _details("two.example", "a"), _details("two.example", "b"),
