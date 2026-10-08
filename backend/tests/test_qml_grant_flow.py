@@ -135,13 +135,24 @@ class MigrationScreenTests(unittest.TestCase):
         self.assertRegex(screen, r'root\.migrationPending && root\.vaultState === "locked"')
         self.assertIn("root.migrationPending = false", function_body("migrateFinish"))
 
-    def test_a_keyring_only_1x_vault_gets_its_own_screen(self):
-        # function-keyring-vaults-not-migrated
+    def test_a_keyring_vault_moves_with_no_terminal_step_and_no_pear_prompt(self):
+        # audit: the keyring-vault screen sent users to 1.3.2's terminal passphrase prompt.
+        # Now the importer reads the key from the keyring; a locked keyring gets its own
+        # unlock dialog, and only after a click here.
         self.assertIn('vaultFile.path = root.v1Dir + "/vault.enc"', CODE)
-        self.assertIn("root.v1KeyringOnly = vault && !root.v1Present", CODE)
-        self.assertIn('"migrate-keyring"', function_body("stateTitle"))
-        self.assertIn("icp passphrase", function_body("stateCommand"))
-        self.assertIn("v1Check.check()", function_body("stateAction"))
+        self.assertIn("root.v1Present = vault;", CODE)
+        self.assertIn("root.v1KeyringOnly = vault && !(kdf && check_)", CODE)
+        for gone in ("icp passphrase", "migrate-keyring", "keyringStartFresh"):
+            self.assertNotIn(gone, CODE, gone)
+        line = function_body("onMigrateLine")
+        branch = line[line.index('if (m.need === "keyring-unlock")'):]
+        branch = branch[:branch.index("return;")]
+        self.assertIn('root.migrateStep = "keyring"', branch)
+        self.assertNotIn("write(", branch)                    # nothing unlocks on its own
+        self.assertIn('unlock_keyring: true', function_body("migrateUnlockKeyring"))
+        self.assertEqual(CODE.count("root.migrateUnlockKeyring()"), 1)
+        self.assertIn('else if (root.migrateStep === "keyring") root.migrateUnlockKeyring();', CODE)
+        self.assertIn('m.error === "no-key"', line)
 
     def test_a_pending_import_with_no_vault_left_is_not_a_dead_end(self):
         # audit: migration_pending dead end. With ~/.config/icp gone the window cleared only

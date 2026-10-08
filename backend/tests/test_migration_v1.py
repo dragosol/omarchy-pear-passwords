@@ -70,6 +70,37 @@ class KeyTests(StoreCase):
             vstore.v1_key_from_passphrase(b"\xff not json", "x")
 
 
+class KeyringVaultTests(StoreCase):
+    """audit: a 1.x vault keyed by the login keyring (its default; no kdf.json, no check.enc)
+    sent users to a 1.3.2 terminal passphrase prompt. Its key now comes from the Secret
+    Service, and the daemon verifies it against vault.enc itself."""
+
+    def keyring_files(self):
+        f = v1_files()
+        del f["kdf.json"], f["check.enc"]
+        return f
+
+    def test_the_key_is_verified_against_vault_enc_without_check_enc(self):
+        f = self.keyring_files()
+        self.assertTrue(vstore.v1_key_verifies(f, v1_key()))
+        self.assertFalse(vstore.v1_key_verifies(f, bytes(32)))
+        self.assertFalse(vstore.v1_key_verifies({}, v1_key()))
+        for bad in (b"", b"x" * 31, None):
+            self.assertFalse(vstore.v1_key_verifies(f, bad))
+        # With check.enc present, check.enc decides (a passphrase vault).
+        full = v1_files()
+        self.assertTrue(vstore.v1_key_verifies(full, v1_key()))
+        full["check.enc"] = nacl.secret.SecretBox(v1_key()).encrypt(b"not-the-marker")
+        self.assertFalse(vstore.v1_key_verifies(full, v1_key()))
+
+    def test_a_keyring_vault_imports(self):
+        s = vstore.UserStore.create(UID)
+        r = s.import_v1(self.keyring_files(), v1_key())
+        self.assertEqual(r["counts"]["credentials"], V1_COUNTS["credentials"])
+        with self.assertRaises(vstore.WrongPassphrase):
+            vstore.UserStore.reset(UID).import_v1(self.keyring_files(), bytes(32))
+
+
 class ImportTests(StoreCase):
     def setUp(self):
         super().setUp()

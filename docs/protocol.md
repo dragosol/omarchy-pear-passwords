@@ -533,12 +533,15 @@ Purpose `import`:
 ```
 
 - `name` must be one of `session.enc`, `vault.enc`, `history.enc`, `nicknames.enc`,
-  `aliases.enc`, `kdf.json`, `check.enc`, `device.json`; `vault.enc`, `kdf.json` and
-  `check.enc` are required. Each file is sent in chunks of at most **32 KiB raw** with `seq`
+  `aliases.enc`, `kdf.json`, `check.enc`, `device.json`; `vault.enc` is required, and
+  `kdf.json` with `check.enc` for a passphrase vault (a vault 1.x keyed by the login keyring
+  has neither). Each file is sent in chunks of at most **32 KiB raw** with `seq`
   counting from 0; at most **4 MiB** per file. A repeated name after `eof`, a gap in `seq` or
   an oversize file is `invalid` and discards that file.
-- `import-key` is checked against `check.enc`, which must already have arrived (else
-  `incomplete`). `passphrase` runs Argon2id with the `kdf.json` parameters inside the daemon.
+- `import-key` is checked against `check.enc` when it has arrived, else against `vault.enc`
+  itself (a keyring-keyed vault; one of the two must have arrived, else `incomplete`).
+  `passphrase` needs `check.enc` and runs Argon2id with the `kdf.json` parameters inside the
+  daemon.
   A wrong key or passphrase changes nothing and may be retried.
 - `import-commit` converts in `u<uid>.tmp`, verifies, and renames into place on a match. On
   `mismatch` nothing is kept and v1 stays authoritative. On success the daemon records
@@ -616,21 +619,33 @@ processes of the same user.
 
 - stdin, line 1: the ticket. Line 2 (purpose `import` only): options
   `{"move_manifests":true|false}`. Later lines, only when asked:
-  `{"passphrase":"..."}` or `{"cancel":true}`.
+  `{"passphrase":"..."}`, `{"unlock_keyring":true}` or `{"cancel":true}`.
 - stdout: one JSON object per line:
 
 ```json
-{"stage":"reading"|"peek"|"converting"|"cleanup"|"purging"}
+{"stage":"reading"|"peek"|"keyring"|"converting"|"cleanup"|"purging"}
 {"need":"passphrase","retry":false}
+{"need":"keyring-unlock","retry":false}
 {"done":true,"counts":{...},"digest":"<hex>","backup_dir":"<abs path>","kept_manifests":["..."]}
 {"done":true,"removed":["..."],"kept":["..."]}
-{"error":"wrong-passphrase"|"mismatch"|"unsafe-file"|"no-v1"|"daemon","detail":"..."}
+{"error":"wrong-passphrase"|"mismatch"|"unsafe-file"|"no-v1"|"no-key"|"daemon","detail":"..."}
 ```
 
-- The importer first PEEKs the 1.3.2 agent (never GET). Only if that fails does it print
-  `{"need":"passphrase"}`; the window shows its one field and writes the answer to stdin; the
-  importer sends it as `import-key{passphrase}`. On `wrong-passphrase` it prints
+- A passphrase vault (`kdf.json` and `check.enc`): the importer first PEEKs the 1.3.2 agent
+  (never GET), then tries the 1.x key items in the login keyring (below). Only if both fail
+  does it print `{"need":"passphrase"}`; the window shows its one field and writes the answer
+  to stdin; the importer sends it as `import-key{passphrase}`. On `wrong-passphrase` it prints
   `{"need":"passphrase","retry":true}`.
+- A keyring vault (`vault.enc` alone, 1.x's default): there is no passphrase. The importer
+  reads the Secret Service items `{application: icp, type: master-key | lockbox-key}` from the
+  session bus, from unlocked items only (`SearchItems`, `OpenSession("plain")`, `GetSecrets`;
+  never `Unlock`, never a prompt, and a service that is not running is not started), and sends
+  each as `import-key{key_b64}`; the daemon checks it against `vault.enc`. If only locked
+  items exist it prints `{"need":"keyring-unlock"}`; on the user's click the window writes
+  `{"unlock_keyring":true}` and only then does the importer call `Service.Unlock` and
+  `Prompt.Prompt`, which show the keyring's own unlock dialog. Still locked afterwards:
+  `{"need":"keyring-unlock","retry":true}`. No key anywhere: the `no-key` error line, and
+  nothing changed.
 - `{"cancel":true}` (or EOF on stdin while asked) ends the importer with exit status 4 and no
   further output; nothing was changed. In purge mode a recorded file that is already gone is
   listed under `removed`.

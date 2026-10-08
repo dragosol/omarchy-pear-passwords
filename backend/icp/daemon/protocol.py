@@ -70,7 +70,8 @@ DEFAULT_SETTINGS = {
 # --- migration -------------------------------------------------------------------------------
 IMPORT_FILES = ("session.enc", "vault.enc", "history.enc", "nicknames.enc", "aliases.enc",
                 "kdf.json", "check.enc", "device.json")
-IMPORT_REQUIRED = ("vault.enc", "kdf.json", "check.enc")
+IMPORT_REQUIRED = ("vault.enc",)    # kdf.json + check.enc only for a passphrase vault
+IMPORT_PASSPHRASE_FILES = ("kdf.json", "check.enc")
 IMPORT_FILE_MAX = 4 * 1024 * 1024
 IMPORT_CHUNK_MAX = 32 * 1024         # raw bytes per import-file line (b64 keeps it < 64 KiB)
 

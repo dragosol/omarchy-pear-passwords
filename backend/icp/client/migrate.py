@@ -8,10 +8,20 @@ the daemon at hello, decides what happens:
 import
   1. Read ~/.config/icp safely (O_NOFOLLOW everywhere, owned by you, regular files under
      4 MiB) and stream the eight v1 files to the daemon, which converts them.
-  2. Get the old key: PEEK the 1.3.2 agent, which answers only inside the grace window of a
-     recent unlock and never prompts. Never GET: that is the command that can put a legacy
-     dialog on screen. If PEEK has nothing, ask the window for the old passphrase, once; it
-     goes to the daemon in memory, which runs Argon2id itself.
+  2. Get the old key, with no prompt of Pear's own:
+     - a passphrase vault (kdf.json + check.enc): PEEK the 1.3.2 agent, which answers only
+       inside the grace window of a recent unlock and never prompts (never GET: that is the
+       command that can put a legacy dialog on screen);
+     - then, for either kind, the key 1.x kept in your login keyring: the Secret Service items
+       {application: icp, type: master-key | lockbox-key}, read over D-Bus from an unlocked
+       collection. 1.x's default vault (no passphrase) is keyed by exactly that item. The
+       daemon checks every candidate against check.enc, or against vault.enc itself when
+       there is no check.enc;
+     - a keyring vault whose keyring is locked: the window says "Unlock your login keyring"
+       and, on that click, the keyring's own unlock dialog is asked for (the desktop's
+       standard prompt, not Pear's);
+     - a passphrase vault with neither: the window asks for the old passphrase, once (the one
+       in-window exception); it goes to the daemon in memory, which runs Argon2id itself.
   3. import-commit. Only after the daemon has verified the converted store against counts and
      a digest does anything here change a file: the old agent is told to LOCK and QUIT, stray
      key copies are deleted, the legacy user units are stopped (over D-Bus; any that could not
@@ -146,6 +156,12 @@ def _read_own_file(dfd: int, name: str, limit: int = protocol.IMPORT_FILE_MAX) -
         os.close(fd)
 
 
+def is_passphrase_vault(files: dict) -> bool:
+    """1.x with a passphrase set wrote kdf.json and check.enc; its default mode, the key in
+    the login keyring, wrote neither."""
+    return "kdf.json" in files and "check.enc" in files
+
+
 def read_v1(config_dir: str) -> dict[str, bytes]:
     dfd = _open_own_dir(config_dir)
     try:
@@ -216,6 +232,164 @@ def peek_key(runtime: str) -> bytearray | None:
     except (ValueError, UnicodeDecodeError):
         return None
     return key if len(key) == 32 else None
+
+
+# --- the 1.x key in the login keyring (Secret Service) ---------------------------------------
+
+SECRETS_BUS = "org.freedesktop.secrets"
+_KEY_BYTES = 32
+
+
+def decode_v1_key(stored) -> bytearray | None:
+    """1.x stored the key base64 (or, in its first releases, raw). None for anything else."""
+    raw = bytes(stored or b"")
+    if len(raw) == _KEY_BYTES:
+        return bytearray(raw)
+    try:
+        key = base64.b64decode(raw.strip(), validate=True)
+    except (ValueError, TypeError):
+        return None
+    return bytearray(key) if len(key) == _KEY_BYTES else None
+
+
+class SecretServiceKeyring:
+    """Reads the 1.x key items from the Secret Service over the session bus (jeepney, which
+    reads DBUS_SESSION_BUS_ADDRESS itself; pear-exec has checked it is the user's own bus).
+
+    keys() never unlocks anything and never shows a prompt: it reads only unlocked items, and
+    reports whether locked ones exist. unlock() is called only after the user clicked "Unlock
+    your login keyring" in the window: it asks the keyring for its own unlock dialog
+    (Service.Unlock, then Prompt.Prompt) and waits for the answer. The service is never
+    started by us: if it is not running there is simply no key."""
+
+    def __init__(self, open_bus=None, prompt_timeout: float = 300.0):
+        self._open_bus = open_bus
+        self.prompt_timeout = prompt_timeout
+
+    def _connect(self):
+        if self._open_bus is not None:
+            return self._open_bus()
+        from jeepney.io.blocking import open_dbus_connection
+        return open_dbus_connection(bus="SESSION")
+
+    @staticmethod
+    def _call(conn, path, iface, method, sig=None, body=(), timeout=10.0):
+        from jeepney import DBusAddress, HeaderFields, MessageType, new_method_call
+        bus = "org.freedesktop.DBus" if iface == "org.freedesktop.DBus" else SECRETS_BUS
+        addr = DBusAddress(path, bus_name=bus, interface=iface)
+        reply = conn.send_and_get_reply(new_method_call(addr, method, sig, body),
+                                        timeout=timeout)
+        if reply.header.message_type == MessageType.error:
+            raise RuntimeError(str(reply.header.fields.get(HeaderFields.error_name, "error")))
+        return reply.body
+
+    def _running(self, conn) -> bool:
+        body = self._call(conn, "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                          "NameHasOwner", "s", (SECRETS_BUS,))
+        return bool(body and body[0])
+
+    def _search(self, conn) -> tuple[list[str], list[str]]:
+        unlocked, locked = [], []
+        for attrs in SECRET_SERVICE_ITEMS:
+            body = self._call(conn, "/org/freedesktop/secrets", "org.freedesktop.Secret.Service",
+                              "SearchItems", "a{ss}", (attrs,))
+            if len(body) == 2:
+                unlocked += [p for p in body[0] if p not in unlocked]
+                locked += [p for p in body[1] if p not in locked]
+        return unlocked, locked
+
+    def keys(self) -> tuple[list[bytearray], bool]:
+        """(candidate keys from unlocked items, whether a locked item exists)."""
+        try:
+            conn = self._connect()
+        except Exception:
+            return [], False
+        keys: list[bytearray] = []
+        try:
+            if not self._running(conn):
+                return [], False
+            unlocked, locked = self._search(conn)
+            if unlocked:
+                _, session = self._call(conn, "/org/freedesktop/secrets",
+                                        "org.freedesktop.Secret.Service", "OpenSession", "sv",
+                                        ("plain", ("s", "")))
+                try:
+                    body = self._call(conn, "/org/freedesktop/secrets",
+                                      "org.freedesktop.Secret.Service", "GetSecrets", "aoo",
+                                      (unlocked, session))
+                    secrets_ = body[0] if body else {}
+                    for path in unlocked:
+                        value = secrets_.get(path)
+                        key = decode_v1_key(value[2]) if value and len(value) >= 3 else None
+                        if key is not None:
+                            keys.append(key)
+                    secrets_ = None
+                finally:
+                    try:
+                        self._call(conn, session, "org.freedesktop.Secret.Session", "Close")
+                    except Exception:
+                        pass
+            return keys, bool(locked)
+        except Exception:
+            return keys, False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def unlock(self) -> bool:
+        """Ask the keyring to unlock the locked 1.x items with its own dialog. True when the
+        user unlocked it (or nothing was locked)."""
+        try:
+            conn = self._connect()
+        except Exception:
+            return False
+        try:
+            if not self._running(conn):
+                return False
+            _, locked = self._search(conn)
+            if not locked:
+                return True
+            _, prompt = self._call(conn, "/org/freedesktop/secrets",
+                                   "org.freedesktop.Secret.Service", "Unlock", "ao", (locked,))
+            if prompt in ("/", "", None):
+                return True
+            return self._prompt(conn, prompt)
+        except Exception:
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _prompt(self, conn, prompt: str) -> bool:
+        from jeepney import MatchRule
+        from jeepney.bus_messages import message_bus
+        rule = MatchRule(type="signal", interface="org.freedesktop.Secret.Prompt",
+                         member="Completed", path=prompt)
+        conn.send_and_get_reply(message_bus.AddMatch(rule), timeout=10)
+        with conn.filter(rule) as queue:
+            self._call(conn, prompt, "org.freedesktop.Secret.Prompt", "Prompt", "s", ("",))
+            msg = conn.recv_until_filtered(queue, timeout=self.prompt_timeout)
+        dismissed = bool(msg.body[0]) if msg.body else True
+        return not dismissed
+
+
+def _try_keyring(daemon: "Channel", keyring) -> tuple[bool, bool]:
+    """Send every candidate key from the keyring; (accepted, locked items exist)."""
+    keys, locked = keyring.keys()
+    accepted = False
+    try:
+        for key in keys:
+            if not accepted and _send_key(daemon,
+                                          key_b64=base64.b64encode(bytes(key)).decode("ascii")):
+                accepted = True
+    finally:
+        for key in keys:
+            key[:] = bytes(len(key))
+    return accepted, locked
 
 
 # --- cleanup after a verified import --------------------------------------------------------
@@ -503,7 +677,7 @@ def _send_key(daemon: Channel, **field) -> bool:
 
 
 def do_import(daemon: Channel, stdin, out: Out, home: str, runtime: str,
-              stop_units=None, secret_service=None, retire_app=None) -> int:
+              stop_units=None, secret_service=None, retire_app=None, keyring=None) -> int:
     try:
         opts = json.loads(stdin_line(stdin) or "{}")
     except ValueError:
@@ -513,20 +687,44 @@ def do_import(daemon: Channel, stdin, out: Out, home: str, runtime: str,
 
     out(stage="reading")
     files = read_v1(config_dir)
+    passphrase_vault = is_passphrase_vault(files)
     for name in protocol.IMPORT_FILES:
         if name in files:
             _send_file(daemon, name, files[name])
     files.clear()
 
-    out(stage="peek")
-    key = peek_key(runtime)
     accepted = False
-    if key is not None:
+    if passphrase_vault:
+        out(stage="peek")
+        key = peek_key(runtime)
+        if key is not None:
+            try:
+                accepted = _send_key(daemon,
+                                     key_b64=base64.b64encode(bytes(key)).decode("ascii"))
+            finally:
+                for i in range(len(key)):
+                    key[i] = 0
+    keyring = keyring or SecretServiceKeyring()
+    locked = False
+    if not accepted:
+        out(stage="keyring")
+        accepted, locked = _try_keyring(daemon, keyring)
+    asked = False
+    while not accepted and not passphrase_vault:
+        # 1.x's default vault: its key is only in the login keyring. No passphrase exists.
+        if not locked:
+            raise MigrateError("no-key", "the 1.x vault's key is not in your login keyring")
+        out(need="keyring-unlock", retry=asked)
         try:
-            accepted = _send_key(daemon, key_b64=base64.b64encode(bytes(key)).decode("ascii"))
-        finally:
-            for i in range(len(key)):
-                key[i] = 0
+            line = stdin_line(stdin)
+            msg = json.loads(line) if line is not None else {"cancel": True}
+        except ValueError:
+            msg = {"cancel": True}
+        if not isinstance(msg, dict) or msg.get("unlock_keyring") is not True:
+            return 4                      # the window cancelled; nothing has changed
+        asked = True
+        keyring.unlock()                  # the keyring's own dialog, after the user's click
+        accepted, locked = _try_keyring(daemon, keyring)
     retry = False
     while not accepted:
         out(need="passphrase", retry=retry)
@@ -640,7 +838,7 @@ def do_purge(daemon: Channel, hello: dict, out: Out, home: str) -> int:
 
 
 def run(stdin, stdout, socket_path: str, home: str, runtime: str,
-        stop_units=None, secret_service=None, retire_app=None) -> int:
+        stop_units=None, secret_service=None, retire_app=None, keyring=None) -> int:
     out = Out(stdout)
     try:
         ticket = stdin_line(stdin, 256)
@@ -658,7 +856,7 @@ def run(stdin, stdout, socket_path: str, home: str, runtime: str,
     try:
         if hello.get("purpose") == "import":
             return do_import(daemon, stdin, out, home, runtime, stop_units, secret_service,
-                             retire_app)
+                             retire_app, keyring)
         if hello.get("purpose") == "purge":
             return do_purge(daemon, hello, out, home)
         out(error="daemon", detail="unknown purpose")

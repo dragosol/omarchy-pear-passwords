@@ -96,6 +96,26 @@ def key_opens(check_enc: bytes, key: bytes) -> bool:
     return hmac.compare_digest(plain, CHECK_PLAINTEXT)
 
 
+def key_verifies(files: dict, key: bytes) -> bool:
+    """Whether `key` is the vault's key: it opens check.enc when there is one (a passphrase
+    vault), else it opens vault.enc itself (a vault keyed by the login keyring, which 1.x
+    wrote without check.enc or kdf.json). Both are XSalsa20-Poly1305 MACs: a wrong key never
+    passes either."""
+    if not isinstance(key, (bytes, bytearray)) or len(key) != KEY_BYTES:
+        return False
+    check = files.get("check.enc")
+    if check is not None:
+        return key_opens(check, key)
+    vault = files.get("vault.enc")
+    if vault is None:
+        return False
+    try:
+        nacl.secret.SecretBox(bytes(key)).decrypt(bytes(vault))
+    except (nacl.exceptions.CryptoError, TypeError, ValueError):
+        return False
+    return True
+
+
 # --- the files -------------------------------------------------------------------------------
 
 @dataclass
@@ -115,7 +135,7 @@ def _open(files: dict, name: str, key: bytes, field_name: str, typ, default):
     try:
         doc = json.loads(nacl.secret.SecretBox(key).decrypt(bytes(blob)).decode("utf-8"))
     except (nacl.exceptions.CryptoError, UnicodeDecodeError, ValueError, TypeError):
-        raise ImportMismatch(f"{name} does not open with the key that opens check.enc") \
+        raise ImportMismatch(f"{name} does not open with the vault's key") \
             from None
     if field_name is None:
         value = doc

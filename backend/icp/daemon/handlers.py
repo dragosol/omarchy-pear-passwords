@@ -1140,8 +1140,11 @@ async def op_import_key(reg, conn, req):
     has_key, has_pass = "key_b64" in req, "passphrase" in req
     if has_key == has_pass:
         raise OpError("bad-request")
+    # A key is checked against check.enc (a passphrase vault), or against vault.enc itself
+    # (a vault 1.x keyed by the login keyring: no check.enc, no kdf.json, no passphrase).
     check = _done(conn, "check.enc")
-    if check is None:
+    vault = _done(conn, "vault.enc")
+    if check is None and (vault is None or has_pass):
         raise OpError("incomplete")
     lock = conn.data.setdefault("key_lock", asyncio.Lock())
     async with lock:
@@ -1165,7 +1168,9 @@ async def op_import_key(reg, conn, req):
                 raise OpError("invalid", field="kdf.json") from None
             finally:
                 passphrase = None
-        if not vstore.v1_key_opens(check, key):
+        proof = {"check.enc": check} if check is not None else {"vault.enc": vault}
+        ok = await asyncio.to_thread(vstore.v1_key_verifies, proof, key)
+        if not ok:
             raise OpError("wrong-passphrase")
         old = conn.data.get("key")
         if isinstance(old, bytearray):

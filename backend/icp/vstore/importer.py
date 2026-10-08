@@ -41,8 +41,8 @@ def import_v1(store: UserStore, files: dict, key: bytes) -> dict:
     if store._doc["entries"]:
         raise StoreError("this store already holds entries; an import never merges")
     files = _check_files(files)
-    if not legacy.key_opens(files["check.enc"], key):
-        raise WrongPassphrase("the key does not open check.enc")
+    if not legacy.key_verifies(files, key):
+        raise WrongPassphrase("the key does not open check.enc (or vault.enc without one)")
 
     canon = legacy.to_canonical(legacy.read(files, key))
     want_counts, want_digest = legacy.counts(canon), legacy.digest(canon)

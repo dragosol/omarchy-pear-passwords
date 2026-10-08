@@ -194,10 +194,12 @@ class MigrationTests(Base):
         self.assertEqual((r["size"], r["sha256"]), (len(big), hashlib.sha256(big).hexdigest()))
         self.assertEqual((await m.call("import-commit"))["error"], "incomplete")
         await self.send_file(m, "kdf.json", b'{"fake": true}')
+        # No check.enc yet: the key is checked against vault.enc (a keyring vault), which
+        # this one does not open.
         self.assertEqual((await m.call("import-key", key_b64=base64.b64encode(b"k" * 32)
-                                       .decode()))["error"], "incomplete")
+                                       .decode()))["error"], "wrong-passphrase")
         await self.send_file(m, "check.enc", b"check")
-        with mock.patch.object(vstore, "v1_key_opens", lambda check, key: key == b"k" * 32):
+        with mock.patch.object(vstore, "v1_key_verifies", lambda files, key: key == b"k" * 32):
             r = await m.call("import-key", key_b64=base64.b64encode(b"j" * 32).decode())
             self.assertEqual(r["error"], "wrong-passphrase")
             r = await m.call("import-key", key_b64=base64.b64encode(b"k" * 32).decode())
@@ -231,7 +233,7 @@ class MigrationTests(Base):
             await self.send_file(m, name, b"x")
         with mock.patch.object(vstore, "v1_key_from_passphrase",
                                lambda kdf, pw: b"k" * 32 if pw == "right" else b"w" * 32), \
-                mock.patch.object(vstore, "v1_key_opens", lambda check, key: key == b"k" * 32):
+                mock.patch.object(vstore, "v1_key_verifies", lambda files, key: key == b"k" * 32):
             self.assertEqual((await m.call("import-key", passphrase="wrong"))["error"],
                              "wrong-passphrase")
             self.assertTrue((await m.call("import-key", passphrase="right"))["ok"])
@@ -256,7 +258,7 @@ class MigrationTests(Base):
         m = await self.migrate()
         for name, data in (("vault.enc", b"mismatch"), ("kdf.json", b"x"), ("check.enc", b"x")):
             await self.send_file(m, name, data)
-        with mock.patch.object(vstore, "v1_key_opens", lambda c, k: True):
+        with mock.patch.object(vstore, "v1_key_verifies", lambda f, k: True):
             await m.call("import-key", key_b64=base64.b64encode(b"k" * 32).decode())
         self.assertEqual((await m.call("import-commit"))["error"], "mismatch")
         self.assertEqual((await m.call("import-commit"))["error"], "incomplete")
@@ -284,6 +286,26 @@ class MigrationTests(Base):
         m2 = await self.migrate()
         self.assertIsNotNone(m2)
         self.assertIn("reset", self.h.store().calls)
+
+    async def test_a_keyring_vault_imports_with_its_key_checked_against_vault_enc(self):
+        # audit: keyring-keyed 1.x vaults (no kdf.json, no check.enc) could not be imported.
+        m = await self.migrate()
+        await self.send_file(m, "vault.enc", b"V" * 64)
+        self.assertEqual((await m.call("import-key", passphrase="x"))["error"], "incomplete")
+        seen = []
+
+        def verifies(files, key):
+            seen.append(sorted(files))
+            return key == b"k" * 32
+        with mock.patch.object(vstore, "v1_key_verifies", verifies):
+            r = await m.call("import-key", key_b64=base64.b64encode(b"j" * 32).decode())
+            self.assertEqual(r["error"], "wrong-passphrase")
+            r = await m.call("import-key", key_b64=base64.b64encode(b"k" * 32).decode())
+            self.assertEqual(r, {"rid": m.rid, "ok": True})
+        self.assertEqual(seen, [["vault.enc"], ["vault.enc"]])
+        r = await m.call("import-commit", backup_dir="/home/u/.config/icp.v1-backup-20261008")
+        self.assertIn("counts", r)
+        self.assertEqual(self.dialogs(), [paths.ACTION_MANAGE])        # nothing else asked
 
     async def _pending_after_a_closed_window(self):
         m = await self.migrate()
@@ -498,6 +520,7 @@ class TpmMoveTests(Base):
     async def test_the_move_is_its_own_manage_dialog(self):
         self.st.tpm_state = "available"
         await self.ui.call("unlock")
+        await self.ui.event("synced")          # the unlock's sync holds `busy` until it ends
         r = await self.ui.call("tpm-move")
         self.assertEqual(r, {"rid": self.ui.rid, "sealed_with": "host+tpm2"})
         self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK, paths.ACTION_MANAGE])
@@ -506,6 +529,7 @@ class TpmMoveTests(Base):
     async def test_a_refused_dialog_moves_nothing(self):
         self.st.tpm_state = "available"
         await self.ui.call("unlock")
+        await self.ui.event("synced")
         self.h.authority.outcome = polkit.DENIED
         r = await self.ui.call("tpm-move")
         self.assertEqual(r["error"], "denied")

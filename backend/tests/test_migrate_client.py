@@ -55,7 +55,8 @@ class FakeDaemon:
                         "sha256": hashlib.sha256(self.files[name]).hexdigest()}
             return {"rid": rid, "ok": True}
         if op == "import-key":
-            if "check.enc" not in self.files:
+            if "check.enc" not in self.files and ("vault.enc" not in self.files
+                                                  or "passphrase" in req):
                 return {"rid": rid, "error": "incomplete"}
             ok = (req.get("key_b64") == base64.b64encode(KEY).decode()
                   or req.get("passphrase") == RIGHT_PASSPHRASE)
@@ -115,6 +116,31 @@ class FakeAgent:
                     conn.sendall(b"OK\n")
 
 
+class FakeKeyring:
+    """The Secret Service as the importer sees it: keys from unlocked items, whether locked
+    ones exist, and unlock() for after the user's click."""
+
+    def __init__(self, keys=(), locked=False, unlock_works=True, locked_keys=(KEY,)):
+        self._keys = [bytes(k) for k in keys]
+        self.locked = locked
+        self.unlock_works = unlock_works
+        self.locked_keys = [bytes(k) for k in locked_keys]
+        self.unlock_calls = 0
+        self.handed = []
+
+    def keys(self):
+        out = [bytearray(k) for k in self._keys]
+        self.handed += out
+        return out, self.locked
+
+    def unlock(self):
+        self.unlock_calls += 1
+        if self.locked and self.unlock_works:
+            self.locked = False
+            self._keys += self.locked_keys
+        return not self.locked
+
+
 class Scratch:
     def __init__(self, test):
         self.tmp = tempfile.TemporaryDirectory()
@@ -155,12 +181,19 @@ class Scratch:
         self.secret_service_calls += 1
         return 0
 
-    def run(self, daemon, stdin_lines):
+    def keyring_vault(self):
+        """1.x's default: the key only in the login keyring, no kdf.json or check.enc."""
+        for name in ("kdf.json", "check.enc"):
+            os.unlink(os.path.join(self.config, name))
+            del self.files[name]
+
+    def run(self, daemon, stdin_lines, keyring=None):
         out = io.StringIO()
+        self.keyring = keyring or FakeKeyring()
         rc = migrate.run(io.StringIO("".join(line + "\n" for line in stdin_lines)), out,
                          daemon.path, self.home, self.runtime,
                          stop_units=self.fake_stop_units, secret_service=self.fake_secret_service,
-                         retire_app=self.fake_retire_app)
+                         retire_app=self.fake_retire_app, keyring=self.keyring)
         msgs = [json.loads(line) for line in out.getvalue().splitlines()]
         return rc, msgs
 
@@ -296,6 +329,188 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class KeyringVaultTests(unittest.TestCase):
+    """audit: a 1.x vault keyed by the login keyring sent users to 1.3.2's terminal
+    passphrase prompt. Its key now comes from the Secret Service, with no prompt of Pear's."""
+
+    def test_an_unlocked_keyring_imports_with_no_prompt_at_all(self):
+        s = Scratch(self)
+        s.keyring_vault()
+        d = FakeDaemon(self, s.root)
+        agent = FakeAgent(self, s.runtime, warm=True)
+        rc, msgs = s.run(d, [TICKET, OPTS], keyring=FakeKeyring(keys=[KEY]))
+        self.assertEqual(rc, 0, msgs)
+        self.assertFalse(any("need" in m for m in msgs), msgs)
+        self.assertEqual([m.get("stage") for m in msgs if "stage" in m],
+                         ["reading", "keyring", "converting", "cleanup"])
+        self.assertNotIn("PEEK", agent.commands)        # no passphrase vault, no agent key
+        self.assertNotIn("kdf.json", d.files)
+        self.assertTrue(msgs[-1]["done"])
+        self.assertEqual(s.secret_service_calls, 1)     # the items are removed afterwards
+        for k in s.keyring.handed:
+            self.assertEqual(bytes(k), bytes(len(k)))   # every candidate was zeroed
+        self.assertNotIn(KEY.hex(), json.dumps(msgs))
+
+    def test_a_wrong_candidate_is_skipped(self):
+        s = Scratch(self)
+        s.keyring_vault()
+        d = FakeDaemon(self, s.root)
+        rc, msgs = s.run(d, [TICKET, OPTS], keyring=FakeKeyring(keys=[b"w" * 32, KEY]))
+        self.assertEqual(rc, 0, msgs)
+        self.assertEqual(len([r for r in d.seen if r["op"] == "import-key"]), 2)
+
+    def test_a_locked_keyring_asks_for_its_own_unlock_after_a_click(self):
+        s = Scratch(self)
+        s.keyring_vault()
+        d = FakeDaemon(self, s.root)
+        kr = FakeKeyring(locked=True)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"unlock_keyring": True})], keyring=kr)
+        self.assertEqual(rc, 0, msgs)
+        self.assertEqual([m for m in msgs if "need" in m],
+                         [{"need": "keyring-unlock", "retry": False}])
+        self.assertEqual(kr.unlock_calls, 1)
+        self.assertTrue(msgs[-1]["done"])
+
+    def test_the_keyring_is_never_unlocked_without_the_click(self):
+        s = Scratch(self)
+        s.keyring_vault()
+        d = FakeDaemon(self, s.root)
+        kr = FakeKeyring(locked=True)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"cancel": True})], keyring=kr)
+        self.assertEqual(rc, 4)
+        self.assertEqual(kr.unlock_calls, 0)
+        self.assertNotIn("import-commit", d.ops())
+        self.assertTrue(os.path.isdir(s.config))
+
+    def test_a_dismissed_keyring_dialog_asks_again(self):
+        s = Scratch(self)
+        s.keyring_vault()
+        d = FakeDaemon(self, s.root)
+        kr = FakeKeyring(locked=True, unlock_works=False)
+        rc, msgs = s.run(d, [TICKET, OPTS, json.dumps({"unlock_keyring": True}),
+                             json.dumps({"cancel": True})], keyring=kr)
+        self.assertEqual(rc, 4)
+        self.assertEqual([m for m in msgs if "need" in m],
+                         [{"need": "keyring-unlock", "retry": False},
+                          {"need": "keyring-unlock", "retry": True}])
+
+    def test_no_key_anywhere_is_a_clear_error_never_a_passphrase(self):
+        s = Scratch(self)
+        s.keyring_vault()
+        d = FakeDaemon(self, s.root)
+        rc, msgs = s.run(d, [TICKET, OPTS], keyring=FakeKeyring())
+        self.assertEqual(rc, 1)
+        self.assertEqual(msgs[-1]["error"], "no-key")
+        self.assertFalse(any(m.get("need") == "passphrase" for m in msgs))
+        self.assertNotIn("import-commit", d.ops())
+        self.assertTrue(os.path.isdir(s.config))
+
+    def test_a_passphrase_vault_takes_a_keyring_copy_before_asking(self):
+        s = Scratch(self)
+        d = FakeDaemon(self, s.root)
+        FakeAgent(self, s.runtime, warm=False)
+        rc, msgs = s.run(d, [TICKET, OPTS], keyring=FakeKeyring(keys=[KEY]))
+        self.assertEqual(rc, 0, msgs)
+        self.assertFalse(any("need" in m for m in msgs), msgs)
+
+    def test_decode(self):
+        self.assertEqual(migrate.decode_v1_key(base64.b64encode(KEY)), bytearray(KEY))
+        self.assertEqual(migrate.decode_v1_key(KEY), bytearray(KEY))
+        for bad in (b"", b"short", base64.b64encode(b"x" * 31), None):
+            self.assertIsNone(migrate.decode_v1_key(bad))
+
+
+class FakeSecretsBus:
+    """Just enough of a jeepney blocking connection for SecretServiceKeyring."""
+
+    def __init__(self, running=True, unlocked=(), locked=(), secrets=None, prompt="/",
+                 dismissed=False):
+        self.running, self.unlocked, self.locked = running, list(unlocked), list(locked)
+        self.secrets = secrets or {}
+        self.prompt, self.dismissed = prompt, dismissed
+        self.calls = []
+
+    def send_and_get_reply(self, msg, timeout=None):
+        from jeepney import HeaderFields, MessageType
+        f = msg.header.fields
+        member = f.get(HeaderFields.member)
+        self.calls.append((member, msg.body))
+        body = ()
+        if member == "NameHasOwner":
+            body = (self.running,)
+        elif member == "SearchItems":
+            kind = msg.body[0]["type"]
+            body = ([p for p in self.unlocked if kind in p], [p for p in self.locked if kind in p])
+        elif member == "OpenSession":
+            self.assertPlain = msg.body[0]
+            body = (("s", ""), "/org/freedesktop/secrets/session/s1")
+        elif member == "GetSecrets":
+            body = ({p: ("/s", b"", self.secrets[p], "text/plain") for p in msg.body[0]
+                     if p in self.secrets},)
+        elif member == "Unlock":
+            body = ([], self.prompt)
+        reply = mock.Mock()
+        reply.header.message_type = MessageType.method_return
+        reply.body = body
+        return reply
+
+    def filter(self, rule):
+        bus = self
+
+        class Q:
+            def __enter__(self):
+                return "q"
+
+            def __exit__(self, *a):
+                return False
+        return Q()
+
+    def recv_until_filtered(self, q, timeout=None):
+        m = mock.Mock()
+        m.body = (self.dismissed, ("s", ""))
+        return m
+
+    def close(self):
+        pass
+
+
+class SecretServiceKeyringTests(unittest.TestCase):
+    MK = "/org/freedesktop/secrets/collection/login/master-key/1"
+    LK = "/org/freedesktop/secrets/collection/login/lockbox-key/2"
+
+    def test_reads_only_unlocked_items_and_never_unlocks(self):
+        bus = FakeSecretsBus(unlocked=[self.MK], locked=[self.LK],
+                      secrets={self.MK: base64.b64encode(KEY)})
+        kr = migrate.SecretServiceKeyring(open_bus=lambda: bus)
+        keys, locked = kr.keys()
+        self.assertEqual([bytes(k) for k in keys], [KEY])
+        self.assertTrue(locked)
+        members = [m for m, _ in bus.calls]
+        self.assertNotIn("Unlock", members)
+        self.assertNotIn("Prompt", members)
+        self.assertIn("Close", members)
+        searched = [b[0] for m, b in bus.calls if m == "SearchItems"]
+        self.assertEqual(searched, [{"application": "icp", "type": "master-key"},
+                                    {"application": "icp", "type": "lockbox-key"}])
+        self.assertEqual(bus.assertPlain, "plain")
+
+    def test_a_service_that_is_not_running_is_never_started(self):
+        bus = FakeSecretsBus(running=False)
+        keys, locked = migrate.SecretServiceKeyring(open_bus=lambda: bus).keys()
+        self.assertEqual((keys, locked), ([], False))
+        self.assertEqual([m for m, _ in bus.calls], ["NameHasOwner"])
+
+    def test_unlock_uses_the_keyrings_own_prompt(self):
+        bus = FakeSecretsBus(locked=[self.MK], prompt="/org/freedesktop/secrets/prompt/p1")
+        self.assertTrue(migrate.SecretServiceKeyring(open_bus=lambda: bus).unlock())
+        members = [m for m, _ in bus.calls]
+        self.assertIn("Unlock", members)
+        self.assertIn("Prompt", members)
+        bus = FakeSecretsBus(locked=[self.MK], prompt="/org/freedesktop/secrets/prompt/p1",
+                      dismissed=True)
+        self.assertFalse(migrate.SecretServiceKeyring(open_bus=lambda: bus).unlock())
+
+
 class FileHygieneTests(unittest.TestCase):
     def _expect(self, s, code):
         d = FakeDaemon(self, s.root)
@@ -335,7 +550,7 @@ class FileHygieneTests(unittest.TestCase):
 
     def test_missing_required_is_no_v1(self):
         s = Scratch(self)
-        os.unlink(os.path.join(s.config, "kdf.json"))
+        os.unlink(os.path.join(s.config, "vault.enc"))
         self._expect(s, "no-v1")
 
     def test_no_directory_is_no_v1(self):

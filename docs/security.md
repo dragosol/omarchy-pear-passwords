@@ -152,8 +152,14 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
   `AllowUserInteraction` appears in them. Tests: `test_scheduler_no_prompt.py`,
   `test_repo_guards.py::BackgroundNeverPromptsTests`.
 - Nothing else prompts: no zenity, `systemd-ask-password`, getpass or passphrase prompt
-  anywhere in the backend or the window. Tests: `test_no_secret_prompts.py`,
-  `test_apple_ctx.py`.
+  anywhere in the backend or the window, and no terminal step. The one exception is the
+  one-time in-window field for the old 1.x passphrase, and only for a passphrase vault whose
+  key neither the 1.3.2 agent nor the login keyring still has. A 1.x vault keyed by the login
+  keyring is moved with its key read from the unlocked keyring over D-Bus and checked against
+  `vault.enc`; if the keyring is locked, its own unlock dialog (the desktop's, not Pear's) is
+  asked for only after the user clicks **Unlock keyring**. Tests:
+  `test_no_secret_prompts.py`, `test_apple_ctx.py`,
+  `test_migrate_client.py::KeyringVaultTests`, `test_migrate_client.py::SecretServiceKeyringTests`.
 
 ## 5. Autofill
 

@@ -972,8 +972,15 @@ def v1_key_opens(check_enc: bytes, key: bytes) -> bool:
     return legacy.key_opens(check_enc, key)
 
 
+def v1_key_verifies(files: dict, key: bytes) -> bool:
+    """True if `key` is the v1 vault's key: check.enc when present, else vault.enc (a vault
+    1.x keyed by the login keyring has no check.enc)."""
+    from . import legacy
+    return legacy.key_verifies(files, key)
+
+
 __all__ = [
     "EntryNotFound", "ImportMismatch", "Meta", "SealError", "SealKind", "Secrets",
     "StoreError", "StoreLocked", "StoreState", "SyncItem", "UserStore", "WrongPassphrase",
-    "v1_key_from_passphrase", "v1_key_opens",
+    "v1_key_from_passphrase", "v1_key_opens", "v1_key_verifies",
 ]

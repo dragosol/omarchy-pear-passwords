@@ -107,7 +107,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "0b0e4fac58c22f71759e3a37b7d3bbd9734d8306aeaecf2b9ca43ae81f9dd7be  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "581e8630ab20c7467c73ec590d129f9d7f86ed90f432ef415dd91f25b71e4c57  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -188,11 +188,13 @@ Your 1.x vault in `~/.config/icp` is moved into 2.0 once, when you say so. It ke
 history and nicknames, and it does not sign this computer in again.
 
 > **If 1.x never asked you for a passphrase**, its key is in your login keyring (1.x's
-> default), and 2.0 can only move a vault protected by a passphrase. Pear then shows **Your
-> 1.x vault needs a passphrase first** with the command to set one in 1.3.2
-> (`~/.local/share/pear-passwords/venv/bin/icp passphrase`); do that, then **Check again**.
-> **Start fresh instead** signs this computer in to iCloud again, without the 1.x history and
-> nicknames, and leaves `~/.config/icp` and its keyring entry where they are.
+> default). There is then nothing to type: Pear reads the key from the keyring (the item
+> 1.x saved, `application=icp`), checks it against the vault itself, and moves it. If the
+> keyring is locked, the window says **Unlock your login keyring**; clicking **Unlock
+> keyring** brings up the keyring's own unlock dialog (the desktop's, not Pear's). If the
+> key is not in the keyring at all, the window says so and nothing changes; **Start fresh
+> instead** signs this computer in to iCloud again, without the 1.x history and nicknames,
+> and leaves `~/.config/icp` where it is. No terminal step either way.
 
 > **For the smoothest move, open and unlock Pear Passwords 1.3.2 within 15 minutes before this
 > step.** 2.0 then asks 1.3.2's background agent for the key, and you type nothing.
@@ -201,9 +203,10 @@ history and nicknames, and it does not sign this computer in again.
    touches `~/.config/icp`, and 1.3.2's background agent keeps running.
 2. Open Pear Passwords 2. It shows **Move your passwords into Pear Passwords 2**, says what
    will change, and lists the 1.x background services it will stop.
-3. Click **Continue**. One dialog. If 1.3.2 was not unlocked recently, the window asks for your
-   old passphrase, this one last time, in a field inside the Pear window. A wrong passphrase
-   just asks again; nothing changes until it is right.
+3. Click **Continue**. One dialog. For a passphrase vault, if 1.3.2 was not unlocked recently
+   and the keyring holds no copy of its key, the window asks for your old passphrase, this one
+   last time, in a field inside the Pear window. A wrong passphrase just asks again; nothing
+   changes until it is right. That field is the only password Pear ever asks for itself.
 4. Pear converts everything, re-opens what it wrote and compares counts and a checksum with
    what it read. Only on an exact match does it take over: it stops 1.3.2's agent, removes the
    1.x key files and the keyring entries, stops and disables the 1.x units (`icp-host`,

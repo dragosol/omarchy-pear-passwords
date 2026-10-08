@@ -96,9 +96,8 @@ ShellRoot {
     property bool v1Present: false
     property bool v1Checked: false
     // A 1.x vault keyed by the login keyring (1.x's default): vault.enc but no kdf.json or
-    // check.enc. 2.0 can only import a passphrase vault, so it says how to get one first.
+    // check.enc. The importer reads its key from the unlocked keyring; no passphrase exists.
     property bool v1KeyringOnly: false
-    property bool keyringStartFresh: false
     // migrate-begin made keys but the import never committed (the window was closed at the
     // passphrase step): the daemon says so at hello, and the move is offered again.
     property bool migrationPending: false
@@ -112,9 +111,7 @@ ShellRoot {
         if (root.migrationPending && root.vaultState === "locked")
             return !root.v1Checked ? "connecting" : (root.v1Present ? "migrate" : "migration-pending");
         switch (root.vaultState) {
-        case "empty": return !root.v1Checked ? "connecting"
-                           : root.v1Present ? "migrate"
-                           : root.v1KeyringOnly && !root.keyringStartFresh ? "migrate-keyring" : "empty";
+        case "empty": return !root.v1Checked ? "connecting" : root.v1Present ? "migrate" : "empty";
         case "tpm-missing": case "tpm-cleared": case "damaged": return root.vaultState;
         }
         if (root.lockReason === "no-agent" || root.lockReason === "busy") return "no-agent";
@@ -423,8 +420,10 @@ ShellRoot {
         }
         function settle() {
             if (--pendingChecks > 0) return;
-            root.v1Present = kdf && check_;
-            root.v1KeyringOnly = vault && !root.v1Present;
+            // Either kind of 1.x vault can be moved: a passphrase vault (kdf.json + check.enc)
+            // or one keyed by the login keyring (vault.enc alone).
+            root.v1Present = vault;
+            root.v1KeyringOnly = vault && !(kdf && check_);
             root.v1Checked = true;
             if (root.v1Present && root.migrateStep === "") root.migrateStep = "intro";
             if (root.migrationPending && !root.v1Present) {
@@ -574,7 +573,8 @@ ShellRoot {
         onExited: function (code) {
             stdinEnabled = true;
             if (migrateProc.purge) { root.purging = false; return; }
-            if (root.migrateStep === "running" || root.migrateStep === "passphrase") {
+            if (root.migrateStep === "running" || root.migrateStep === "passphrase"
+                || root.migrateStep === "keyring") {
                 if (code !== 4) {
                     root.migrateStep = "error";
                     if (!root.migrateError) root.migrateError = "The importer stopped unexpectedly. Nothing was changed.";
@@ -1127,6 +1127,13 @@ ShellRoot {
     function onMigrateLine(m) {
         if (!m) return;
         if (m.stage) { root.migrateStage = m.stage; root.migrateStep = "running"; return; }
+        if (m.need === "keyring-unlock") {
+            // A keyring-keyed 1.x vault and a locked login keyring: the keyring's own unlock
+            // dialog is asked for only when the user clicks "Unlock keyring" here.
+            root.migrateRetry = !!m.retry;
+            root.migrateStep = "keyring";
+            return;
+        }
         if (m.need === "passphrase") {
             root.migrateRetry = !!m.retry;
             root.migrateStep = "passphrase";
@@ -1145,6 +1152,9 @@ ShellRoot {
                 : m.error === "mismatch" ? "The converted copy didn't match your old vault, so nothing was changed. Your 1.x passwords are untouched."
                 : m.error === "unsafe-file" ? "A file in ~/.config/icp isn't safe to read (" + (m.detail || "") + "). Nothing was changed."
                 : m.error === "no-v1" ? "No 1.x vault was found to move."
+                : m.error === "no-key" ? "Your 1.x vault's key isn't in your login keyring, so it can't be opened here. "
+                                         + "Nothing was changed. You can start fresh instead: sign in to iCloud and your "
+                                         + "passwords come back (local history and nicknames stay in the old vault)."
                 : "Something went wrong" + (m.detail ? ": " + m.detail : ".");
             if (root.migrateStep !== "done") root.migrateStep = "error";
         }
@@ -1155,6 +1165,12 @@ ShellRoot {
         migrateProc.write(JSON.stringify({ passphrase: oldPass.text }) + "\n");
         oldPass.text = "";
         root.migrateStep = "running";
+    }
+
+    function migrateUnlockKeyring() {
+        migrateProc.write(JSON.stringify({ unlock_keyring: true }) + "\n");
+        root.migrateStep = "running";
+        root.migrateStage = "keyring";
     }
 
     function migrateCancel() {
@@ -3703,7 +3719,7 @@ ShellRoot {
             anchors.fill: parent
             color: Theme.bg
             visible: ["connecting", "not-installed", "launcher", "daemon-failed", "abi-mismatch",
-                      "empty", "migrate-keyring", "migration-pending", "tpm-missing", "tpm-cleared",
+                      "empty", "migration-pending", "tpm-missing", "tpm-cleared",
                       "damaged"].indexOf(root.screen) >= 0
             MouseArea { anchors.fill: parent }
 
@@ -3773,11 +3789,6 @@ ShellRoot {
                     Layout.topMargin: 10
                     spacing: 10
                     AppButton {
-                        visible: root.screen === "migrate-keyring"
-                        text: "Start fresh instead…"
-                        onClicked: root.keyringStartFresh = true
-                    }
-                    AppButton {
                         visible: root.screen === "tpm-cleared" || root.screen === "damaged"
                                  || root.screen === "migration-pending"
                         text: root.startOverConfirm ? "Yes, start over" : "Start over…"
@@ -3825,6 +3836,7 @@ ShellRoot {
                         Layout.fillWidth: true
                         text: root.migrateStep === "running" ? "Moving your passwords…"
                             : root.migrateStep === "passphrase" ? "Your old Pear Passwords passphrase"
+                            : root.migrateStep === "keyring" ? "Unlock your login keyring"
                             : root.migrateStep === "done" ? "Your passwords are here"
                             : root.migrateStep === "error" ? "The move didn't finish"
                             : "Move your passwords into Pear Passwords 2"
@@ -3857,8 +3869,11 @@ ShellRoot {
                         Text {
                             textFormat: Text.PlainText
                             Layout.fillWidth: true
-                            text: "For the smoothest move, open and unlock Pear Passwords 1.3.2 within 15 minutes "
-                                + "before this step. Otherwise you'll be asked for your old passphrase, this one last time."
+                            text: root.v1KeyringOnly
+                                ? "Your 1.x vault's key is in your login keyring, so there's no passphrase to type: Pear "
+                                  + "reads it from the keyring. If the keyring is locked, you'll be asked to unlock it."
+                                : "For the smoothest move, open and unlock Pear Passwords 1.3.2 within 15 minutes "
+                                  + "before this step. Otherwise you'll be asked for your old passphrase, this one last time."
                             color: Theme.fg
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fBody
@@ -3930,6 +3945,7 @@ ShellRoot {
                             Layout.fillWidth: true
                             text: root.migrateStage === "reading" ? "Reading your 1.x vault…"
                                 : root.migrateStage === "peek" ? "Getting the key from Pear Passwords 1.3.2…"
+                                : root.migrateStage === "keyring" ? "Getting the key from your login keyring…"
                                 : root.migrateStage === "converting" ? "Converting and checking every entry…"
                                 : root.migrateStage === "cleanup" ? "Tidying up the old install…"
                                 : "Waiting for your approval…"
@@ -3957,6 +3973,22 @@ ShellRoot {
                                 }
                             }
                         }
+                    }
+
+                    // ---- a locked login keyring (keyring-keyed vault)
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        Layout.topMargin: 12
+                        visible: root.migrateStep === "keyring"
+                        text: (root.migrateRetry ? "The keyring is still locked. " : "")
+                            + "Your 1.x vault's key is in your login keyring, which is locked. Unlock it with the "
+                            + "keyring's own dialog and the move carries on; there is no Pear passphrase to type."
+                        color: root.migrateRetry ? Theme.danger : Theme.dim
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fBody
+                        lineHeight: 1.15
+                        wrapMode: Text.Wrap
                     }
 
                     // ---- the old passphrase, once
@@ -4115,7 +4147,7 @@ ShellRoot {
                         }
                         Item { Layout.fillWidth: true }
                         AppButton {
-                            visible: root.migrateStep === "passphrase"
+                            visible: root.migrateStep === "passphrase" || root.migrateStep === "keyring"
                             text: "Cancel"
                             onClicked: root.migrateCancel()
                         }
@@ -4124,9 +4156,11 @@ ShellRoot {
                             active: true
                             enabled: root.migrateStep !== "passphrase" || oldPass.text.length > 0
                             text: root.migrateStep === "done" ? "Done"
-                                : root.migrateStep === "error" ? "Back" : "Continue"
+                                : root.migrateStep === "error" ? "Back"
+                                : root.migrateStep === "keyring" ? "Unlock keyring" : "Continue"
                             onClicked: {
                                 if (root.migrateStep === "done") root.migrateFinish();
+                                else if (root.migrateStep === "keyring") root.migrateUnlockKeyring();
                                 else if (root.migrateStep === "error") { root.migrateStep = "intro"; }
                                 else if (root.migrateStep === "passphrase") root.migratePassphrase();
                                 else root.migrateBegin();
@@ -4430,7 +4464,6 @@ ShellRoot {
         case "daemon-failed": return "Pear's background service didn't start";
         case "abi-mismatch": return "Python was upgraded";
         case "empty": return "No passwords yet";
-        case "migrate-keyring": return "Your 1.x vault needs a passphrase first";
         case "migration-pending": return "The move from 1.x didn't finish";
         case "tpm-missing": return "The security chip is switched off";
         case "tpm-cleared": return "The security chip refused the keys";
@@ -4455,13 +4488,8 @@ ShellRoot {
                  + "./install.sh from the plugin folder, then paste the command it prints.";
         case "empty":
             return "Sign in to iCloud to bring in the passwords saved on your iPhone, iPad and Mac."
-                 + (root.v1KeyringOnly ? " Your 1.x vault in ~/.config/icp stays where it is, protected by your "
-                                         + "login keyring, and its history and nicknames are not brought over." : "");
-        case "migrate-keyring":
-            return "Pear Passwords 1.x kept this vault's key in your login keyring, and 2.0 can only move a vault "
-                 + "protected by a passphrase. To keep your password history and nicknames, set one in 1.3.2 "
-                 + "with the command below, then check again. Starting fresh instead signs this computer in to "
-                 + "iCloud again and leaves the 1.x vault and its keyring entry where they are.";
+                 + (root.v1KeyringOnly ? " Your 1.x vault in ~/.config/icp stays where it is, and its history and "
+                                         + "nicknames are not brought over." : "");
         case "migration-pending":
             return "An earlier move from Pear Passwords 1.x stopped before it finished, and there is no 1.x "
                  + "vault in ~/.config/icp to finish it from. Nothing was imported. Starting over makes new "
@@ -4487,7 +4515,6 @@ ShellRoot {
     }
     function stateCommand() {
         return root.screen === "daemon-failed" ? "journalctl -b -u pear-passwordsd"
-             : root.screen === "migrate-keyring" ? "~/.local/share/pear-passwords/venv/bin/icp passphrase"
              : "";
     }
     function stateButton() {
@@ -4495,7 +4522,6 @@ ShellRoot {
         case "not-installed": case "daemon-failed": case "abi-mismatch": return "Try again";
         case "launcher": return "Close";
         case "empty": return "Sign in to iCloud";
-        case "migrate-keyring": return "Check again";
         case "tpm-missing": case "tpm-cleared": case "damaged": return "Try again";
         }
         return "";
@@ -4505,7 +4531,6 @@ ShellRoot {
         case "not-installed": case "daemon-failed": case "abi-mismatch": root.reconnect(); return;
         case "launcher": Qt.quit(); return;
         case "empty": root.startSignin("login"); return;
-        case "migrate-keyring": v1Check.check(); return;
         case "tpm-missing": case "tpm-cleared": case "damaged": root.authenticate(); return;
         }
     }
