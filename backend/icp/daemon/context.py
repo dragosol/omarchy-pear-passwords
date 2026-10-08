@@ -73,6 +73,8 @@ class BackgroundFrontend:
     """The frontend of a run with nobody to ask: progress is dropped, questions raise
     NeedsLogin. UserContext.ui returns one of these when frontend is None."""
 
+    interactive = False          # nobody to answer: never trigger an Apple 2FA push
+
     def emit(self, kind: str, text: str) -> None:
         return None
 

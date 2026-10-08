@@ -102,8 +102,11 @@ def test_background_refresh_that_needs_2fa_raises_and_latches(monkeypatch, fake_
         raise ICloudError("iCloud credentials expired")
 
     def mint(record, username, password, device, anisette, *, twofa):
-        twofa("trusted")     # Apple sent a code; a background frontend cannot take it
-        pytest.fail("the code question must not return")
+        # Nobody can answer a code here, so no callback is handed down: grandslam stands
+        # down before asking Apple to push one.
+        assert twofa is None
+        from icp.auth.gsa import GSAError
+        raise GSAError("2FA required and nobody is present to answer it")
 
     monkeypatch.setattr(signin, "refresh_webservices", expired)
     monkeypatch.setattr(signin, "mint_tokens", mint)
@@ -649,3 +652,44 @@ def test_the_device_identity_lives_in_the_store():
     assert Device.load_or_create(store).serial
     with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/nonexistent"}):
         Device.load_or_create(FakeStore())        # touches no path at all
+
+
+class _TwoFactorGSA:
+    """A GSAClient whose password login is answered with a 2FA demand."""
+
+    def __init__(self, au):
+        self.au = au
+        self.triggered = []
+
+    def authenticate(self, username, password):
+        return {"Status": {"au": self.au}}, {"adsid": "1", "GsIdmsToken": "t"}
+
+    def trigger_trusted_factor(self, dsid, idms):
+        self.triggered.append("trusted")
+        return True
+
+    def trigger_sms_factor(self, *a):
+        self.triggered.append("sms")
+
+    def list_phone_numbers(self, *a):
+        self.triggered.append("phones")
+        return [{"id": 1}]
+
+
+@pytest.mark.parametrize("au", ["trustedDeviceSecondaryAuth", "secondaryAuth"])
+def test_background_run_never_triggers_a_2fa_push(monkeypatch, au):
+    # function-background-2fa-push: with nobody present, no code may be sent to the person's
+    # devices; the run stands down (needs-login) before any trigger.
+    gsa = _TwoFactorGSA(au)
+    monkeypatch.setattr(signin, "GSAClient", lambda device, anisette: gsa)
+
+    def expired(*a, **kw):
+        raise ICloudError("mmeAuthToken expired")
+    monkeypatch.setattr(signin, "refresh_webservices", expired)
+    store = FakeStore()
+    ctx = _ctx(store)                                   # no frontend: background
+    s = {"username": "a@example.test", "password": "saved"}
+    with pytest.raises(NeedsLogin):
+        apple._fresh_tokens(ctx, s, device=None, anisette=None)
+    assert gsa.triggered == []
+    assert store.status().get("needs_login") is True

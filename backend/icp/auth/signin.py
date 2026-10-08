@@ -115,7 +115,10 @@ def ensure_fresh_tokens(s: dict, device, anisette, ui) -> None:
             raise
     ui.stage("signing_in")
     ui.emit("step", "iCloud token expired - re-authenticating with the saved password...")
-    mint_tokens(s, username, password, device, anisette, twofa=twofa_prompt(ui))
+    # A frontend with nobody behind it (background sync) gets no 2FA callback at all, so
+    # grandslam stands down before Apple pushes a code to the person's devices.
+    twofa = twofa_prompt(ui) if getattr(ui, "interactive", True) else None
+    mint_tokens(s, username, password, device, anisette, twofa=twofa)
     refresh_webservices(s, device, anisette)   # retry with the fresh mmeAuthToken
 
 
