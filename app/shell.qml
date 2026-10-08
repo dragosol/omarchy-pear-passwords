@@ -598,7 +598,7 @@ ShellRoot {
                     root.status = "too many tries — wait " + (d.retry_after || 60) + " s";
                 return;
             }
-            if (d.error) { root.status = d.error; return; }
+            if (d.error) { root.status = root.errorWords(d); return; }
             root.status = "";
             root.appUnlocked = true;
             root.vaultState = "unlocked";

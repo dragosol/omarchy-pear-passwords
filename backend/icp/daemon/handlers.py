@@ -416,6 +416,9 @@ async def op_unlock(reg, conn, req):
         return await _unlocked_reply(reg, s)
     if s.ui is not conn:
         raise OpError("forbidden")
+    if s.wipe_after:
+        # The last lock is still waiting for a store call to return; no dialog until then.
+        raise OpError("seal-unavailable")
     state = await _store(reg, conn.uid, s.store.state)
     if state == "empty":
         return {"locked": True, "reason": "empty"}

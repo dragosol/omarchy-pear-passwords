@@ -10,13 +10,14 @@ the things that must be decided in exactly one place:
   supersedes a pending `grant` with a new one, and cancels on EOF.
 - lock(): every lock trigger in docs/protocol.md 4.2 ends here. It marks the uid locked first,
   then wipes the grant, revokes tickets, withdraws clip and migrate processes, cancels dialogs
-  and a running sign-in, and wipes the store's keys - synchronously, so a PrepareForSleep
-  handler can release its inhibitor knowing nothing is left.
+  and a running sign-in, and wipes the store's keys. It never waits: it runs on the event loop,
+  which serves every uid, and a store call can sit in systemd-creds for up to a minute on a
+  slow TPM. When no store call is running the keys are wiped at once; when one is, the uid is
+  marked wipe-after, every new store call for it is refused at once, and run_store wipes the
+  keys the moment the running call returns (never a half-applied sync, never a meta.v2 sealed
+  from a wiped doc).
 - run_store(): blocking UserStore and Apple calls go to a worker thread under the uid's store
-  lock. A lock that lands while such a call runs marks the uid locked at once; the store's own
-  mutex makes the key wipe wait for the store method in progress (never a half-applied sync or
-  a meta.v2 sealed from a wiped doc), and run_store wipes again when the call returns, so a
-  sync finishing late cannot leave the keys in memory.
+  lock, and wipe the keys again on the way out when a lock landed meanwhile.
 """
 
 from __future__ import annotations
@@ -124,6 +125,9 @@ class Session:
         self.last_ui_request = 0.0
         self.next_sync_at: float | None = None
         self.store_lock = asyncio.Lock()
+        # A lock landed while a store call held the store's mutex: the keys are wiped as soon
+        # as that call returns, and no other store call for this uid starts before then.
+        self.wipe_after = False
 
     def unlocked(self) -> bool:
         t = self.tier1
@@ -278,13 +282,24 @@ class Registry:
         s = self.sessions.get(uid)
         if s is None:
             raise OpError("internal")
+        if s.wipe_after:
+            raise OpError("locked")         # a lock is waiting for the running call to end
         async with s.store_lock:
+            if s.wipe_after:
+                raise OpError("locked")
             epoch = s.epoch
             try:
                 return await self._in_pool(self._store_pool, fn, *args)
             finally:
-                if s.epoch != epoch and not s.unlocked():
+                if s.wipe_after or (s.epoch != epoch and not s.unlocked()):
                     self._wipe_store(s)
+
+    def wipes_pending(self) -> bool:
+        """Whether any uid still has keys in memory waiting for a store call to return."""
+        try:
+            return any(s.wipe_after for s in list(self.sessions.values()))
+        except RuntimeError:                 # read from the logind thread mid-update
+            return True
 
     def notify_ui(self, uid: int, event: dict) -> None:
         s = self.sessions.get(uid)
@@ -320,6 +335,9 @@ class Registry:
             s.settings_loaded = True
             try:
                 d = await self.run_store(uid, s.store.load_settings)
+            except OpError:
+                s.settings_loaded = False      # a wipe is pending: read them next time
+                d = {}
             except Exception:
                 logger.exception("uid %d: settings unreadable, using defaults", uid)
                 d = {}
@@ -396,10 +414,25 @@ class Registry:
             self.lock(uid, reason)
 
     def _wipe_store(self, s: Session) -> None:
+        """Wipe the store's keys without ever waiting on the event loop. If a store call holds
+        the store right now, flag wipe-after: run_store wipes when that call returns and
+        refuses new calls until then."""
         try:
-            s.store.lock()
+            try_lock = getattr(s.store, "try_lock", None)
+            if try_lock is None:
+                s.store.lock()
+                done = True
+            else:
+                done = try_lock()
         except Exception:
             logger.exception("uid %d: store.lock() failed", s.uid)
+            return
+        if done:
+            s.wipe_after = False
+        elif not s.wipe_after:
+            s.wipe_after = True
+            logger.info("uid %d: a store call is running; its keys are wiped when it returns",
+                        s.uid)
 
     def withdraw(self, uid: int, roles=("clip", "migrate")) -> None:
         for c in list(self.conns):

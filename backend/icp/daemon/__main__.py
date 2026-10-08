@@ -102,14 +102,15 @@ async def serve(sock: socket.socket, client_gid: int) -> None:
     srv = await server.start(sock)
     stop = asyncio.Event()
 
-    def call_in_loop(fn) -> None:
+    def call_in_loop(fn, timeout: float = 10.0) -> None:
         async def run():
             fn()
-        asyncio.run_coroutine_threadsafe(run(), loop).result(timeout=10)
+        asyncio.run_coroutine_threadsafe(run(), loop).result(timeout=timeout)
 
     watcher = LogindWatcher(on_lock=registry.lock,
                             on_sleep=lambda: registry.lock_all("sleep"),
-                            call_in_loop=call_in_loop)
+                            call_in_loop=call_in_loop,
+                            pending=registry.wipes_pending)
     await asyncio.to_thread(watcher.start)
 
     scheduler = Scheduler(registry, lambda uid: handlers.background_sync(registry, uid))

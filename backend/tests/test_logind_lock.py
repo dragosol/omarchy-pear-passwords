@@ -34,7 +34,7 @@ class WatcherTests(unittest.TestCase):
         self.w = logind.LogindWatcher(
             on_lock=lambda uid, reason: self.log.append(("lock", uid, reason)),
             on_sleep=lambda: self.log.append("wipe all"),
-            call_in_loop=lambda fn: fn(),
+            call_in_loop=lambda fn, **kw: fn(),
             lookup_uid=lambda path: {S2: 2000}.get(path),
             take_inhibitor=lambda: (self.log.append("inhibitor taken"), Inhibitor(self.log))[1])
         self.w.set_owner(LOGIND)
@@ -101,7 +101,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_no_bus_is_not_fatal(self):
         w = logind.LogindWatcher(on_lock=lambda *a: None, on_sleep=lambda: None,
-                                 call_in_loop=lambda fn: fn())
+                                 call_in_loop=lambda fn, **kw: fn())
         w._take_inhibitor_fn = lambda: (_ for _ in ()).throw(OSError("no bus"))
         with self.assertLogs("icp.daemon.logind", "WARNING"):
             w.take_inhibitor()

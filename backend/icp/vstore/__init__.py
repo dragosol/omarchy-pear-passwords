@@ -139,9 +139,10 @@ _KEYS_FORMAT = 2
 
 def _serialized(fn):
     """Run the method under the store's own mutex. The daemon calls the store from a worker
-    thread (run_store) and lock() from the event loop; without this a lock landing mid-call
+    thread (run_store) and the lock from the event loop; without this a lock landing mid-call
     wiped the keys under a running apply_sync, leaving a half-applied sync or an encrypted
-    `null` written over meta.v2. lock() now waits for the call in progress to finish."""
+    `null` written over meta.v2. lock() waits for the call in progress; try_lock() never
+    waits, and leaves the wipe to the caller once that call returns."""
     @_functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
         with self._mx:
@@ -327,7 +328,24 @@ class UserStore:
     @_serialized
     def lock(self) -> None:
         """Wipe RK_list, every subkey, the plaintext meta and any cached session. Idempotent.
-        There is no partial lock: 2.0 has no sync lease."""
+        There is no partial lock: 2.0 has no sync lease. Waits for a store call in progress;
+        the daemon's event loop uses try_lock() instead."""
+        self._wipe_now()
+
+    def try_lock(self) -> bool:
+        """lock() if no store call is running right now, without waiting. Returns whether the
+        keys were wiped. False means a call holds the store (a systemd-creds call can take up
+        to a minute on a slow TPM); the caller must wipe again as soon as that call returns
+        (Registry.run_store does), and must not start another one in between."""
+        if not self._mx.acquire(blocking=False):
+            return False
+        try:
+            self._wipe_now()
+        finally:
+            self._mx.release()
+        return True
+
+    def _wipe_now(self) -> None:
         if self._rk is not None:
             self._rk.wipe()
         _keys.wipe_all(self._sub or {})

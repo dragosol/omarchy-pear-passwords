@@ -5,8 +5,10 @@ On the system bus the daemon listens for:
 - org.freedesktop.login1.Session.Lock on any session, and PropertiesChanged with
   LockedHint=true: that session's uid is locked with reason `screen-locked`;
 - Manager.PrepareForSleep(true): every uid is locked with reason `sleep` while a `delay`
-  inhibitor holds the suspend back, and only then is the inhibitor released, so no key is in
-  RAM or in a hibernation image. PrepareForSleep(false) takes a new inhibitor;
+  inhibitor holds the suspend back (SLEEP_WAIT_S at the most), and only then is the
+  inhibitor released, so no key is in RAM or in a hibernation image - unless a store call is
+  still running then (docs/security.md, "Sleep while a store call runs").
+  PrepareForSleep(false) takes a new inhibitor;
 - Manager.SessionRemoved: when a uid's last session ends it is locked (`session-ended`).
 
 Signals are accepted only from logind's own bus name. A forged one could at worst cause a
@@ -24,6 +26,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,10 @@ MANAGER_PATH = "/org/freedesktop/login1"
 MANAGER_IFACE = "org.freedesktop.login1.Manager"
 SESSION_IFACE = "org.freedesktop.login1.Session"
 PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+# How long PrepareForSleep may hold the suspend back: the lock never waits, and a store call
+# still running gets this long to return before the machine sleeps anyway.
+SLEEP_WAIT_S = 1.0
 
 INHIBIT_WHO = "Pear Passwords"
 INHIBIT_WHY = "Wipe password keys before the computer sleeps"
@@ -49,8 +56,10 @@ class LogindWatcher:
     def __init__(self, *, on_lock: Callable[[int, str], None], on_sleep: Callable[[], None],
                  call_in_loop: Callable[[Callable[[], None]], None],
                  lookup_uid: Callable[[str], int | None] | None = None,
-                 take_inhibitor: Callable[[], object] | None = None):
+                 take_inhibitor: Callable[[], object] | None = None,
+                 pending: Callable[[], bool] | None = None):
         self._on_lock = on_lock
+        self._pending = pending or (lambda: False)
         self._on_sleep = on_sleep
         self._call_in_loop = call_in_loop
         self._lookup_uid = lookup_uid or self._bus_lookup_uid
@@ -118,9 +127,21 @@ class LogindWatcher:
             self._call_in_loop(lambda: self._on_lock(uid, "screen-locked"))
 
     def before_sleep(self) -> None:
-        """Wipe every uid, wait for it, then let the machine sleep."""
+        """Wipe every uid, then let the machine sleep - after SLEEP_WAIT_S at the most.
+
+        The wipe itself never waits (Registry.lock). A uid whose store is inside a call (a
+        systemd-creds unseal on a slow TPM, a sync) is wiped the moment that call returns; we
+        give that up to SLEEP_WAIT_S and then release the inhibitor anyway. The residual risk
+        is documented in docs/security.md: a call still running then keeps its keys in RAM
+        across the suspend until it returns after resume."""
+        deadline = time.monotonic() + SLEEP_WAIT_S
         try:
-            self._call_in_loop(self._on_sleep)
+            self._call_in_loop(self._on_sleep, timeout=SLEEP_WAIT_S)
+            while self._pending() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if self._pending():
+                logger.warning("sleeping with a store call still running; its keys are "
+                               "wiped when it returns")
         finally:
             self.release_inhibitor()
 
