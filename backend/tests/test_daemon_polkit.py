@@ -13,6 +13,10 @@ from jeepney import HeaderFields, Message, MessageType, new_error, new_method_re
 from icp.daemon import paths, polkit, protocol
 from icp.daemon.polkit import Authority, Subject, classify, sanitize
 
+# How long a step may take before a test gives up. Generous: the gate VM runs the suite
+# under load, where 5 s waits for a worker thread timed out (round 1 gate finding 4).
+WAIT = 30
+
 
 class FakeBus:
     """Answers CheckAuthorization with a scripted (result, seconds) and records every message
@@ -271,11 +275,11 @@ class PromptRuleTests(unittest.IsolatedAsyncioTestCase):
         self.auth.block = True
         self.auth.started.clear()
         pending = self.ui.send("create", fields={"domain": "a.example", "password": "p"})
-        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.assertTrue(await asyncio.to_thread(self.auth.started.wait, WAIT))
         self.assertEqual((await self.ui.call("delete", id="e.1"))["error"], "prompt-pending")
         self.assertEqual((await self.ui.call("cancel", target=self.ui.rid - 1))["cancelled"],
                          True)
-        self.assertEqual((await asyncio.wait_for(pending, 5))["error"], "cancelled")
+        self.assertEqual((await asyncio.wait_for(pending, WAIT))["error"], "cancelled")
         self.assertEqual(len(self.auth.cancels), 1)
 
     async def test_new_grant_supersedes_a_pending_one(self):
@@ -283,26 +287,26 @@ class PromptRuleTests(unittest.IsolatedAsyncioTestCase):
         self.auth.block = True
         self.auth.started.clear()
         first = self.ui.send("grant", id="e.0")
-        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.assertTrue(await asyncio.to_thread(self.auth.started.wait, WAIT))
         self.auth.block = False
         second = await self.ui.call("grant", id="e.1")
         self.assertEqual(second["id"], "e.1")
-        self.assertEqual((await asyncio.wait_for(first, 5))["error"], "cancelled")
+        self.assertEqual((await asyncio.wait_for(first, WAIT))["error"], "cancelled")
 
     async def test_release_cancels_a_pending_grant(self):
         await self.ui.call("unlock")
         self.auth.block = True
         self.auth.started.clear()
         pending = self.ui.send("grant", id="e.0")
-        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.assertTrue(await asyncio.to_thread(self.auth.started.wait, WAIT))
         await self.ui.call("release")
-        self.assertEqual((await asyncio.wait_for(pending, 5))["error"], "cancelled")
+        self.assertEqual((await asyncio.wait_for(pending, WAIT))["error"], "cancelled")
 
     async def test_eof_cancels_the_dialog(self):
         self.auth.block = True
         self.auth.started.clear()
         self.ui.send("unlock")
-        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.assertTrue(await asyncio.to_thread(self.auth.started.wait, WAIT))
         self.ui.close()
         for _ in range(50):
             if self.auth.cancels:
@@ -316,7 +320,7 @@ class PromptRuleTests(unittest.IsolatedAsyncioTestCase):
         self.auth.block = True
         self.auth.started.clear()
         pending = self.ui.send("delete", id="e.1")
-        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.assertTrue(await asyncio.to_thread(self.auth.started.wait, WAIT))
         await self.h.enable_autofill(4242)
         af, _ = await self.h.hello("autofill")
         reg = self.h.reg
@@ -327,16 +331,16 @@ class PromptRuleTests(unittest.IsolatedAsyncioTestCase):
         await reg.authorize(conn, paths.ACTION_AUTOFILL, {"account": "a", "origin": "b.c"})
         self.assertEqual(self.auth.calls[-1][1], paths.ACTION_AUTOFILL)
         self.auth.release()
-        await asyncio.wait_for(pending, 5)
+        await asyncio.wait_for(pending, WAIT)
 
     async def test_lock_cancels_pending_dialogs(self):
         await self.ui.call("unlock")
         self.auth.block = True
         self.auth.started.clear()
         pending = self.ui.send("grant", id="e.0")
-        await asyncio.to_thread(self.auth.started.wait, 5)
+        self.assertTrue(await asyncio.to_thread(self.auth.started.wait, WAIT))
         self.h.reg.lock(4242, "screen-locked")
-        self.assertEqual((await asyncio.wait_for(pending, 5))["error"], "cancelled")
+        self.assertEqual((await asyncio.wait_for(pending, WAIT))["error"], "cancelled")
 
     async def test_only_prompt_ops_raise_dialogs(self):
         await self.ui.call("unlock")

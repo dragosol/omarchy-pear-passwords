@@ -370,10 +370,11 @@ class Client:
         self.writer.write((json.dumps({"op": op, "rid": rid, **fields}) + "\n").encode())
         return fut
 
-    async def call(self, op, timeout=5, **fields):
+    # 30 s: only a failing test waits that long, and the gate VM under load timed out at 5 s.
+    async def call(self, op, timeout=30, **fields):
         return await asyncio.wait_for(self.send(op, **fields), timeout)
 
-    async def event(self, name, timeout=5):
+    async def event(self, name, timeout=30):
         while True:
             for e in self.events:
                 if e["event"] == name and not e.get("_seen"):

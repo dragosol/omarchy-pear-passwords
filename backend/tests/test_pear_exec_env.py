@@ -355,8 +355,20 @@ class PearExecTests(unittest.TestCase):
         self.expect_refused(p, res)
 
     def test_compositor_must_be_the_oldest(self):
-        time.sleep(0.02)
-        younger = self.compositor("wayland-9")
+        # The younger one must really start later (in clock ticks, as pear-exec compares):
+        # under load a fixed short sleep was not always enough (round 1 gate finding 4).
+        def start(pid):
+            with open(f"/proc/{pid}/stat") as f:
+                return int(f.read().rsplit(")", 1)[1].split()[19])
+        older = start(self.comp.pid)
+        deadline = time.monotonic() + 10
+        while True:
+            time.sleep(0.02)
+            younger = self.compositor("wayland-9")
+            if start(younger.pid) > older or time.monotonic() > deadline:
+                break
+            self._reap(younger)
+        self.assertGreater(start(younger.pid), older)
         self.lock("wayland-9", younger.pid)
         p, res = self.run_exec(env=self.env(WAYLAND_DISPLAY="wayland-9"))
         self.expect_refused(p, res)

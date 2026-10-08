@@ -76,10 +76,12 @@ PCR_PUBLIC_KEY_PATHS = ("/etc/systemd/tpm2-pcr-public-key.pem",
 # Credential key types: the sd_id128 at the start of a credential. Every value below was
 # read from a real `systemd-creds encrypt` on the gate VM (Arch, OVMF, swtpm), under systemd
 # 261.2 and 262, with and without a TPM and with a tpm2-pcr-public-key.pem in place
-# (docs/security.md section 8). systemd 262 gave its TPM2 types new ids; the host-only ones
-# did not change. ONLY the types in the two ALLOWED tables are ever accepted: anything else -
-# a type a future systemd introduces, an unscoped, TPM-only, null or public-key-bound one - is
-# refused (SealRefused), never guessed at.
+# (docs/security.md section 8). systemd 262 added *_PINNED_SRK variants of the TPM2 types,
+# and its auto mode always picks those when a TPM is used (creds-util.c, v262); the older
+# TPM2 ids still exist and still decrypt, and the host-only ids did not change. The "_262"
+# names below are those pinned-SRK types. ONLY the types in the two ALLOWED tables are ever
+# accepted: anything else - a type a future systemd introduces, an unscoped, TPM-only, null
+# or public-key-bound one - is refused (SealRefused), never guessed at.
 CRED_BY_HOST = bytes.fromhex("5a1c6a86df9d4096b1d5a65e0862f19a")          # system, 261 + 262
 CRED_BY_HOST_SCOPED = bytes.fromhex("55b9ed1d38594d43a8319d2ebb332ac6")   # uid, 261 + 262
 CRED_BY_HOST_AND_TPM2 = bytes.fromhex("93a894094874449090caf2fc93cab553")  # system, 261
