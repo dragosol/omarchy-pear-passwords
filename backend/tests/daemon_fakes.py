@@ -107,6 +107,10 @@ class FakeStore:
                 "synced_at": self.synced_at if self.keys else None,
                 "needs_login": self.needs_login if self.keys else None}
 
+    def holds_nothing(self):
+        return not self.exists or not (self.metas or self.history_items or self.session
+                                       or self.nicknames)
+
     def unlock(self):
         self.calls.append("unlock")
         if self.seal_error:

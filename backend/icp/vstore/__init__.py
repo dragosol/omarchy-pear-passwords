@@ -291,6 +291,27 @@ class UserStore:
             return self._fail
         return "locked" if self._has_keys() else "empty"
 
+    def holds_nothing(self) -> bool:
+        """Whether this store keeps nothing anyone could lose, read without a key: no entry
+        or history box, no iCloud session, no aliases and no nicknames. True with no store
+        at all. A store left like that (an abandoned or reset 1.x import, a fresh store
+        never signed in) may be replaced by a migrate-begin without a dead end."""
+        if not self._has_keys():
+            return True
+        for name in (_paths.SESSION_FILE, _paths.ALIASES_FILE, _paths.NICKNAMES_FILE):
+            if _os.path.lexists(self._dir / name):
+                return False
+        for sub in (_paths.ENTRIES_DIR, _paths.HISTORY_DIR):
+            try:
+                with _os.scandir(self._dir / sub) as it:
+                    if any(True for _ in it):
+                        return False
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False              # cannot tell: treat it as holding something
+        return True
+
     def status(self) -> dict:
         """What hello reports: {state, signed_in, sealed_with, synced_at, needs_login}.
 

@@ -154,11 +154,28 @@ class MigrationScreenTests(unittest.TestCase):
         self.assertIn('else if (root.migrateStep === "keyring") root.migrateUnlockKeyring();', CODE)
         self.assertIn('m.error === "no-key"', line)
 
+    def test_only_a_confirmed_missing_vault_abandons_the_import(self):
+        # Round 2 audit, problem 3: any FileView load failure (unreadable, not a file) used
+        # to count as "no 1.x vault" and dropped the pending import on its own.
+        settle = function_body("settle")
+        calls = [m.start() for m in re.finditer(r"root\.abandonMigration\(", settle)]
+        self.assertEqual(len(calls), 1)
+        guard = settle[:calls[0]]
+        guard = guard[guard.rindex("if ("):]
+        self.assertIn("vaultMissing", guard)
+        vault_view = CODE[CODE.index("id: vaultFile"):]
+        vault_view = vault_view[:vault_view.index("FileView {")]
+        failed = vault_view[vault_view.index("onLoadFailed"):]
+        self.assertIn("v1Check.vaultMissing = error === FileViewError.FileNotFound", failed)
+        self.assertNotRegex(CODE, r"vaultMissing\s*=\s*true")
+        # Cannot tell: the window says so and keeps the record.
+        self.assertIn("vaultError", settle)
+
     def test_a_pending_import_with_no_vault_left_is_not_a_dead_end(self):
         # audit: migration_pending dead end. With ~/.config/icp gone the window cleared only
         # its own flag; every "Sign in to iCloud" then failed with migration-pending.
         settle = function_body("settle")
-        branch = settle[settle.index("if (root.migrationPending && !root.v1Present)"):]
+        branch = settle[settle.index("if (root.migrationPending && !root.v1Present && vaultMissing)"):]
         self.assertIn("root.abandonMigration(", branch[:branch.index("\n            }")])
         self.assertNotRegex(branch[:200], r"root\.migrationPending = false;")
         abandon = function_body("abandonMigration")

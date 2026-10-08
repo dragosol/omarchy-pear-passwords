@@ -227,6 +227,37 @@ class LifecycleTests(StoreCase):
             self.assertEqual(moved.read_bytes(), data, rel)
 
 
+class HoldsNothingTests(StoreCase):
+    """Round 2 audit, problem 3: migrate-begin may replace a store only when it keeps
+    nothing anyone could lose, and that has to be known without a key."""
+
+    def test_no_store_and_a_fresh_store_hold_nothing(self):
+        self.assertTrue(vstore.UserStore.open(UID).holds_nothing())
+        s = vstore.UserStore.create(UID)
+        s.lock()
+        self.assertTrue(vstore.UserStore.open(UID).holds_nothing())
+
+    def test_an_entry_a_session_aliases_or_nicknames_count(self):
+        s = self.populated(1)
+        self.assertFalse(vstore.UserStore.open(UID).holds_nothing())
+        for setup in (lambda st: st.save_session({"username": "x"}),
+                      lambda st: st.save_aliases([{"address": "a@icloud.com"}]),
+                      lambda st: st.save_nicknames({"e.1": "n"})):
+            vstore.UserStore.reset(UID)
+            st = vstore.UserStore.open(UID)
+            st.unlock()
+            self.assertTrue(st.holds_nothing())
+            setup(st)
+            st.lock()
+            self.assertFalse(vstore.UserStore.open(UID).holds_nothing())
+        del s
+
+    def test_history_alone_counts(self):
+        vstore.UserStore.create(UID).lock()
+        (self.udir / "history" / "e.1").mkdir()
+        self.assertFalse(vstore.UserStore.open(UID).holds_nothing())
+
+
 class DamageTests(StoreCase):
     def test_truncated_meta_is_damaged_and_kept(self):
         s = self.populated()

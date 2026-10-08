@@ -106,8 +106,9 @@ Replies:
 - `migration_pending`: an earlier `migrate-begin` created keys but its import never committed
   (the window was closed at the passphrase step). The window then offers the move again; a
   `signin` with mode `login` is refused with `migration-pending` until it has, or until the
-  record is dropped: `migrate-abandon` (no dialog; the window sends it when no importable 1.x
-  vault is left or "Start fresh instead" is chosen) or `reset` (`.manage`).
+  record is dropped: `migrate-abandon` (no dialog; the window sends it when `vault.enc` is
+  confirmed missing - FileNotFound, not any load failure - or "Start fresh instead" is
+  chosen) or `reset` (`.manage`).
 
 `clip` (after the ticket is checked):
 
@@ -458,9 +459,13 @@ the next grant; `idle_lock_s` restarts the idle clock.
 {"op":"autofill-enable","rid":23,"enabled":true} -> {"rid":23,"autofill":{"enabled":true,"hosts":0}}
 ```
 
-- `migrate-begin`: needs state `empty`, or a store an earlier `migrate-begin` created that
+- `migrate-begin`: needs state `empty`, a store an earlier `migrate-begin` created that
   never committed (the daemon records `migration_pending` in state.json; that store holds
-  keys and nothing else, and is renamed aside and started over). Otherwise `not-locked`.
+  keys and nothing else, and is renamed aside and started over), or any store that holds
+  nothing - no entry or history box, no iCloud session, no aliases or nicknames, read
+  without a key - which is started over the same way (an import abandoned by mistake, or a
+  store reset and never signed in, so a 1.x vault that is there can always still be moved).
+  Otherwise `not-locked`.
   Raises `.manage`, creates and seals new keys, opens tier 1 on this connection, and issues
   a `migrate`/`import` ticket. The
   UI runs `pear-exec migrate` with it (section 10.2). When the import commits, the UI gets
@@ -480,8 +485,9 @@ the next grant; `idle_lock_s` restarts the idle clock.
   sends it when it finds no importable 1.x vault left, or when you choose "Start fresh
   instead" over an unfinished move. It reveals nothing and changes no key; with nothing
   pending it is a no-op. Reply `{migration_pending:false}`.
-- `reset`: allowed in `tpm-cleared`, `damaged`, and while an import that never committed is
-  recorded (`migration_pending`; else `not-locked`). Raises `.manage`;
+- `reset`: allowed in `tpm-cleared`, `damaged`, while an import that never committed is
+  recorded (`migration_pending`), and on a store that holds nothing (as for
+  `migrate-begin`); else `not-locked`. Raises `.manage`;
   the old directory is renamed aside, never deleted. The reply `state:"empty"` means "no
   entries and no iCloud session": the fresh store already has new sealed keys and tier 1
   stays open on this connection, so the sign-in the UI then offers needs only its own
@@ -794,9 +800,9 @@ traceback.
 | `signout` | ui | `.manage` | tier 1 | `{signed_out:true}` |
 | `sync` | ui | – | – | `{queued:true}` or `{skipped}` |
 | `settings` | ui | – | – | `{settings}` |
-| `migrate-begin` | ui | `.manage` | state empty | `{ticket, ttl:10}` |
+| `migrate-begin` | ui | `.manage` | state empty, migration_pending, or a store holding nothing | `{ticket, ttl:10}` |
 | `migrate-abandon` | ui | – | – | `{migration_pending:false}` |
-| `reset` | ui | `.manage` | tpm-cleared, damaged or migration_pending | `{state:"empty"}` |
+| `reset` | ui | `.manage` | tpm-cleared, damaged, migration_pending or a store holding nothing | `{state:"empty"}` |
 | `purge-old-copy` | ui | `.manage` | an old_copy record | `{ticket, ttl:10}` |
 | `clip-history-check` | ui | `.manage` | tier 1 | `{matches}` |
 | `autofill-enable` | ui | `.manage` | – | `{autofill:{enabled, hosts}}` |

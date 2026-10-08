@@ -923,8 +923,12 @@ async def op_migrate_begin(reg, conn, req):
         raise OpError("forbidden")
     state = await _store(reg, conn.uid, s.store.state)
     # A store created by an earlier migrate-begin that never committed is started over, not
-    # refused: it holds keys and nothing else.
-    retry = state != "empty" and await _migration_pending(reg, s)
+    # refused: it holds keys and nothing else. So is any store that holds nothing at all -
+    # an import abandoned (by "Start fresh instead", or by a window that could not see the
+    # 1.x vault) or a reset store never signed in - so a 1.x vault that is there can always
+    # still be moved.
+    retry = state != "empty" and (await _migration_pending(reg, s)
+                                  or await _holds_nothing(reg, s))
     if state != "empty" and not retry:
         raise OpError("not-locked")
     epoch = s.epoch
@@ -968,6 +972,19 @@ async def op_migrate_abandon(reg, conn, req):
     return {"migration_pending": False}
 
 
+async def _holds_nothing(reg, s) -> bool:
+    """No entry, history, session, aliases or nicknames, with signed_in false: read without a
+    key, so it works while locked. False when it cannot tell."""
+    fn = getattr(s.store, "holds_nothing", None)
+    if fn is None:
+        return False
+    try:
+        st = await _store(reg, s.uid, s.store.status)
+        return not st.get("signed_in") and bool(await _store(reg, s.uid, fn))
+    except OpError:
+        return False
+
+
 async def _migration_pending(reg, s) -> bool:
     if getattr(s, "migrating", False):
         return True
@@ -995,11 +1012,13 @@ async def op_purge_old_copy(reg, conn, req):
 
 
 async def _resettable(reg, s) -> bool:
-    """reset is the way out of tpm-cleared, damaged, and an import that never committed."""
+    """reset is the way out of tpm-cleared, damaged, an import that never committed, and a
+    store that holds nothing (it loses nothing)."""
     state = await _store(reg, s.uid, s.store.state)
     if state in ("tpm-cleared", "damaged"):
         return True
-    return state != "empty" and await _migration_pending(reg, s)
+    return state != "empty" and (await _migration_pending(reg, s)
+                                 or await _holds_nothing(reg, s))
 
 
 async def op_reset(reg, conn, req):

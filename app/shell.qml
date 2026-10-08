@@ -412,8 +412,13 @@ ShellRoot {
         property bool kdf: false
         property bool check_: false
         property bool vault: false
+        // Only a load that failed because vault.enc does not exist says there is no 1.x
+        // vault; unreadable or not a file is "cannot tell", and nothing is abandoned on it.
+        property bool vaultMissing: false
+        property string vaultError: ""
         function check() {
-            kdf = false; check_ = false; vault = false; pendingChecks = 3;
+            kdf = false; check_ = false; vault = false; vaultMissing = false; vaultError = "";
+            pendingChecks = 3;
             kdfFile.path = ""; kdfFile.path = root.v1Dir + "/kdf.json";
             checkFile.path = ""; checkFile.path = root.v1Dir + "/check.enc";
             vaultFile.path = ""; vaultFile.path = root.v1Dir + "/vault.enc";
@@ -426,7 +431,10 @@ ShellRoot {
             root.v1KeyringOnly = vault && !(kdf && check_);
             root.v1Checked = true;
             if (root.v1Present && root.migrateStep === "") root.migrateStep = "intro";
-            if (root.migrationPending && !root.v1Present) {
+            if (root.migrationPending && !root.v1Present && !vaultMissing && vaultError)
+                root.status = "Pear cannot read " + root.v1Dir + "/vault.enc (" + vaultError
+                    + "), so the move from 1.x waits. Fix that and reopen Pear, or Start over.";
+            if (root.migrationPending && !root.v1Present && vaultMissing) {
                 // Nothing left to import (the 1.x vault is gone): the daemon drops its record
                 // of the unfinished move (no dialog), and this is an ordinary store again.
                 root.abandonMigration(function () {
@@ -444,7 +452,11 @@ ShellRoot {
         printErrors: false
         // Only whether it exists; its contents are never used here. Large, so not watched.
         onLoaded: { v1Check.vault = true; v1Check.settle(); }
-        onLoadFailed: v1Check.settle()
+        onLoadFailed: (error) => {
+            v1Check.vaultMissing = error === FileViewError.FileNotFound;
+            if (!v1Check.vaultMissing) v1Check.vaultError = FileViewError.toString(error);
+            v1Check.settle();
+        }
     }
     FileView {
         id: kdfFile

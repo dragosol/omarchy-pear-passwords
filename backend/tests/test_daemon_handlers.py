@@ -356,6 +356,37 @@ class MigrationTests(Base):
         self.assertEqual((await self.ui.call("migrate-begin"))["error"], "not-locked")
         self.assertEqual(self.dialogs(), [])
 
+    # --- round 2 audit, problem 3: no dead end after an abandoned or reset import ---------
+    async def test_an_abandoned_import_can_be_started_again(self):
+        # The window abandons the record whenever it cannot see vault.enc, and "Start fresh
+        # instead" does too. The store then holds keys and nothing else; when the 1.x vault
+        # is (still) there, Continue must work, not answer not-locked for ever.
+        await self._pending_after_a_closed_window()
+        await self.ui.call("migrate-abandon")
+        self.assertNotIn("migration_pending", self.h.store().settings)
+        m = await self.migrate()
+        self.assertIsNotNone(m)
+        self.assertIn("reset", self.h.store().calls)
+        self.assertEqual(self.dialogs()[self.dialogs_before:], [paths.ACTION_MANAGE])
+
+    async def test_a_store_that_holds_nothing_can_take_a_migration(self):
+        self.h.seed(n=0, signed_in=False)            # e.g. after Start over, never signed in
+        m = await self.migrate()
+        self.assertIsNotNone(m)
+        self.assertIn("reset", self.h.store().calls)
+        self.assertEqual(self.dialogs(), [paths.ACTION_MANAGE])
+
+    async def test_a_store_that_holds_nothing_can_be_reset(self):
+        self.h.seed(n=0, signed_in=False)
+        r = await self.ui.call("reset")
+        self.assertEqual(r, {"rid": self.ui.rid, "state": "empty"})
+
+    async def test_a_signed_in_store_without_entries_is_not_replaced(self):
+        self.h.seed(n=0, signed_in=True)
+        self.assertEqual((await self.ui.call("migrate-begin"))["error"], "not-locked")
+        self.assertEqual((await self.ui.call("reset"))["error"], "not-locked")
+        self.assertEqual(self.dialogs(), [])
+
     async def test_lock_withdraws_the_importer(self):
         m = await self.migrate()
         await self.ui.call("lock")
