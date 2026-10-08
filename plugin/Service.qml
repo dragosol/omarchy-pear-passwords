@@ -14,8 +14,8 @@ import Quickshell.Io
 //
 // What this does is tell you when that step is missing or out of date. pear-exec must exist,
 // be owned by root, belong to group pear-client and carry the set-gid bit (2755); without that
-// the window cannot reach its service. If the installed window differs from this checkout's,
-// an update is waiting for the same step.
+// the window cannot reach its service. If the installed snapshot ($P/VERSION) is not this
+// checkout's, an update is waiting for the same step.
 QtObject {
   id: root
 
@@ -51,10 +51,16 @@ QtObject {
     }
   }
 
-  // The installed window against this checkout's: a difference means the plugin was updated
-  // and the system step has not been re-run yet.
+  // The installed snapshot against this checkout's, exactly as install.sh compares
+  // them: $P/VERSION (written by the root step) must name this checkout's version and the
+  // sha256 of its SHA256SUMS. Any change anywhere (daemon, pear-exec, policy, units, window)
+  // changes SHA256SUMS, so a backend-only update is announced too. Read-only.
   property Process compare: Process {
-    command: ["cmp", "-s", root.checkout + "/app/shell.qml", root.prefix + "/app/shell.qml"]
+    command: ["sh", "-c",
+      'v=$(sed -n \'s/^ *"version": *"\\([0-9][0-9.]*\\)".*/\\1/p\' "$1/manifest.json" | head -n 1); '
+      + 's=$(sha256sum < "$1/SHA256SUMS" | cut -c1-64); '
+      + '[ -n "$v" ] && [ "$(cat "$2/VERSION" 2>/dev/null)" = "$(printf \'version=%s\\nsums=%s\' "$v" "$s")" ]',
+      "pear-version-check", root.checkout, root.prefix]
     running: false
     onExited: function (code) {
       root.systemState = code === 0 ? "ok" : "outdated";

@@ -471,6 +471,40 @@ class OneCommandInstallTest(unittest.TestCase):
         self.assertNotIn("venv", qml,
                          "the plugin must not build the backend")
 
+    def test_the_plugin_compares_the_installed_snapshot_not_just_shell_qml(self):
+        # installer-plugin-update-detection-ignores-version: a backend-only update (same
+        # shell.qml, new SHA256SUMS) must be reported as outdated.
+        import re
+        import subprocess
+        import tempfile
+        qml = self._read("plugin", "Service.qml")
+        block = qml[qml.index("property Process compare"):]
+        m = re.search(r"command: (\[.*?\])\n\s*running:", block, re.S)
+        self.assertIsNotNone(m, "the compare Process has no command")
+        with tempfile.TemporaryDirectory() as d:
+            checkout, prefix = os.path.join(d, "checkout"), os.path.join(d, "prefix")
+            os.makedirs(os.path.join(checkout, "app"))
+            os.makedirs(os.path.join(prefix, "app"))
+            for base in (checkout, prefix):
+                with open(os.path.join(base, "app", "shell.qml"), "w") as f:
+                    f.write("// same window\n")
+            with open(os.path.join(checkout, "manifest.json"), "w") as f:
+                f.write('{\n  "version": "2.0.1"\n}\n')
+            with open(os.path.join(checkout, "SHA256SUMS"), "w") as f:
+                f.write("a" * 64 + "  backend/icp/daemon/peer.py\n")
+            argv = eval(m.group(1), {}, {"root": type("R", (), {"checkout": checkout,
+                                                                 "prefix": prefix})})
+            run = lambda: subprocess.run(argv, capture_output=True, timeout=10).returncode
+            self.assertNotEqual(run(), 0, "no VERSION installed reads as current")
+            with open(os.path.join(checkout, "SHA256SUMS"), "rb") as f:
+                sums = __import__("hashlib").sha256(f.read()).hexdigest()
+            with open(os.path.join(prefix, "VERSION"), "w") as f:
+                f.write(f"version=2.0.1\nsums={sums}\n")
+            self.assertEqual(run(), 0, "the installed snapshot is this checkout's")
+            with open(os.path.join(checkout, "SHA256SUMS"), "w") as f:
+                f.write("b" * 64 + "  backend/icp/daemon/peer.py\n")   # backend-only change
+            self.assertNotEqual(run(), 0, "a backend-only update was not noticed")
+
     def test_the_window_gates_on_the_backend(self):
         # 2.0: the window gates on reaching the daemon, and says what is missing.
         qml = self._read("app", "shell.qml")
