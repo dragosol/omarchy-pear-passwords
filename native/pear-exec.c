@@ -173,8 +173,10 @@ static int proc_comm_is(pid_t pid, const char *want)
     return strcmp(buf, want) == 0;
 }
 
-/* Field 22 of /proc/<pid>/stat, counted after the last ')' so a comm with spaces or parens
- * cannot shift the fields. */
+/* Field 22 (starttime) of /proc/<pid>/stat, counted after the last ')' so a comm with spaces
+ * or parens cannot shift the fields. p starts on the space before field 3 (state); each hop
+ * moves to the space before the next field, so 19 hops (field 3 -> 22) land on starttime.
+ * One more hop would read field 23, the virtual size (round 2 audit, problem 1). */
 static int proc_starttime(pid_t pid, unsigned long long *out)
 {
     char path[64], buf[1024], *p;
@@ -186,7 +188,7 @@ static int proc_starttime(pid_t pid, unsigned long long *out)
     if (p == NULL)
         return -1;
     p++;
-    for (field = 2; field < 22; field++) {
+    for (field = 3; field < 22; field++) {
         p = strchr(p + 1, ' ');
         if (p == NULL)
             return -1;

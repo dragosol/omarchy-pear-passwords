@@ -33,6 +33,9 @@ CFLAGS = ["-O2", "-fstack-protector-strong", "-D_FORTIFY_SOURCE=3", "-fPIE", "-p
           "-Wl,-z,relro,-z,now", "-Wall", "-Wextra", "-Werror"]
 
 SIG = "testsig_1_2"
+# The session's compositor (started first, in setUp) reserves this much address space, so a
+# younger fake that reserves none always has the smaller virtual size (round 2 audit, problem 1).
+BIG_RESERVE = 1 << 30
 COMM = f"pfh{os.getpid() % 1000000}"
 
 FAKE_TARGET = r'''#!/usr/bin/python3 -I
@@ -49,8 +52,12 @@ sys.stdout.write("target-stdout\n")
 '''
 
 COMPOSITOR = r'''
-import socket, sys
+import mmap, socket, sys
 open("/proc/self/comm", "w").write(sys.argv[1])
+# argv[3]: bytes of address space to reserve (never touched, so no memory is used). It makes
+# the virtual size, field 23 of /proc/<pid>/stat, disagree with the start order on purpose.
+reserve = mmap.mmap(-1, int(sys.argv[3]), flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+                    | getattr(mmap, "MAP_NORESERVE", 0), prot=mmap.PROT_READ)
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind(sys.argv[2])
 s.listen(16)
@@ -131,9 +138,9 @@ class PearExecTests(unittest.TestCase):
             f.write(content)
         os.chmod(full, mode)
 
-    def compositor(self, name, comm=COMM):
+    def compositor(self, name, comm=COMM, reserve=BIG_RESERVE):
         sock = os.path.join(self.rt, name)
-        p = subprocess.Popen([sys.executable, "-c", COMPOSITOR, comm, sock],
+        p = subprocess.Popen([sys.executable, "-c", COMPOSITOR, comm, sock, str(reserve)],
                              stdout=subprocess.PIPE, text=True)
         self.addCleanup(self._reap, p)
         self.assertEqual(p.stdout.readline().strip(), "ready")
@@ -354,25 +361,43 @@ class PearExecTests(unittest.TestCase):
         p, res = self.run_exec()
         self.expect_refused(p, res)
 
-    def test_compositor_must_be_the_oldest(self):
+    @staticmethod
+    def _stat_field(pid, n):
+        """Field n (1-based, as proc(5) numbers them) of /proc/<pid>/stat."""
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[n - 3])
+
+    def _younger_small_compositor(self, name):
         # The younger one must really start later (in clock ticks, as pear-exec compares):
-        # under load a fixed short sleep was not always enough (round 1 gate finding 4).
-        def start(pid):
-            with open(f"/proc/{pid}/stat") as f:
-                return int(f.read().rsplit(")", 1)[1].split()[19])
-        older = start(self.comp.pid)
+        # under load a fixed short sleep was not always enough (round 1 gate finding 4). It
+        # reserves nothing, so it is also the smallest: a check that compared virtual size
+        # (field 23) instead of start time (field 22) picks it as "the oldest".
+        older = self._stat_field(self.comp.pid, 22)
         deadline = time.monotonic() + 10
         while True:
             time.sleep(0.02)
-            younger = self.compositor("wayland-9")
-            if start(younger.pid) > older or time.monotonic() > deadline:
+            younger = self.compositor(name, reserve=4096)
+            if self._stat_field(younger.pid, 22) > older or time.monotonic() > deadline:
                 break
             self._reap(younger)
-        self.assertGreater(start(younger.pid), older)
+        self.assertGreater(self._stat_field(younger.pid, 22), older)
+        self.assertLess(self._stat_field(younger.pid, 23), self._stat_field(self.comp.pid, 23))
+        return younger
+
+    def test_compositor_must_be_the_oldest(self):
+        younger = self._younger_small_compositor("wayland-9")
         self.lock("wayland-9", younger.pid)
         p, res = self.run_exec(env=self.env(WAYLAND_DISPLAY="wayland-9"))
         self.expect_refused(p, res)
         self.assertIn("older", p.stderr)
+
+    def test_the_oldest_compositor_works_while_a_younger_smaller_one_runs(self):
+        # A nested or test Hyprland (smaller, started later) must not lock the real session
+        # out (round 2 audit, problem 1).
+        self._younger_small_compositor("wayland-9")
+        self.lock("wayland-7", self.comp.pid)
+        p, res = self.run_exec()
+        self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_runtime_dir_rules(self):
         p, res = self.run_exec(env=self.env(XDG_RUNTIME_DIR=self.rt + "/"))
