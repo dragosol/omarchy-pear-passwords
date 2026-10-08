@@ -201,5 +201,62 @@ class OwnerDecisionsInDocsTests(unittest.TestCase):
             self.assertNotIn(stale, rest, stale)
 
 
+class ReviewedResidualsInDocsTests(unittest.TestCase):
+    """The review's honest-docs findings: what a reviewer reads must match what the code does."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.readme = _read("README.md")
+        cls.security = _read("docs", "security.md")
+        cls.residuals = _section(cls.readme, "What Pear protects against")
+
+    def test_autofill_is_not_called_unreachable(self):
+        # escape-autofill-role-ungated
+        unlocking = _section(self.readme, "How unlocking works")
+        self.assertIn("autofill hosts once you turn autofill on", unlocking)
+        self.assertNotIn("Off until the user runs `pear-passwords-autofill register`",
+                         self.security)
+        self.assertIn("autofill_enabled", _read("docs", "protocol.md") + _read(
+            "backend", "icp", "vstore", "session_store.py"))
+
+    def test_compositor_control_is_disclosed_with_its_mitigation(self):
+        # escape-compositor-control-undisclosed
+        self.assertIn("if it controls your compositor", self.residuals)
+        self.assertIn("enforce_permissions = true", self.residuals)
+        self.assertIn("A program controlling the compositor", self.security)
+
+    def test_omarchy_components_reads_and_children_are_listed(self):
+        # escape-omarchy-commons-home-reads-and-children, clipboard_ui-7
+        for doc in (_section(self.readme, "Security"), self.security):
+            for what in ("fc-match", "hyprctl -j getoption", "colors,shell}.toml",
+                         ".config/omarchy/shell.toml", "fonts.conf", "gaps"):
+                self.assertIn(what, doc, what)
+        self.assertIn("window-no-gaps.lua", self.security)
+        self.assertNotIn("no settings,\n  fonts or plugins from your home", self.readme)
+
+    def test_omarchy_screen_lock_is_not_claimed_to_lock_pear(self):
+        # installer-screen-lock-claim-false-on-omarchy
+        self.assertNotIn("press **Lock**, lock the screen, suspend", self.readme)
+        self.assertIn("Omarchy's lock does not lock Pear yet", self.readme)
+        self.assertIn("awake behind Omarchy's screen lock", self.residuals)
+        self.assertRegex(self.security, r"awake behind Omarchy's screen lock.*\| Does not hold")
+
+    def test_install_inventory_is_complete_and_the_size_is_true(self):
+        # installer-readme-inventory-inaccurate
+        install = _section(self.readme, "Install")
+        for path in ("pear-passwords-seal.socket", "pear-passwords-seal@.service",
+                     "/etc/tmpfiles.d/pear-passwords.conf", "/usr/local/lib/pear-passwords/VERSION",
+                     "uninstall-root", "etc/fonts.conf"):
+            self.assertIn(path, install, path)
+        claimed = int(re.search(r"set-gid program of about (\d+) lines", self.readme).group(1))
+        actual = len(_read("native", "pear-exec.c").splitlines())
+        self.assertLess(abs(claimed - actual) / actual, 0.1, (claimed, actual))
+
+    def test_ptt_is_not_claimed_to_protect_old_backups(self):
+        # crypto-ptt-reseal-does-not-rotate-keys
+        self.assertNotIn("With PTT on they are useless without this computer's TPM", self.readme)
+        self.assertIn("A backup taken **before** the switch", self.readme)
+
+
 if __name__ == "__main__":
     unittest.main()

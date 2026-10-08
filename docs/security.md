@@ -46,9 +46,20 @@ a locked computer does not sync.
   executes a fixed root-owned argv only if every path and parent is root-owned and not group-
   or other-writable. The set-gid exec makes the child non-dumpable whatever `ptrace_scope` is.
   Tests: `test_pear_exec_env.py`.
-- **The window** has no `IpcHandler`, renders every `Text` as plain text, logs no values, and
-  starts only a fixed list of programs. Tests: `test_qml_no_ipc.py`,
-  `test_qml_text_plain.py`, `test_qml_no_console_log.py`, `test_qml_process_allowlist.py`.
+- **The window** has no `IpcHandler`, renders every `Text` as plain text, logs no values, binds
+  neither the primary selection nor a text-input protocol (`QT_WAYLAND_DISABLED_INTERFACES`
+  from pear-exec), and starts only a fixed list of programs. The Omarchy components it
+  instantiates (Commons `Style`, `Color`, `Util`; Ui `Button`, `TextField`) add exactly
+  `hyprctl -j getoption decoration:rounding|general:gaps_out` and `fc-match -f %{family[0]}
+  monospace` (through PATH=/usr/bin, with egid pear-client) and read
+  `~/.local/state/omarchy/current/theme/{colors,shell}.toml`, `~/.config/omarchy/shell.toml`,
+  and (watch only) `~/.config/fontconfig/fonts.conf` and
+  `~/.local/state/omarchy/toggles/hypr/window-no-gaps.lua`: a same-uid program can change the
+  window's colours and sizes, not its contents. Both lists are pinned by tests, so an Omarchy
+  update that adds to them fails. Quickshell's runtime directory lets the same user kill the
+  window (`qs kill`); its log holds no account data. Tests: `test_qml_no_ipc.py`,
+  `test_qml_text_plain.py`, `test_qml_no_console_log.py`, `test_qml_process_allowlist.py`,
+  `test_qml_grant_flow.py`, `test_pear_exec_env.py`.
 - **pear-clip** speaks the Wayland data-control protocol itself and holds the value in memory.
   It identifies each reader by the pipe it hands over: Omarchy's history watcher gets nothing,
   any other reader is the one counted paste, and the offer is withdrawn after that paste or
@@ -169,7 +180,9 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
 | Network | Holds | TLS verified, `trust_env=False`, no redirects, `icloud.com` endpoint check. |
 | Disk image or backup of `/` with the host key, PTT off | Does not hold | Only LUKS protects it. |
 | The same with PTT on | Holds | Blobs need this TPM. A pre-PTT copy still opens the data as it was then (the keys were rotated, so nothing written later); delete such snapshots. |
-| Stolen laptop, off, locked, suspended or hibernated | Holds | Keys wiped on Lock, LockedHint and PrepareForSleep. |
+| Stolen laptop, off, suspended or hibernated | Holds | Keys wiped on PrepareForSleep (and on logind Lock and LockedHint where the locker sends them). |
+| Stolen laptop, awake behind Omarchy's screen lock, Pear unlocked | Does not hold | Omarchy's lock emits neither Lock nor LockedHint and G6 is not built: the keys stay until Lock, window close, idle lock or sleep. |
+| A program controlling the compositor (Hyprland plugin load or virtual keyboard/pointer, allowed by Hyprland's default `ecosystem:enforce_permissions = false`) | Does not hold | Sees what the window shows (the unlocked list, revealed values), reads what is typed into it (Apple password, 1.x passphrase, new passwords), can click Copy inside an approved grant and remove `no_screen_share`. Mitigation: `enforce_permissions = true` with `permission` rules denying `plugin` and `keyboard`, screen capture on ask. |
 | Root, the kernel, `empower`, `/etc/polkit-1/rules.d` | Not defended | Same position as systemd-homed. |
 | Old v1 ciphertext in snapshots | Residual | Crackable by guessing the old passphrase. |
 

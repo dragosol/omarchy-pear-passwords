@@ -79,8 +79,12 @@ Each dialog takes your fingerprint first. The password field appears if the read
 (about 30 seconds) or fails, or straight away when the lid is closed. A dialog is never
 remembered: there is no "keep me authorized for 5 minutes" behind any of them.
 
-**Pear locks** when you close the window, press **Lock**, lock the screen, suspend, or log out.
-Locking wipes every key from memory before the screen locks or the machine sleeps. Locking
+**Pear locks** when you close the window, press **Lock**, suspend, or log out, and every key is
+wiped from memory before the machine sleeps or the session ends. **Locking the screen with
+Omarchy's lock does not lock Pear yet:** Omarchy's lock tells logind nothing (no `Lock`, no
+`LockedHint`), and the fallback that would forward it is not built (gate G6). Press **Lock** or
+close the window before you walk away, or turn on idle locking. On desktops whose locker
+calls `loginctl lock-session` or sets `LockedHint`, locking the screen locks Pear too. Locking
 after a period of inactivity is off by default; Settings offers 5, 15 or 30 minutes. After a
 lock nothing asks again until you click **Unlock**.
 
@@ -124,6 +128,10 @@ The system step installs, and records in a receipt (`/var/lib/pear-passwords-ins
 | The autofill host wrapper (does nothing until you register a browser) | `/usr/local/lib/pear-passwords/libexec/pear-autofill-host` |
 | The opt-in autofill registration command | `/usr/local/bin/pear-passwords-autofill` |
 | The socket and service units | `/etc/systemd/system/pear-passwordsd.{socket,service}` |
+| The root seal service, a fallback installed but never enabled unless `pear-passwordsd.service` sets `PEAR_SEAL_BACKEND=seal-service`; it runs `systemd-creds` as root for the service's own keys only (docs/security.md, G1) | `/etc/systemd/system/pear-passwords-seal.socket`, `pear-passwords-seal@.service` |
+| The rule that creates the vault directory | `/etc/tmpfiles.d/pear-passwords.conf` |
+| The installed version and the hash of its `SHA256SUMS` | `/usr/local/lib/pear-passwords/VERSION` |
+| The window's system-only font configuration and the root uninstaller | `/usr/local/lib/pear-passwords/etc/fonts.conf`, `/usr/local/lib/pear-passwords/libexec/uninstall-root` |
 | The four polkit actions | `/usr/share/polkit-1/actions/io.github.dragosol.pearpasswords.policy` |
 | The `pear-passwords` user and the empty `pear-client` group | `/etc/sysusers.d/pear-passwords.conf` |
 | Your vault, readable only by `pear-passwords` | `/var/lib/pear-passwords/u<uid>/` |
@@ -344,7 +352,8 @@ again; local history and nicknames are lost). Turning PTT off by mistake is not 
 | Someone on the network | **Protected.** Every connection to Apple is verified (below). |
 | A copy of the whole disk or of `/`, with PTT off | **Not protected.** The host key is in the image; only disk encryption (LUKS) protects it. Turn PTT on, or exclude the two paths above from backups. |
 | The same, with PTT on | **Protected** for copies taken after Pear moved to TPM-sealed keys. A copy from before still opens the vault as it was then. |
-| A stolen laptop, off, locked or asleep | **Protected.** Disk encryption, and Pear wipes its keys before the screen locks or the machine sleeps. |
+| A stolen laptop, off or asleep | **Protected.** Disk encryption, and Pear wipes its keys before the machine sleeps. |
+| A stolen laptop, awake behind Omarchy's screen lock | **Protected only if Pear was locked or closed first.** Omarchy's screen lock does not reach Pear (gate G6), so an unlocked Pear keeps its keys in memory until you lock it, close it, idle locking fires or the machine sleeps. |
 | Root, the kernel, admin polkit rules | **Not defended.** See below. |
 
 What a program running as you can still do, because no Linux desktop can stop it today:
@@ -357,6 +366,15 @@ What a program running as you can still do, because no Linux desktop can stop it
   browser extension asks to fill the password for …" (and the window says an autofill host is
   connected). If you approve a fill you did not just ask your browser for, that program gets
   that one password;
+- **if it controls your compositor**: with Hyprland's default `ecosystem:enforce_permissions =
+  false`, any program running as you can load a Hyprland plugin or send fake keyboard and mouse
+  input (`wtype`). It can then see everything the Pear window shows, including the account
+  list once unlocked and any password you reveal; read everything you type into it (your Apple
+  Account password, the old 1.x passphrase, new passwords); and click Copy for you (usernames
+  at any time, a password during a 2-minute view you approved). It can also remove the
+  "keep out of screen sharing" rule. To close this, set `ecosystem:enforce_permissions = true`
+  with `permission` rules that deny plugin loading and virtual keyboards and keep screen
+  capture on "ask";
 - kill your desktop shell and show its own dialog to phish your **login password**. Anything
   with your login password can also become root with sudo, so this is not Pear-specific. A
   fingerprint cannot be replayed (see the hardening option below);
@@ -382,7 +400,8 @@ the design and the gates still to be verified in a VM).
   socket-activated and sandboxed (no capabilities, read-only system, private /tmp and devices,
   a syscall filter). It is the only process that ever holds a key. <!-- tests: test_unit_hardening.py test_store_v2.py -->
 - **Only the Pear window can reach it.** The socket belongs to a group with no members, and the
-  only way into that group is `pear-exec`, a root-owned set-gid program of about 200 lines,
+  only way into that group is `pear-exec`, a root-owned set-gid program of about 560 lines
+  (about 450 without comments and blank lines),
   compiled from source on your machine. It scrubs the environment and runs one of four fixed
   root-owned programs, which the kernel then protects from debugging and memory reads. The
   service checks every connection's group, process and parent again. <!-- tests: test_daemon_peer.py test_pear_exec_env.py test_tickets.py -->
@@ -396,8 +415,9 @@ the design and the gates still to be verified in a VM).
   <!-- tests: test_no_secret_prompts.py test_apple_ctx.py -->
 - **Nothing in the background asks.** Sync and the scheduler cannot raise a dialog; they do not
   even import the code that does. <!-- tests: test_scheduler_no_prompt.py test_repo_guards.py::BackgroundNeverPromptsTests -->
-- **Locked means wiped.** Closing the window, locking the screen, suspending or logging out
-  wipes every key before the screen locks or the machine sleeps. <!-- tests: test_logind_lock.py -->
+- **Locked means wiped.** Closing the window, Lock, suspending or logging out wipes every key
+  before the machine sleeps or the session ends; so does locking the screen where the locker
+  tells logind (Omarchy's does not yet, gate G6). <!-- tests: test_logind_lock.py -->
 - **Encrypted at rest, and never deleted by mistake.** Every file is authenticated and bound to
   its name and your uid; a file that does not decrypt is reported, never deleted. Passwords are
   sealed to a key that sync never opens. <!-- tests: test_store_v2.py test_seal_reseal.py test_pwmac_sync_diff.py -->
@@ -408,8 +428,15 @@ the design and the gates still to be verified in a VM).
 - **Vault text is never treated as markup.** Every label renders as plain text, so an entry
   whose title or notes contain an `<img>` tag is shown as those characters rather than fetched.
   <!-- tests: test_qml_text_plain.py test_webauth.py::QmlTextFormatTests -->
-- **The window exposes nothing to other programs.** No IPC handler, no disk cache, no settings,
-  fonts or plugins from your home, and only a fixed list of programs it may start.
+- **The window exposes nothing to other programs.** No IPC handler, no disk cache, no fonts or
+  plugins from your home, no primary selection and no input method, and only a fixed list of
+  programs it may start. It follows your Omarchy theme, so Omarchy's own components read
+  `~/.local/state/omarchy/current/theme/{colors,shell}.toml` and `~/.config/omarchy/shell.toml`,
+  watch `~/.config/fontconfig/fonts.conf` and the window-gaps toggle, and start
+  `hyprctl -j getoption` (rounding, gaps) and `fc-match monospace`: a program running as you
+  can change the window's colours and sizes through those files, never what it shows. Quickshell
+  also keeps its runtime directory in `/run/user/<uid>/quickshell`, through which you (and so
+  any program of yours) can kill the window.
   <!-- tests: test_qml_no_ipc.py test_qml_process_allowlist.py test_qml_no_console_log.py test_pear_exec_env.py -->
 - **Autofill is opt-in and asks every time.** No installer registers a browser. A locked Pear
   tells the browser nothing, and each fill shows its own dialog for one matching account.

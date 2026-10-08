@@ -22,7 +22,10 @@ import qs.Ui as O
 //   - no console.log, of anything;
 //   - child processes only from the fixed list below: hyprctl (window rules, focus, opening a
 //     link through Hyprland so the browser does not inherit our group), pear-exec clip and
-//     migrate, the touchpad watcher and `systemctl show` for diagnostics.
+//     migrate, the touchpad watcher and `systemctl show` for diagnostics; plus, through
+//     Omarchy's Style singleton, `hyprctl -j getoption` (rounding, gaps) and `fc-match
+//     monospace`, which also re-run when your fonts.conf or the window-gaps toggle changes
+//     (test_qml_process_allowlist.py pins both lists, and Omarchy's reads from your home).
 // A secret (password, notes, history, code) enters this process only after an explicit
 // action inside that account's grant, is shown for at most `hide_after` seconds or until the
 // window loses focus, then the property is overwritten. QML strings cannot be zeroed; that
@@ -41,17 +44,21 @@ ShellRoot {
     // keep them.
     readonly property string v1Dir: home + "/.config/icp"
     readonly property string clipHistoryPath: home + "/.local/state/omarchy/clipboard-history.json"
-    // Registered once per Hyprland session, before the window maps (it stays hidden until
-    // this has run). no_screen_share keeps the window out of screen sharing and most capture
-    // tools; it is best effort, a revealed password can still be photographed.
-    readonly property string windowRulesLua: "if not _G.__pear_passwords_rules_v2 then "
+    // Registered before the window maps (it stays hidden until this has run). The layout
+    // rules once per Hyprland session; no_screen_share on every start, outside that guard, so
+    // a global set beforehand cannot keep it from being added (a config reload still drops it
+    // until Pear starts again). It keeps the window out of screen sharing and most capture
+    // tools; it is best effort, a revealed password can still be photographed, and a program
+    // that controls Hyprland can remove it (README, "What a program running as you can do").
+    readonly property string windowRulesLua: "hl.window_rule({ match = { class = [[^org\\.quickshell$]], "
+        + "title = [[^Pear Passwords$]] }, no_screen_share = true }) "
+        + "if not _G.__pear_passwords_rules_v2 then "
         + "local m = { class = [[^org\\.quickshell$]], title = [[^Pear Passwords$]] } "
         + "hl.window_rule({ match = m, tag = [[-default-opacity]] }) "
         + "hl.window_rule({ match = m, opacity = [[1 override 1 override]] }) "
         + "hl.window_rule({ match = m, float = true }) "
         + "hl.window_rule({ match = m, size = [[960 640]] }) "
         + "hl.window_rule({ match = m, center = true }) "
-        + "hl.window_rule({ match = m, no_screen_share = true }) "
         + "_G.__pear_passwords_rules_v2 = true end"
     readonly property string focusLua: "hl.dsp.focus({ window = \"title:^Pear Passwords$\" })"
     // What a site may look like before it is handed to Hyprland to open: a lowercase host of

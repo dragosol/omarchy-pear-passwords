@@ -74,6 +74,9 @@ class AllowlistTests(unittest.TestCase):
         rules = re.search(r"readonly property string windowRulesLua:(.*?)\n\s*readonly", code,
                           re.S).group(1)
         self.assertIn("no_screen_share = true", rules)
+        # escape-compositor-control-undisclosed: added on every start, not behind the
+        # once-per-session global another program could set first.
+        self.assertLess(rules.index("no_screen_share = true"), rules.index("if not _G."))
         self.assertIn(f"^{paths.WINDOW_TITLE}$", rules)
         self.assertIn(f'title: "{paths.WINDOW_TITLE}"', code)
         self.assertEqual(property_value(code, "focusLua"),
@@ -94,6 +97,93 @@ class AllowlistTests(unittest.TestCase):
                     "a.com`id`", "localhost", "a b.com", "a.com\\", "a.com'", "-a.com",
                     "a.com/<script>", "a.com/$x", "a.com\nb", ""):
             self.assertIsNone(rx.match(bad), bad)
+
+
+# What Omarchy's own components start and read once the window instantiates them (Commons/
+# Style, Color and Util through Theme.qml, Button, TextField). They run in the window with egid
+# pear-client, so they are pinned here too: an Omarchy update that adds a process or a file
+# read fails this test until it is reviewed and documented (README "Security", security.md).
+OMARCHY_ALLOWED = {
+    '["hyprctl", "-j", "getoption", "decoration:rounding"]',
+    '["hyprctl", "-j", "getoption", "general:gaps_out"]',
+    '["fc-match", "-f", "%{family[0]}", "monospace"]',
+}
+OMARCHY_HOME_READS = {
+    'Quickshell.env("HOME") + "/.config/fontconfig/fonts.conf"',
+    'Quickshell.env("HOME") + "/.local/state/omarchy/toggles/hypr/window-no-gaps.lua"',
+    'root.currentThemePath + "/colors.toml"',
+    'root.currentThemePath + "/shell.toml"',
+    'root.home + "/.config/omarchy/shell.toml"',
+}
+
+
+def used_omarchy_files() -> list[str]:
+    """Every Commons and Ui QML file the window instantiates, transitively."""
+    import test_qml_no_ipc
+    commons = os.path.join(qmlscan.OMARCHY_SHELL, "Commons")
+    ui = os.path.join(qmlscan.OMARCHY_SHELL, "Ui")
+    singletons = {}
+    with open(os.path.join(commons, "qmldir")) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 4 and parts[0] == "singleton":
+                singletons[parts[1]] = os.path.join(commons, parts[3])
+    files = [os.path.join(ui, n + ".qml") for n in test_qml_no_ipc.used_ui_components()]
+    files = [f for f in files if os.path.exists(f)]
+    todo = list(qmlscan.app_files((".qml",))) + files
+    used: set[str] = set()
+    while todo:
+        path = todo.pop()
+        code = qmlscan.blank_strings(qmlscan.strip_comments(qmlscan.read(path)))
+        for name, target in singletons.items():
+            if target not in used and re.search(rf"(?<![\w.]){name}\.", code):
+                used.add(target)
+                todo.append(target)
+    return sorted(used) + files
+
+
+@unittest.skipUnless(os.path.isdir(os.path.join(qmlscan.OMARCHY_SHELL, "Commons")),
+                     "Omarchy's shell components are not installed")
+class OmarchyComponentTests(unittest.TestCase):
+    """escape-omarchy-commons-home-reads-and-children, clipboard_ui-7."""
+
+    def setUp(self):
+        self.files = {p: qmlscan.strip_comments(qmlscan.read(p)) for p in used_omarchy_files()}
+
+    def test_the_window_instantiates_style_and_color(self):
+        names = {os.path.basename(p) for p in self.files}
+        self.assertLessEqual({"Style.qml", "Color.qml"}, names)
+
+    def test_their_processes_are_the_reviewed_ones(self):
+        found = set()
+        procs = cmds = 0
+        for path, code in self.files.items():
+            for m in re.finditer(r"\bcommand\s*:\s*(\[[^\n]*\])", code):
+                found.add(re.sub(r"\s+", " ", m.group(1)).strip())
+            scan = qmlscan.blank_strings(code)
+            procs += len(re.findall(r"(?<![\w.])Process\s*\{", scan))
+            cmds += len(re.findall(r"^\s*command\s*:", scan, re.M))
+        self.assertEqual(found, OMARCHY_ALLOWED)
+        self.assertEqual(procs, cmds)
+
+    def test_nothing_runs_a_shell_on_the_windows_behalf(self):
+        # Util.qml defines execDetached/execArgv (bash -lc); nothing the window loads may call
+        # them, and nothing else may start a detached process.
+        for path, code in list(self.files.items()) + [
+                (p, qmlscan.strip_comments(qmlscan.read(p))) for p in qmlscan.app_files()]:
+            scan = qmlscan.blank_strings(code)
+            self.assertIsNone(re.search(r"\bUtil\.(execDetached|execArgv)\s*\(", scan), path)
+            if os.path.basename(path) != "Util.qml":
+                self.assertIsNone(re.search(r"\bexecDetached\s*\(", scan), path)
+
+    def test_their_reads_from_home_are_the_documented_ones(self):
+        found = set()
+        for code in self.files.values():
+            for m in re.finditer(r"^\s*path\s*:\s*(.+)$", code, re.M):
+                expr = m.group(1).strip()
+                if "env(" in expr or "home" in expr.lower() or "Path +" in expr:
+                    found.add(expr)
+        self.assertEqual(found, OMARCHY_HOME_READS)
 
 
 class AppFileTests(unittest.TestCase):
