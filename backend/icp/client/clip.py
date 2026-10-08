@@ -29,7 +29,11 @@ offer goes up are taken to be the history watcher (which reads the moment the se
 changes) and get nothing, and the first request after that is the paste. A switch in this
 root-owned file, not the environment, because pear-exec passes no environment through.
 
-The outcome goes back to the daemon (`clip-result`), which tells the window. The value lives in
+The outcome goes back to the daemon (`clip-result`), which tells the window. The window also
+reads this process's stdout, one JSON line per event and never the value: `{"event": "offered"}`
+once the compositor has answered a sync sent after set_selection (only then does the window say
+"copied"), `{"event": "error", "reason": ...}` when it ends without ever offering, and last
+`{"event": "done", "outcome": ...}`. The value lives in
 a bytearray that is zeroed before exit; Python may have copied it on the way in (the JSON
 reply), which is why the real boundary is that this process is non-dumpable.
 """
@@ -38,6 +42,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import json
 import os
 import re
 import select
@@ -49,13 +54,14 @@ from typing import Callable
 from ..daemon import protocol
 from . import watchers
 from .channel import Channel, ChannelError, stdin_line
-from .wayland import (DataControl, Connection, Event, Reader, Selection, SOURCE_CANCELLED,
-                      SOURCE_SEND, WaylandError)
+from .wayland import (CALLBACK_DONE, DataControl, Connection, Event, Reader, Selection,
+                      SOURCE_CANCELLED, SOURCE_SEND, WaylandError)
 
 HINT_MIME = "x-kde-passwordManagerHint"
 TEXT_MIMES = ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "TEXT", "STRING")
 TICKET_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 WRITE_DEADLINE_S = 2.0
+OFFER_CONFIRM_S = 5.0               # how long the compositor may take to answer the offer
 
 # Gate G5 switch: "proc" (identify every reader's pipe in /proc) or "timing" (the fallback).
 READER_POLICY = "proc"
@@ -172,6 +178,8 @@ class Offer:
     served: int = 0                         # writes of the value
     refused_watchers: int = 0
     refused_others: int = 0
+    offered: bool = False                   # the compositor answered after set_selection
+    error: str = ""                         # why it failed, for the window (never the value)
     log: list = field(default_factory=list)  # (mime, verdict) - never the value
 
     def mimes(self) -> list[str]:
@@ -291,27 +299,48 @@ def _write_all(fd: int, data) -> int:
 
 # --- the loop ---------------------------------------------------------------------------------
 
-def serve(dc: DataControl, offer: Offer, daemon: Channel | None) -> str:
+def serve(dc: DataControl, offer: Offer, daemon: Channel | None,
+          on_offered: Callable[[], None] | None = None) -> str:
     """Own the selection until the offer is over. Returns the outcome. Never raises for a
-    compositor failure: that is the outcome "failed"."""
+    compositor failure: that is the outcome "failed". `on_offered` runs once the compositor
+    has answered a sync sent after set_selection, i.e. the value really is on offer."""
     conn: Connection = dc.conn
     try:
         sel: Selection = dc.offer(offer.mimes())
-    except WaylandError:
+    except WaylandError as e:
         offer.outcome = "failed"
+        offer.error = str(e)
         return "failed"
     offer.start()
     daemon_gone = False
     try:
+        # The compositor handles requests in order: its answer to this sync means it has taken
+        # set_selection. Answered inside the loop, so a paste right behind it is not dropped.
+        confirm = conn.sync()
+        confirm_by = offer.now() + OFFER_CONFIRM_S
         while offer.outcome is None:
             waits = [conn.sock]
             if daemon is not None and not daemon_gone:
                 waits.append(daemon)
             buffered = daemon is not None and not daemon_gone and daemon.has_pending()
-            ready, _, _ = select.select(waits, [], [], 0 if buffered else offer.next_wakeup())
+            wake = offer.next_wakeup()
+            if not offer.offered:
+                wake = min(wake, max(0.0, confirm_by - offer.now()) + 0.01)
+            ready, _, _ = select.select(waits, [], [], 0 if buffered else wake)
             if conn.sock in ready:
                 for ev in conn.read_events(0):
+                    if ev.obj == confirm and ev.opcode == CALLBACK_DONE:
+                        conn.objects.pop(confirm, None)
+                        if offer.outcome is None and not offer.offered:
+                            offer.offered = True
+                            if on_offered is not None:
+                                on_offered()
+                        continue
                     _dispatch(dc, sel, offer, ev)
+            if not offer.offered and offer.outcome is None and offer.now() >= confirm_by:
+                offer.outcome = "failed"
+                offer.error = "the compositor did not answer"
+                break
             if daemon is not None and not daemon_gone and (buffered or daemon in ready):
                 try:
                     for msg in daemon.read_messages(0):
@@ -325,8 +354,9 @@ def serve(dc: DataControl, offer: Offer, daemon: Channel | None) -> str:
         # Also after `cancelled`: a cancelled source is dead and destroying it changes nothing.
         dc.destroy_source(sel)
         _flush(conn)
-    except WaylandError:
+    except WaylandError as e:
         # The compositor went away, and the selection with it.
+        offer.error = offer.error or str(e)
         if offer.outcome is None:
             offer.outcome = "pasted" if offer.pasted_at is not None else "failed"
     return offer.outcome or "failed"
@@ -354,13 +384,32 @@ def _flush(conn: Connection) -> None:
 
 # --- entry point ---------------------------------------------------------------------------------
 
-def run(stdin, socket_path: str, wayland_path: str, identify=None) -> int:
+# Why a copy never reached the clipboard, as the window's "Couldn't copy — <reason>" says it.
+NOT_OFFERED = {"replaced": "something else was copied first",
+               "withdrawn": "it was taken back before the clipboard had it"}
+
+
+def report(out, event: str, **fields) -> None:
+    """One line for the window on stdout. Fixed words and outcomes only, never the value; a
+    window that has gone away (EPIPE) changes nothing here."""
+    if out is None:
+        return
+    try:
+        out.write(json.dumps({"event": event, **fields}) + "\n")
+        out.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def run(stdin, socket_path: str, wayland_path: str, identify=None, out=None) -> int:
+    out = sys.stdout if out is None else out
     try:
         ticket = stdin_line(stdin, 256)
     except ValueError:
         ticket = None
     if not ticket or not TICKET_RE.match(ticket):
         print("pear-clip: no ticket on stdin", file=sys.stderr)
+        report(out, "error", reason="no copy request reached the clipboard helper")
         return 2
     try:
         daemon = Channel.connect(socket_path)
@@ -368,9 +417,11 @@ def run(stdin, socket_path: str, wayland_path: str, identify=None) -> int:
         reply = daemon.request("redeem", timeout=10)
     except ChannelError as e:
         print(f"pear-clip: {e}", file=sys.stderr)
+        report(out, "error", reason="the Pear Passwords service couldn't be reached")
         return 3
     if "error" in reply or not isinstance(reply.get("value"), str):
         print("pear-clip: the ticket could not be redeemed", file=sys.stderr)
+        report(out, "error", reason="the copy request had expired")
         daemon.close()
         return 3
     value = bytearray(reply["value"].encode("utf-8"))
@@ -385,6 +436,7 @@ def run(stdin, socket_path: str, wayland_path: str, identify=None) -> int:
 
     offer = None
     outcome = "failed"
+    reason = "the clipboard couldn't be reached"
     try:
         try:
             conn = Connection.connect(wayland_path)
@@ -396,16 +448,21 @@ def run(stdin, socket_path: str, wayland_path: str, identify=None) -> int:
             if identify is None:
                 identify = factory({os.getpid(), conn.peer_pid or -1})
             offer = Offer(value, sensitive, float(timeout), identify, watcher_window=window)
-            outcome = serve(dc, offer, daemon)
+            outcome = serve(dc, offer, daemon, on_offered=lambda: report(out, "offered"))
+            reason = (NOT_OFFERED.get(outcome) or offer.error
+                      or "the compositor didn't take the clipboard")
             conn.close()
     finally:
         for i in range(len(value)):
             value[i] = 0
+    if offer is None or not offer.offered:
+        report(out, "error", reason=reason)
     try:
         daemon.request("clip-result", timeout=5, outcome=outcome)
     except ChannelError:
         pass
     daemon.close()
+    report(out, "done", outcome=outcome)
     return 0
 
 

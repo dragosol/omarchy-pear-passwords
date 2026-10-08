@@ -367,6 +367,7 @@ ShellRoot {
             root.grantRanOut();
             return;
         case "clip":
+            if (m.outcome === "failed" && Date.now() - root.clipFailAt < 5000) return;
             root.showFlash(root.clipWords(m.field) + (m.outcome === "pasted" ? " pasted — now cleared"
                          : m.outcome === "expired" ? " cleared from the clipboard"
                          : m.outcome === "replaced" ? " replaced by something you copied"
@@ -567,17 +568,65 @@ ShellRoot {
     // ---------------------------------------------------------------- pear-exec children
     // Copy: the value never comes here. The daemon puts it in a ticket; pear-clip redeems it
     // and owns the clipboard. A component, because a second copy may start while the first
-    // clip process is still being told to withdraw.
+    // clip process is still being told to withdraw. "copied" is said only once pear-clip
+    // reports {"event":"offered"} on stdout (the compositor has the selection); an error
+    // line, or an exit before "offered" (pear-exec refusing it, a crash), says why it failed.
     Component {
         id: clipComponent
         Process {
+            id: clipProc
             property string ticket: ""
+            property string words: "Selection"
+            property bool offered: false
+            property bool failed: false
+            property string refusal: ""          // pear-exec's or pear-clip's own stderr line
             running: false
             stdinEnabled: true
             command: [root.pearExec, "clip"]
             onStarted: { write(ticket + "\n"); ticket = ""; stdinEnabled = false; }
-            onExited: destroy()
+            function fail(reason) {
+                if (clipProc.offered || clipProc.failed) return;
+                clipProc.failed = true;
+                root.clipFailed(reason);
+            }
+            stdout: SplitParser {
+                splitMarker: "\n"
+                onRead: function (line) {
+                    let m = null;
+                    try { m = JSON.parse(line); } catch (e) { return; }
+                    if (!m) return;
+                    if (m.event === "offered" && !clipProc.failed && !clipProc.offered) {
+                        clipProc.offered = true;
+                        root.clipFailAt = 0;
+                        root.showFlash(clipProc.words + " copied — clears after one paste or "
+                                       + (root.settings.clip_timeout_s || 30) + " s");
+                    } else if (m.event === "error") {
+                        clipProc.fail(typeof m.reason === "string" && m.reason ? m.reason
+                                      : "the clipboard didn't take it");
+                    }
+                }
+            }
+            stderr: SplitParser {
+                splitMarker: "\n"
+                onRead: function (line) {
+                    const r = line.match(/^pear-(?:exec|clip): (.+)$/);
+                    if (r) clipProc.refusal = r[1].slice(0, 160);
+                }
+            }
+            onExited: function (code) {
+                clipProc.fail(clipProc.refusal ? clipProc.refusal
+                              : code === 77 ? "the clipboard helper was refused (pear-exec 77)"
+                              : "the clipboard helper stopped (exit " + code + ")");
+                destroy();
+            }
         }
+    }
+    // A copy that never reached the clipboard. The daemon's own "couldn't be put on the
+    // clipboard" for the same copy, if it follows, adds nothing and is not shown over this.
+    property double clipFailAt: 0
+    function clipFailed(reason) {
+        root.clipFailAt = Date.now();
+        root.showFlash("Couldn't copy — " + reason);
     }
 
     // The importer: line 1 the ticket, line 2 the options, later only an answer it asks for.
@@ -684,9 +733,7 @@ ShellRoot {
             root.send("copy-text", bound ? { source: source, id: id, text: text }
                                          : { source: source, text: text }, function (d) {
                 if (d.error) { root.showFlash(root.errorWords(d)); return; }
-                clipComponent.createObject(root, { ticket: d.ticket, running: true });
-                root.showFlash("Selection copied — clears after one paste or "
-                               + (root.settings.clip_timeout_s || 30) + " s");
+                clipComponent.createObject(root, { ticket: d.ticket, words: "Selection", running: true });
             });
         };
         if (bound) root.withGrant(go); else go();
@@ -956,9 +1003,8 @@ ShellRoot {
             root.send("copy", { id: id, field: field }, function (d) {
                 if (d.error) { root.status = d.error === "no-grant" || d.error === "grant-expired"
                                    ? "that account closed — open it again" : d.error; return; }
-                clipComponent.createObject(root, { ticket: d.ticket, running: true });
-                root.showFlash(root.clipWords(field) + " copied — clears after one paste or "
-                               + (root.settings.clip_timeout_s || 30) + " s");
+                clipComponent.createObject(root, { ticket: d.ticket, words: root.clipWords(field),
+                                                   running: true });
             });
         };
         if (field === "password" || field === "code" || field === "notes") root.withGrant(go); else go();
@@ -1694,7 +1740,15 @@ ShellRoot {
         if (s.has_password === false)
             rows[1] = { key: "none", label: "Password", value: "none — this account uses a passkey",
                         quiet: true, actions: [] };
-        if (s.is_wifi) return readOnly ? root.withoutEdits(rows) : rows;
+        // Wi-Fi: Apple keeps no notes for a network (no details record in the WiFi zone), so
+        // tags it carries (from a 1.x import) show read-only, and the daemon refuses to set them.
+        if (s.is_wifi) {
+            const wifiTags = s.tags || [];
+            if (wifiTags.length)
+                rows.push({ key: "tags", label: "Tags", value: "#" + wifiTags.join("  #"),
+                            quiet: false, chips: wifiTags, actions: [] });
+            return readOnly ? root.withoutEdits(rows) : rows;
+        }
         const sites = root.allSites();
         if (!sites.length)
             rows.push({ key: "editsites", label: "Website", value: "Add a website", quiet: true, actions: [] });
@@ -1744,7 +1798,16 @@ ShellRoot {
         return (s.no_site ? [] : [s.domain]).concat(s.sites || []);
     }
 
+    // Rows Apple keeps read-only (the daemon refuses a `set` on them): Recently Deleted copies
+    // and passkey-only rows. Nothing on them may open an editor, which would raise the
+    // account's approval dialog for an edit that cannot happen.
+    function selectedReadOnly() {
+        const s = root.selected;
+        return !!s && (!!s.recently_deleted || s.kind === "passkey");
+    }
+
     function fieldAction(key) {
+        if (root.selectedReadOnly() && (key === "change" || key.indexOf("edit") === 0)) return;
         if (key === "username") root.copyField("username");
         else if (key === "password") root.copyPassword();
         else if (key === "view") root.doReveal();
@@ -1764,7 +1827,9 @@ ShellRoot {
         else if (key === "totp") root.loadTotp();
         else if (key === "editsites") root.withGrant(function () { root.openEditor("sites"); });
         else if (key === "edittotp") root.withGrant(function () { root.openEditor("totp"); });
-        else if (key === "notes") root.loadNotes(root.notesLoaded ? function () { root.openEditor("notes"); } : null);
+        else if (key === "notes")
+            root.loadNotes(root.notesLoaded && !root.selectedReadOnly()
+                           ? function () { root.openEditor("notes"); } : null);
         else if (key === "editnotes") root.loadNotes(function () { root.openEditor("notes"); });
         else if (key === "edittags") root.withGrant(function () { root.openTagEditor(); });
     }
@@ -2070,6 +2135,10 @@ ShellRoot {
                                 available: !root.editorOpen && !root.settingsOpen && !root.signinOpen
                                 // The status bar under the window (24 px): the rows scroll above it.
                                 bottomReserve: statusBar.height
+                                // The drop-down keeps its left edge by the avatars and reaches the
+                                // list column's right edge, so no row's highlight or icons show
+                                // beside it.
+                                panel.width: parent.width - search.x - search.panel.x
                                 entries: root.entries
                                 features: root.features
                                 tag: root.catTag
@@ -2572,10 +2641,13 @@ ShellRoot {
                                             font.pixelSize: Theme.fHeading
                                             elide: Text.ElideRight
                                             HoverHandler { id: hTitle }
+                                            // No rename on a read-only row: its approval
+                                            // dialog would be for an edit that always fails.
                                             MouseArea {
                                                 anchors.fill: parent
+                                                enabled: !root.selectedReadOnly()
                                                 cursorShape: Qt.PointingHandCursor
-                                                onClicked: root.withGrant(function () {
+                                                onClicked: if (!root.selectedReadOnly()) root.withGrant(function () {
                                                     nickField.text = root.selected.nickname
                                                         || root.selected.title;
                                                     root.renaming = true;
@@ -2591,7 +2663,7 @@ ShellRoot {
                                             color: Theme.dim
                                             font.family: Theme.uiFont
                                             font.pixelSize: Theme.fSmall
-                                            opacity: hTitle.hovered ? 1 : 0
+                                            opacity: hTitle.hovered && !root.selectedReadOnly() ? 1 : 0
                                         }
                                         O.TextField {
                                             id: nickField

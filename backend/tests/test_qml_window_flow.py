@@ -65,12 +65,27 @@ class WindowApple(FakeApple):
 
 
 FAKE_PEAR_EXEC = r'''#!%(python)s
-# pear-exec, for the test: `clip` reads its ticket, redeems it as pear-clip would and reports
-# one paste. What it got goes to a file the test reads (made-up data only).
-import json, socket, sys
+# pear-exec, for the test: `clip` reads its ticket, redeems it as pear-clip would, says
+# {"event":"offered"} on stdout a little later and reports one paste. What it got goes to a file
+# the test reads (made-up data only). The third run fails the way pear-exec refused the clip
+# role on the VM (exit 77, a reason on stderr, nothing on stdout); the fourth reports an error
+# line as pear-clip does when the compositor has no data-control protocol.
+import json, os, socket, sys, time
 if sys.argv[1:] != ["clip"]:
     sys.exit(64)
+n = 1
+if os.path.exists(%(count)r):
+    n = int(open(%(count)r).read()) + 1
+open(%(count)r, "w").write(str(n))
 ticket = sys.stdin.readline().strip()
+if n == 3:
+    sys.stderr.write("pear-exec: WAYLAND_DISPLAY must be a socket name like wayland-1\n")
+    sys.exit(77)
+if n == 4:
+    print(json.dumps({"event": "error", "reason": "the compositor offers no data-control protocol"}),
+          flush=True)
+    print(json.dumps({"event": "done", "outcome": "failed"}), flush=True)
+    sys.exit(0)
 s = socket.socket(socket.AF_UNIX)
 s.connect(%(sock)r)
 f = s.makefile("rwb")
@@ -79,7 +94,11 @@ def call(**req):
     return json.loads(f.readline())
 out = {"hello": call(op="hello", rid=0, role="clip", proto=2, ticket=ticket)}
 out["redeem"] = call(op="redeem", rid=1)
+time.sleep(0.8)                      # the window must not say "copied" before this
+print(json.dumps({"event": "offered"}), flush=True)
+time.sleep(0.4)
 out["result"] = call(op="clip-result", rid=2, outcome="pasted")
+print(json.dumps({"event": "done", "outcome": "pasted"}), flush=True)
 with open(%(out)r, "a") as log:
     log.write(json.dumps(out) + "\n")
 '''
@@ -193,7 +212,13 @@ DRIVER = r'''
                 check(edArea.text === "recovery codes are in the safe", "the editor got the body only: " + JSON.stringify(edArea.text));
                 edArea.forceActiveFocus();
                 edArea.select(0, 8);
+                root.flash = "";
                 tc.keyClick("c", Qt.ControlModifier);
+                // "copied" only once pear-clip says the clipboard has it.
+                tc.wait(400);
+                check(root.flash.indexOf("copied") === -1, "copied before offered: " + root.flash);
+                waitFor(function () { return root.flash === "Selection copied — clears after one paste or 30 s"; },
+                        10000, "the copied toast after offered (flash: " + root.flash + ")");
                 waitFor(function () { return root.flash.indexOf("Selection pasted") === 0; }, 10000,
                         "the clip event for the selection (flash: " + root.flash + ")");
                 // The context menu's Copy takes the same way.
@@ -217,6 +242,23 @@ DRIVER = r'''
                 probe.paste();
                 check(probe.text === "control", "the probe cannot see the clipboard");
                 probe.destroy();
+                say(step);
+
+                step = "copy fails";
+                // pear-exec refuses the clip role: it exits before "offered".
+                root.flash = "";
+                root.copyText("notes-edit", "recovery");
+                waitFor(function () { return root.flash !== ""; }, 10000, "a toast for the refused copy");
+                check(root.flash === "Couldn't copy — WAYLAND_DISPLAY must be a socket name like wayland-1",
+                      "early exit: " + root.flash);
+                // pear-clip reports an error line instead of "offered".
+                root.flash = "";
+                root.copyText("notes-edit", "codes");
+                waitFor(function () { return root.flash !== ""; }, 10000, "a toast for the failed copy");
+                check(root.flash === "Couldn't copy — the compositor offers no data-control protocol",
+                      "error line: " + root.flash);
+                tc.wait(300);
+                check(root.flash.indexOf("copied") === -1, "copied after a failure: " + root.flash);
                 root.closeEditor();
                 say(step);
 
@@ -348,7 +390,8 @@ class WindowFlowTests(unittest.IsolatedAsyncioTestCase):
         clips = os.path.join(self.tmp, "clips.jsonl")
         fake = os.path.join(self.tmp, "pear-exec")
         with open(fake, "w") as f:
-            f.write(FAKE_PEAR_EXEC % {"python": sys.executable, "sock": self.h.path, "out": clips})
+            f.write(FAKE_PEAR_EXEC % {"python": sys.executable, "sock": self.h.path, "out": clips,
+                                      "count": os.path.join(self.tmp, "clip-runs")})
         os.chmod(fake, 0o755)
         app = window_copy(self.tmp, self.h.path, fake)
         ui = self.h.peer()
@@ -359,7 +402,8 @@ class WindowFlowTests(unittest.IsolatedAsyncioTestCase):
         steps = re.findall(r"FLOW-STEP (.+)", out)
         self.assertIn("FLOW-DONE", out, f"steps done: {steps}\n" + out[-4000:])
         self.assertEqual(steps, ["unlock", "hover", "choose Codes", "Backspace", "choose a tag",
-                                 "edit tags", "copy-text", "features", "create", "lock"])
+                                 "edit tags", "copy-text", "copy fails", "features", "create",
+                                 "lock"])
 
         # The dialogs: the list, the one account, then .manage for turning a category on, the
         # keychain check and the new entry. Copy-text and the drop-down raise none.

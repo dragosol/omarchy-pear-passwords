@@ -732,6 +732,12 @@ async def op_set(reg, conn, req):
     _still(s, conn, epoch)
     if getattr(meta, "recently_deleted", False) or getattr(meta, "kind", "login") == "passkey":
         raise OpError("invalid", field="id")
+    # A Wi-Fi network has no details record (the WiFi zone keeps none), so its notes, and the
+    # tags that live in them, its websites and its code have nowhere to go.
+    if (getattr(meta, "domain", "") or "") == "AirPort":
+        for key in ("tags", "notes", "sites", "totp"):
+            if key in clean:
+                raise OpError("invalid", field=key)
     reg.grant_check(conn.uid, id)
     if s.busy:
         raise OpError("busy-sync")
