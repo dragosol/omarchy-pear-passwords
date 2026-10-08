@@ -80,11 +80,11 @@ class SyncUnitTest(unittest.TestCase):
             return fh.read()
 
     def test_the_timer_unit_passes_no_prompt(self):
-        unit = self._read("systemd", "pear-passwords-sync.service")
-        line = [l for l in unit.splitlines() if l.startswith("ExecStart=")]
-        self.assertTrue(line, "the sync unit has no ExecStart")
-        self.assertIn("--no-prompt", line[0],
-                      "the unattended sync unit can prompt for the passphrase again")
+        # 2.0 (WP5): the user sync timer is deleted, so nothing unattended can prompt at all.
+        # Sync runs inside the daemon, only while unlocked.
+        for name in ("pear-passwords-sync.service", "pear-passwords-sync.timer"):
+            self.assertFalse(os.path.exists(os.path.join(self.ROOT, "systemd", name)), name)
+        self.assertNotIn("pear-passwords-sync.timer\"", self._read("install.sh"))
 
     def test_sync_accepts_the_flag(self):
         from icp.cli import app
