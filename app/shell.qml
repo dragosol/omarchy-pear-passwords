@@ -2059,6 +2059,10 @@ ShellRoot {
                                 anchors.rightMargin: newButton.visible ? newButton.width + 28 : 14
                                 enabled: root.appUnlocked
                                 opacity: root.appUnlocked ? 1 : 0.6
+                                // Nothing drops down behind a sheet (their dim takes no hover).
+                                available: !root.editorOpen && !root.settingsOpen && !root.signinOpen
+                                // The status bar under the window (24 px): the rows scroll above it.
+                                bottomReserve: statusBar.height
                                 entries: root.entries
                                 features: root.features
                                 tag: root.catTag
@@ -3151,6 +3155,7 @@ ShellRoot {
 
                 // ------------------------------------------------ status bar
                 Rectangle {
+                    id: statusBar
                     Layout.fillWidth: true
                     implicitHeight: 24
                     color: root.flash ? Theme.hover : Theme.panel

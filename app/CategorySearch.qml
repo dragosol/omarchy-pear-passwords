@@ -20,6 +20,11 @@ TextField {
     property var entries: []
     property var features: ({})
     property var tag: null
+    // False while a sheet (the editor, Settings, sign-in) covers the window: hover, Alt+Down
+    // and '#' then open nothing, and an open list closes.
+    property bool available: true
+    // Room the window keeps below the list for its footer: the drop-down never runs under it.
+    property real bottomReserve: 0
 
     signal tagPicked(var tag)
     signal moveRequested(int delta)
@@ -35,10 +40,26 @@ TextField {
     // A row under a resting pointer is tinted but never taken by a key typed into the query.
     property bool catKeyed: false
     readonly property var catRows: Cat.rows(catSearch.entries, catSearch.features, catSearch.catFilter)
-    readonly property bool canOpen: catSearch.enabled && catSearch.entries.length > 0
+    readonly property bool canOpen: catSearch.enabled && catSearch.available
+                                    && catSearch.entries.length > 0
     readonly property alias panel: catPanel
     readonly property alias chipItem: chip
     readonly property alias chipClearItem: chipClear
+    readonly property alias rowsView: rowsView
+    // The rows' full height, and how much of it fits between the field and the window's footer:
+    // past that the rows scroll inside the drop-down instead of running off the window.
+    readonly property real rowsHeight: {
+        let h = 0;
+        for (let i = 0; i < catSearch.catRows.length; i++)
+            h += catSearch.catRows[i].kind === "divider" ? 11 : 34;
+        return h;
+    }
+    readonly property real panelRoom: {
+        const w = catSearch.Window.window;
+        if (!w || !catSearch.catOpen) return 100000;
+        const top = catSearch.mapToItem(null, 0, catSearch.height).y;
+        return Math.max(120, w.height - top - catSearch.bottomReserve - 8);
+    }
 
     leftPadding: chip.visible ? catSearch.padding + chip.width + 8 : catSearch.padding
 
@@ -62,6 +83,22 @@ TextField {
         catSearch.catOpen = true;
         catSearch.catKeyed = !!keyboard;
         catSearch.catCursor = keyboard ? catSearch.activeRow() : -1;
+        rowsView.positionViewAtBeginning();
+        catSearch.showCursor();
+    }
+    // Keeps the keyboard's row in view. Only for keys: a row under the pointer never scrolls.
+    function showCursor() {
+        if (catSearch.catCursor >= 0) rowsView.positionViewAtIndex(catSearch.catCursor, ListView.Contain);
+    }
+    // '#' into an empty query with no tag: the filter starts, open or not (spec 3.4).
+    function startFilter() {
+        if (catSearch.catOpen) {
+            closeTimer.stop();
+            catSearch.catTyping = true;
+            catSearch.setFilter("");
+        } else {
+            catSearch.openCats(true, true);
+        }
     }
     function closeCats() {
         openTimer.stop();
@@ -78,8 +115,9 @@ TextField {
         catSearch.catKeyed = true;
         let i = catSearch.catCursor < 0 ? catSearch.activeRow() - delta : catSearch.catCursor;
         for (let j = i + delta; j >= 0 && j < rows.length; j += delta)
-            if (rows[j].kind !== "divider") { catSearch.catCursor = j; return; }
+            if (rows[j].kind !== "divider") { catSearch.catCursor = j; catSearch.showCursor(); return; }
         if (catSearch.catCursor < 0) catSearch.catCursor = catSearch.activeRow();
+        catSearch.showCursor();
     }
     // All clears the tag, any other row replaces it, and the row already set changes nothing.
     function choose(i) {
@@ -94,6 +132,7 @@ TextField {
         catSearch.catFilter = text;
         catSearch.catCursor = catSearch.firstRow();
         catSearch.catKeyed = true;
+        rowsView.positionViewAtBeginning();
     }
     function hoverChanged() {
         if (hField.hovered || hPopup.hovered) closeTimer.stop();
@@ -103,6 +142,9 @@ TextField {
     onActiveFocusChanged: if (!activeFocus) catSearch.closeCats()
     onEnabledChanged: if (!enabled) catSearch.closeCats()
     onCanOpenChanged: if (!canOpen) catSearch.closeCats()
+    // A list the pointer opened is a hover affordance: typing a query closes it, so it never
+    // covers the results being narrowed or takes their Up/Down and Enter.
+    onTextChanged: if (catSearch.catOpen && !catSearch.catKeyed && !catSearch.catTyping) catSearch.closeCats()
 
     Timer { id: openTimer; interval: 200; onTriggered: catSearch.openCats(false, false) }
     Timer { id: closeTimer; interval: 300; onTriggered: catSearch.closeCats() }
@@ -118,6 +160,12 @@ TextField {
 
     Keys.onPressed: function (ev) {
         const k = ev.key;
+        if (ev.text === "#" && catSearch.text === "" && catSearch.tag === null && !catSearch.catTyping
+            && catSearch.canOpen) {
+            catSearch.startFilter();
+            ev.accepted = true;
+            return;
+        }
         if (catSearch.catOpen) {
             if (k === Qt.Key_Escape) { catSearch.closeCats(); ev.accepted = true; return; }
             if (k === Qt.Key_Tab) { catSearch.closeCats(); catSearch.tabbed(); ev.accepted = true; return; }
@@ -133,6 +181,13 @@ TextField {
                 return;
             }
             if (catSearch.catTyping) {
+                // Picking a tag: Enter and Space never reach the query or copy a password,
+                // even with nothing matching.
+                if (k === Qt.Key_Return || k === Qt.Key_Enter || k === Qt.Key_Space) {
+                    if (catSearch.catCursor >= 0) catSearch.choose(catSearch.catCursor);
+                    ev.accepted = true;
+                    return;
+                }
                 if (k === Qt.Key_Backspace) {
                     if (catSearch.catFilter === "") catSearch.closeCats();
                     else catSearch.setFilter(catSearch.catFilter.slice(0, -1));
@@ -148,10 +203,6 @@ TextField {
             }
         } else if (k === Qt.Key_Down && (ev.modifiers & Qt.AltModifier)) {
             catSearch.openCats(true, false);
-            ev.accepted = true;
-            return;
-        } else if (ev.text === "#" && catSearch.text === "" && catSearch.tag === null) {
-            catSearch.openCats(true, true);
             ev.accepted = true;
             return;
         }
@@ -241,9 +292,11 @@ TextField {
         id: catPanel
         objectName: "catPanel"
         visible: catSearch.catOpen
-        x: 0
+        // Lined up with the list's avatars (x 10 in the window, the field sits at 14), so no
+        // sliver of them shows beside the drop-down.
+        x: -4
         y: catSearch.height
-        width: Math.max(catSearch.width, 260)
+        width: Math.max(catSearch.width + 4, 264)
         height: popupCol.implicitHeight + 12
         color: Theme.bg
         border.width: 1
@@ -252,6 +305,15 @@ TextField {
         // Tag names are someone's note text: no menu of Qt's own on them either.
         ContextMenu.menu: null
         HoverHandler { id: hPopup; onHoveredChanged: catSearch.hoverChanged() }
+        // Every press and wheel inside the drop-down stops here: its margin, the divider and the
+        // filter line never reach the list underneath (which would select a hidden account).
+        // The rows' own TapHandlers sit above it.
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.AllButtons
+            onPressed: function (m) { m.accepted = true; }
+            onWheel: function (w) { w.accepted = true; }
+        }
         Column {
             id: popupCol
             x: 6; y: 6
@@ -286,8 +348,18 @@ TextField {
                 font.pixelSize: Theme.fSmall
             }
 
-            Repeater {
+            ListView {
+                id: rowsView
+                objectName: "catRows"
+                width: parent.width
+                height: Math.min(catSearch.rowsHeight,
+                                 Math.max(34, catSearch.panelRoom - 12
+                                              - (catSearch.catTyping ? 30 : 0)
+                                              - (catSearch.catRows.length === 0 ? 30 : 0)))
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
                 model: catSearch.catRows
+                ScrollBar.vertical: AppScrollBar {}
                 delegate: Item {
                     id: crow
                     required property var modelData
@@ -295,7 +367,7 @@ TextField {
                     readonly property bool divider: modelData.kind === "divider"
                     readonly property bool active: !divider
                         && Cat.sameTag(Cat.tagOf(modelData), catSearch.tag)
-                    width: popupCol.width
+                    width: rowsView.width
                     height: divider ? 11 : 34
 
                     Rectangle {
@@ -317,8 +389,11 @@ TextField {
                         cursorShape: Qt.PointingHandCursor
                         onHoveredChanged: if (hovered) catSearch.catCursor = crow.index
                     }
+                    // Takes the press for itself (an exclusive grab), so a click on a row never
+                    // also taps the account list under the drop-down.
                     TapHandler {
                         enabled: !crow.divider
+                        gesturePolicy: TapHandler.WithinBounds
                         onTapped: catSearch.choose(crow.index)
                     }
                     Row {
@@ -345,7 +420,7 @@ TextField {
                         Text {
                             textFormat: Text.PlainText
                             anchors.verticalCenter: parent.verticalCenter
-                            width: popupCol.width - 22 - 10 - 8 - countText.width - 18
+                            width: rowsView.width - 22 - 10 - 8 - countText.width - 18
                             text: crow.modelData.label
                             color: crow.modelData.count > 0 || crow.active ? Theme.fg : Theme.dim
                             font.family: Theme.uiFont

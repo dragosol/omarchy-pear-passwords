@@ -112,6 +112,17 @@ class WindowWiringTests(unittest.TestCase):
         for fn in ("forgetSecrets", "endGrant", "select", "hideSecrets"):
             self.assertNotIn("catTag", function_body(fn), fn)
 
+    def test_nothing_drops_down_behind_a_sheet(self):
+        search = element_of("search")
+        self.assertIn("available: !root.editorOpen && !root.settingsOpen && !root.signinOpen", search)
+        self.assertIn("bottomReserve: statusBar.height", search)
+
+    def test_the_drop_down_lines_up_with_the_avatars(self):
+        src = qmlscan.strip_comments(qmlscan.read(SEARCH_QML))
+        panel = src[src.index('objectName: "catPanel"'):][:400]
+        self.assertIn("x: -4\n", panel)
+        self.assertIn("width: Math.max(catSearch.width + 4, 264)", panel)
+
     def test_the_window_going_inactive_closes_the_list(self):
         conn = CODE[CODE.index("function onStateChanged()"):]
         conn = conn[:conn.index("}\n")]
@@ -279,6 +290,9 @@ Item {
     property int tabs: 0
     property int copies: 0
     property int escapes: 0
+    property int listTaps: 0
+    property int wheels: 0
+    property var baseEntries: %(fixture)s
 
     // What the window shows for a tag: its applyFilter with an empty query.
     function shown(tag) {
@@ -289,6 +303,13 @@ Item {
         id: outer
         anchors.fill: parent
         Keys.onPressed: function (ev) { if (ev.key === Qt.Key_Escape) host.escapes++; }
+        // The account list under the drop-down, taken by TapHandler and WheelHandler as in shell.qml.
+        Item {
+            id: under
+            x: 0; y: 58; width: 700; height: 542
+            TapHandler { onTapped: host.listTaps++ }
+            WheelHandler { onWheel: host.wheels++ }
+        }
         CategorySearch {
             id: search
             x: 14; y: 0; width: 300; height: 58
@@ -310,6 +331,9 @@ Item {
         function init() {
             host.features = ({}); host.catTag = null; host.picked = [];
             host.moved = 0; host.tabs = 0; host.copies = 0; host.escapes = 0;
+            host.listTaps = 0; host.wheels = 0;
+            host.entries = host.baseEntries;
+            search.available = true;
             search.enabled = true;
             search.text = "";
             search.closeCats();
@@ -508,6 +532,107 @@ Item {
             keyClick(Qt.Key_Return);
             compare(host.picked.length, 0);
             compare(host.copies, 1);
+        }
+
+        function test_a_leading_hash_works_while_hover_opened() {
+            mouseMove(search, 60, 20);
+            tryCompare(search, "catOpen", true, 1000);
+            keyClick("#");
+            verify(search.catTyping, "the # did not start the filter");
+            compare(search.text, "", "the # went into the query");
+            keyClick("w"); keyClick("o");
+            compare(labels(), ["work"]);
+            compare(search.text, "");
+            keyClick(Qt.Key_Return);
+            compare(host.catTag.key, "work");
+            compare(host.copies, 0, "Enter copied a password");
+        }
+        function test_filter_keys_never_copy_or_type() {
+            keyClick("#"); keyClick("z"); keyClick("z");
+            compare(search.catRows.length, 0);
+            keyClick(Qt.Key_Return);
+            compare(host.copies, 0, "Enter with nothing matching copied a password");
+            compare(host.picked.length, 0);
+            keyClick(Qt.Key_Space);
+            compare(search.text, "", "Space went into the query");
+            keyClick(Qt.Key_Backspace); keyClick(Qt.Key_Backspace); keyClick(Qt.Key_Backspace);
+            verify(!search.catOpen);
+            keyClick("#"); keyClick("w");
+            keyClick(Qt.Key_Space);                    // a match under the cursor: Space chooses
+            compare(host.catTag.key, "wifi");
+            compare(search.text, "");
+            compare(host.copies, 0);
+        }
+        function test_the_panel_takes_its_own_presses_and_wheel() {
+            keyClick(Qt.Key_Down, Qt.AltModifier);
+            mouseClick(search.panel, 3, search.panel.height - 3);   // the margin
+            mouseClick(search.panel, 40, rowY(3) - 12);             // the divider (11 px)
+            compare(host.listTaps, 0, "a press on the drop-down reached the list under it");
+            verify(search.catOpen);
+            mouseWheel(search.panel, 40, rowY(1), 0, -120);
+            compare(host.wheels, 0, "the wheel reached the list under the drop-down");
+            clickRow(rowIndex("cat", "codes"));                     // a row: chosen, and only that
+            compare(host.catTag.key, "codes");
+            compare(host.listTaps, 0, "a click on a row also tapped the list under it");
+            host.catTag = null;
+            keyClick("#");                                          // the filter line
+            mouseClick(search.panel, 40, 12);
+            compare(host.listTaps, 0, "a press on the filter line reached the list");
+            keyClick(Qt.Key_Escape);
+            mouseClick(under, 300, 400);                            // closed: the list's again
+            compare(host.listTaps, 1);
+        }
+        function test_nothing_opens_behind_a_sheet() {
+            search.available = false;
+            mouseMove(search, 60, 20);
+            wait(300);
+            verify(!search.catOpen, "hover opened it behind a sheet");
+            keyClick(Qt.Key_Down, Qt.AltModifier);
+            verify(!search.catOpen, "Alt+Down opened it behind a sheet");
+            keyClick("#");
+            verify(!search.catOpen, "# opened it behind a sheet");
+            search.text = "";
+            search.available = true;
+            keyClick(Qt.Key_Down, Qt.AltModifier);
+            verify(search.catOpen);
+            search.available = false;                               // a sheet opening closes it
+            verify(!search.catOpen);
+        }
+        function test_many_tags_scroll_inside_the_window() {
+            var many = [];
+            for (var i = 0; i < 30; i++)
+                many.push({ id: "m" + i, primary: "A" + i, title: "A" + i, secondary: "", domain: "",
+                            tags: ["t" + (i < 10 ? "0" : "") + i] });
+            host.entries = many;
+            keyClick(Qt.Key_Down, Qt.AltModifier);
+            tryCompare(search.panel, "height", search.rowsView.height + 12);   // the Column's layout
+            var bottom = search.panel.mapToItem(null, 0, search.panel.height).y;
+            verify(bottom <= host.height, "the drop-down runs off the window: " + bottom);
+            var last = search.catRows.length - 1;
+            for (var k = 0; k < 40; k++) keyClick(Qt.Key_Down);
+            compare(search.catCursor, last);
+            var row = search.rowsView.itemAtIndex(last);
+            verify(row !== null, "the last row was never scrolled into view");
+            var p = row.mapToItem(search.panel, 40, row.height / 2);
+            verify(p.y > 0 && p.y < search.panel.height - 6, "the last row is not visible: " + p.y);
+            mouseClick(search.panel, p.x, p.y);
+            compare(host.catTag.key, "t29");
+        }
+        function test_typing_closes_a_hover_opened_list() {
+            mouseMove(search, 60, 20);
+            tryCompare(search, "catOpen", true, 1000);
+            keyClick("g");
+            verify(!search.catOpen, "the hover list stayed over the results");
+            compare(search.text, "g");
+            keyClick(Qt.Key_Down);
+            compare(host.moved, 1, "Down went to the drop-down, not the list");
+            keyClick(Qt.Key_Return);
+            compare(host.copies, 1);
+            compare(host.picked.length, 0);
+            // Opened from the keyboard it stays while the query changes.
+            keyClick(Qt.Key_Down, Qt.AltModifier);
+            search.text = "gi";
+            verify(search.catOpen);
         }
 
         // ---- choosing
@@ -749,6 +874,19 @@ Item {
             tagInput.forceActiveFocus();
             keyClick(Qt.Key_Escape);
             compare(root.tagEditing, false);
+        }
+        function test_create_form_tags_problem() {
+            compare(root.tagsProblem(""), "");
+            compare(root.tagsProblem("work #family, side-project"), "");
+            var bad = "a tag is 1 to 32 letters, digits, - or _";
+            compare(root.tagsProblem("x".repeat(33)), bad);
+            compare(root.tagsProblem("a#b"), bad);
+            compare(root.tagsProblem("##x"), bad);
+            var many = [];
+            for (var i = 0; i < 17; i++) many.push("t" + i);
+            compare(root.tagsProblem(many.join(" ")), "at most 16 tags");
+            compare(root.tagsProblem("\\ud801\\udc28".repeat(20)), "");   // 20 code points
+            compare(root.parseTags("\\ud801\\udc28".repeat(20)), ["\\ud801\\udc28".repeat(20)]);
         }
     }
 }
