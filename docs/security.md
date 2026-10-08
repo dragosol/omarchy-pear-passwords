@@ -147,10 +147,13 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
   its receipt recorded. Tests: `test_daemon_handlers.py::AutofillOptInTests`,
   `test_autofill_register.py`, `test_repo_guards.py::InstallerWritesNoManifestTests`.
 - While autofill is on, any same-uid program can connect as an autofill host. A query gives it
-  ids only, no usernames or labels, until a fill on that connection is approved; every fill is
+  handles only, no usernames or labels, until a fill on that connection is approved; every fill is
   its own `.autofill` dialog, which says a browser extension is asking, and the window shows
   when a host is connected. Residual: a program that gets the user to approve one fill dialog
-  receives that password. Tests: `test_autofill_handlers.py`,
+  receives that password. A handle is HMAC-SHA256 of the entry id under a key that exists only
+  while the uid is unlocked, never the entry id itself (an unkeyed hash of domain and username,
+  which would let a program confirm a guessed username offline). Tests:
+  `test_autofill_handlers.py::HandleTests`, `test_autofill_handlers.py`,
   `test_autofill_host_framing.py`.
 - While the uid is locked, `autofill-query` answers only `locked` (or `unavailable`), and
   `autofill-fill` answers `locked`: nothing reveals which sites have accounts. Every fill

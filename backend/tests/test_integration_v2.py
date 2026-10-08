@@ -293,16 +293,18 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q["state"], "unlocked")
         for a in q["accounts"]:
             self.assertEqual(set(a), {"id", "match"})            # no names before a fill
-        gh = [a for a in q["accounts"]
-              if a["id"] == ids.entry_id("github.com", "dev@example.test")]
+        gh = q["accounts"]
         self.assertEqual(len(gh), 1, q)
+        # A handle, never the entry id (an unkeyed hash a program could check guesses with).
+        self.assertNotEqual(gh[0]["id"], ids.entry_id("github.com", "dev@example.test"))
         self.assertEqual(len(self.authority.actions()), n + 1)   # only the window's unlock
 
         f = await af.call("autofill-fill", origin="https://github.com", id=gh[0]["id"],
                           timeout=30)
         self.assertEqual((f["username"], f["password"]), ("dev@example.test", "gh-TEST-pw-1"))
         self.assertEqual(self.authority.actions()[-1], paths.ACTION_AUTOFILL)
-        bank = ids.entry_id("bank.example.test", "alex")
+        qb = await af.call("autofill-query", origin="https://bank.example.test", timeout=30)
+        bank = qb["accounts"][0]["id"]
         f = await af.call("autofill-fill", origin="https://github.com", id=bank)
         self.assertEqual(f.get("error"), "no-match")              # wrong site: no dialog
         self.assertEqual(self.authority.actions()[-1], paths.ACTION_AUTOFILL)

@@ -8,6 +8,7 @@ on the autofill connection, and everything is re-checked after the dialog.
 """
 
 import asyncio
+import os
 import time
 import unittest
 
@@ -80,6 +81,7 @@ class FakeSession:
         self.settings = dict(protocol.DEFAULT_SETTINGS)
         self._unlocked = unlocked
         self.autofill_enabled = True
+        self.autofill_key = os.urandom(32) if unlocked else None
         self.epoch = 0
 
     def unlocked(self):
@@ -88,6 +90,7 @@ class FakeSession:
     def lock(self):
         self._unlocked = False
         self.epoch += 1
+        self.autofill_key = None
         self.store.state_value = "locked"
 
 
@@ -167,13 +170,20 @@ class Base(unittest.TestCase):
 
     def unlock(self):
         self.session._unlocked = True
+        self.session.autofill_key = os.urandom(32)
         self.store.state_value = "unlocked"
+
+    def h(self, id):
+        """The handle an autofill client sees for entry `id` in this unlock."""
+        return autofill.handle_for(self.session.autofill_key, id)
 
     def query(self, origin="https://github.com", conn=None):
         return run(autofill.handle_autofill_query(self.reg, conn or self.conn,
                                                   {"op": "autofill-query", "origin": origin}))
 
-    def fill(self, id="gh1", origin="https://github.com", conn=None):
+    def fill(self, id="gh1", origin="https://github.com", conn=None, raw=False):
+        if not raw and self.session.autofill_key is not None:
+            id = self.h(id)
         return run(autofill.handle_autofill_fill(self.reg, conn or self.conn,
                                                  {"op": "autofill-fill", "origin": origin,
                                                   "id": id}))
@@ -248,8 +258,8 @@ class QueryTests(Base):
         self.assertEqual(r["host"], "github.com")
         ids = [a["id"] for a in r["accounts"]]
         # exact (newest first: bob 20, alice 10, erin 5 via sites), then related
-        self.assertEqual(ids, ["gh2", "gh1", "sited", "gist"])
-        self.assertNotIn("other", ids)                       # aliases never match
+        self.assertEqual(ids, [self.h(i) for i in ("gh2", "gh1", "sited", "gist")])
+        self.assertNotIn(self.h("other"), ids)               # aliases never match
         for a in r["accounts"]:
             self.assertEqual(set(a), {"id", "match"})        # no names before a fill
         self.fill("gh2")                                      # one approved fill...
@@ -307,7 +317,7 @@ class QueryTests(Base):
             self.store.metas[m.id] = m
         accts = self.query("https://many.example")["accounts"]
         self.assertEqual(len(accts), autofill.MAX_ACCOUNTS)
-        self.assertEqual(accts[0]["id"], "x29")
+        self.assertEqual(accts[0]["id"], self.h("x29"))
 
     def test_lock_while_listing_wins(self):
         self.unlock()
@@ -328,7 +338,8 @@ class FillTests(Base):
 
     def test_fill_prompts_on_the_autofill_connection_and_returns_one_credential(self):
         r = self.fill("gh1")
-        self.assertEqual(r, {"id": "gh1", "username": "alice", "password": FAKE_PW + ":gh1"})
+        self.assertEqual(r, {"id": self.h("gh1"), "username": "alice",
+                             "password": FAKE_PW + ":gh1"})
         self.assertEqual(len(self.reg.dialogs), 1)
         conn, action, details = self.reg.dialogs[0]
         self.assertIs(conn, self.conn)
@@ -345,14 +356,16 @@ class FillTests(Base):
         self.assertEqual(self.store.unseal_count, 2)
 
     def test_unknown_and_non_matching_ids_look_the_same(self):
-        errors = [self.fill_error(i) for i in ("nope", "other", "", "x" * 500, "../gh1",
-                                               "gh1\n")]
+        errors = [self.fill_error(i) for i in ("nope", "other")]
+        errors += [self.fill_error(i, raw=True) for i in ("", "x" * 500, "../gh1", "gh1\n",
+                                                          "gh1", "h-" + "0" * 32)]
         self.assertEqual({(e.code, tuple(e.extra.items())) for e in errors}, {("no-match", ())})
         self.assertEqual(self.reg.dialogs, [])
         self.assertNotIn("open_entry", self.store.calls)
 
     def test_a_related_site_fills_but_an_alias_does_not(self):
-        self.assertEqual(self.fill("gh1", origin="https://login.github.com")["id"], "gh1")
+        self.assertEqual(self.fill("gh1", origin="https://login.github.com")["id"],
+                         self.h("gh1"))
         self.assertEqual(self.fill_error("other").code, "no-match")
         self.assertEqual(self.fill_error("gh1", origin="https://github.com.evil.com").code,
                          "no-match")
@@ -465,12 +478,12 @@ class RateLimitTests(Base):
         async def two():
             self.reg.gate = asyncio.Event()
             first = asyncio.ensure_future(autofill.handle_autofill_fill(
-                self.reg, self.conn, {"origin": "https://github.com", "id": "gh1"}))
+                self.reg, self.conn, {"origin": "https://github.com", "id": self.h("gh1")}))
             await asyncio.sleep(0.05)
             other = FakeConn()                     # a second browser window, same uid
             with self.assertRaises(OpError) as cm:
                 await autofill.handle_autofill_fill(
-                    self.reg, other, {"origin": "https://github.com", "id": "gh2"})
+                    self.reg, other, {"origin": "https://github.com", "id": self.h("gh2")})
             self.assertEqual(cm.exception.code, "prompt-pending")
             # a query still answers while the dialog is up
             q = await autofill.handle_autofill_query(self.reg, other,
@@ -478,7 +491,65 @@ class RateLimitTests(Base):
             self.assertEqual(q["state"], "unlocked")
             self.reg.gate.set()
             return await first
-        self.assertEqual(run(two())["id"], "gh1")
+        self.assertEqual(run(two())["id"], self.h("gh1"))
+
+
+class HandleTests(Base):
+    """Autofill ids were the entry ids, an unkeyed sha256 of (domain, username): any program
+    could confirm a guessed username offline from a query. Every autofill reply now carries
+    handles keyed by a secret that exists only while the uid is unlocked."""
+
+    def setUp(self):
+        from icp.vstore import ids
+        self.real = {ids.entry_id("github.com", u): u for u in ("alice", "bob")}
+        super().setUp()
+        self.store.metas = {i: meta(i, "github.com", username=u) for i, u in self.real.items()}
+        self.unlock()
+
+    def test_no_reply_carries_an_entry_id(self):
+        q = self.query()
+        got = [a["id"] for a in q["accounts"]]
+        self.assertEqual(len(got), 2)
+        for id in self.real:
+            self.assertNotIn(id, repr(q))
+            self.assertNotIn(id[3:], repr(q))          # nor its hex
+        r = self.fill(raw=True, id=got[0])
+        self.assertEqual(r["id"], got[0])
+        self.assertEqual(set(r), {"id", "username", "password"})
+
+    def test_a_guess_cannot_be_checked_offline(self):
+        from icp.vstore import ids
+        handles = {a["id"] for a in self.query()["accounts"]}
+        for guess in ("alice", "bob"):
+            self.assertNotIn(ids.entry_id("github.com", guess), handles)
+
+    def test_an_entry_id_is_not_a_handle(self):
+        for id in self.real:
+            self.assertEqual(self.fill_error(id, raw=True).code, "no-match")
+        self.assertEqual(self.reg.dialogs, [])
+
+    def test_handles_die_with_the_lock(self):
+        old = self.query()["accounts"][0]["id"]
+        self.session.lock()
+        self.unlock()
+        self.assertNotIn(old, {a["id"] for a in self.query()["accounts"]})
+        self.assertEqual(self.fill_error(old, raw=True).code, "no-match")
+        self.assertEqual(self.reg.dialogs, [])
+
+    def test_the_registry_keys_handles_only_while_unlocked(self):
+        from icp.daemon.sessions import Registry, Session
+        reg = Registry(store_cls=object)
+        s = Session(1000, self.store)
+        reg.sessions[1000] = s
+        self.assertIsNone(s.autofill_key)
+        reg.open_tier1(s, self.ui)
+        k1 = s.autofill_key
+        self.assertEqual(len(k1), 32)
+        reg.lock(1000, "user", notify=False)
+        self.assertIsNone(s.autofill_key)
+        reg.open_tier1(s, self.ui)
+        self.assertNotEqual(s.autofill_key, k1)
+        reg.shutdown()
 
 
 if __name__ == "__main__":

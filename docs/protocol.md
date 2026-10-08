@@ -666,15 +666,23 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
                       "rate-limited"|"prompt-pending"|"cancelled"|"bad-origin"|"insecure-origin"}
 ```
 
+- `id` in every autofill reply and request is a **handle**, never an entry id: `h-` and 32 hex
+  characters of HMAC-SHA256(entry id) under a random key the daemon makes at each unlock and
+  drops at every lock. Entry ids are an unkeyed hash of (domain, username), so a program given
+  them could confirm a guessed username offline; a handle says nothing without the key, and a
+  handle from before a lock is `no-match`. A real entry id sent to `autofill-fill` is
+  `no-match` too. Handles are the same on every autofill connection during one unlock, so
+  `sendNativeMessage` (a connection per message) works.
+
 - `autofill-query` never prompts. Locked, without a UI connection, or for a uid the daemon
   has not seen since it started: only `{"state":"locked"}` (the autofill `hello` says the
   same); empty or a seal state: only `{"state":"unavailable"}`. Unlocked: up to
   20 accounts ranked by match, then newest change, then label. `username` and `label` are
   included only once a fill on this connection has been approved since the uid last
-  unlocked; before that a query gives ids and match kinds only. Never a secret.
+  unlocked; before that a query gives handles and match kinds only. Never a secret.
 - `autofill-fill` raises `.autofill` every time with `account` and `origin` (the host), in the
   `autofill` rate-limit bucket (one outstanding, 3 refused per minute per uid). An unknown
-  id and a non-matching id both give `no-match`. After approval the daemon re-checks that the
+  handle and a non-matching one both give `no-match`. After approval the daemon re-checks that the
   uid is still unlocked and the entry still matches, opens the entry and replies with
   username and password only. It also sends the UI an `autofill` event.
 - The browser, and the extension, then hold that one password. The origin is only as

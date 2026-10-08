@@ -122,7 +122,10 @@ request for the daemon from `origin` and `id` only.
 - Never raises a dialog and never returns a secret.
 - `locked` and `unavailable` replies carry nothing else: no count, no hint.
 - `accounts`: at most 20, exact matches first, then related ones (section 6), newest change
-  first within each group. `id` is opaque; pass it back unchanged to `fill`. `username` and
+  first within each group. `id` is an opaque handle; pass it back unchanged to `fill`. It is
+  valid until Pear next locks (then query again: an old handle is `no-match`), it is the same
+  for every host process during one unlock, and it is not derived from the username in any
+  way you could check. `username` and
   `label` (what the Pear dialog shows) are included only after a fill through this host
   process was approved since Pear was last unlocked; before that, show "Account 1, 2, ..."
   and let the Pear dialog name the account.

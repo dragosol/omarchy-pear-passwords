@@ -122,6 +122,7 @@ class Session:
         self.signin = None                 # the live SocketFrontend
         self.migrating = False             # migrate-begin made a store, import not committed
         self.autofill_enabled = False      # turned on in the window, behind .manage (persisted)
+        self.autofill_key: bytes | None = None   # keys autofill handles; only while unlocked
         self.last_ui_request = 0.0
         self.next_sync_at: float | None = None
         self.store_lock = asyncio.Lock()
@@ -381,6 +382,7 @@ class Registry:
     def open_tier1(self, s: Session, conn, show_all: bool = False) -> None:
         s.tier1 = conn
         s.show_all = bool(show_all)
+        s.autofill_key = secrets.token_bytes(32)   # new handles for every unlock
         s.next_sync_at = None              # the scheduler starts the 2 h clock from here
         s.last_ui_request = self.clock()
         self.notify_autofill(s.uid)
@@ -393,6 +395,7 @@ class Registry:
         was = s.tier1 is not None
         s.tier1 = None
         s.show_all = False
+        s.autofill_key = None                       # every handle handed out is void
         s.epoch += 1
         s.next_sync_at = None
         self._drop_grant(uid, event=False)

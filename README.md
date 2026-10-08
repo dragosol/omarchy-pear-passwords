@@ -107,7 +107,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "282f62a0311ed5df678cf1db7470a679c3ea40742a070c03652626b53f6b14a9  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "365e8750929444fd1bd54a132395a83995dc152e6ce38bb3462aa77c75e42f41  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -275,8 +275,10 @@ What to know before you turn it on:
   set-gid so that only it can reach the service, but anything of yours can start it. Such a
   program still gets nothing without a dialog, and the dialog says a browser extension is
   asking; but if you approve a fill you did not just ask your browser for, it gets that
-  password. The window shows when an autofill host is connected. Leave autofill off if you do
-  not use it.
+  password. Before you approve one, it learns only how many accounts a site has, as opaque
+  handles that change every time Pear locks, never a username, and it cannot test a guessed
+  one. The window shows when an autofill host is connected. Leave autofill off if you do not
+  use it.
 - **The browser then holds that password**, and so does the extension. Pear's protection ends
   where the browser's begins.
 - **The site is only as trustworthy as the browser that reports it.** A well-behaved extension

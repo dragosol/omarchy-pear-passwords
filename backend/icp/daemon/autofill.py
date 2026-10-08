@@ -11,9 +11,15 @@ The rules these handlers implement (docs/protocol.md 'Autofill' is the normative
   refuses the role, and both ops refuse with "forbidden" once it is turned off again. pear-exec
   runs the autofill role for any program of yours, so the browser manifest alone is no opt-in.
 - A query names accounts (username, label) only to a connection that has had a fill approved
-  since the last unlock; before that it gives ids and match kinds only. Any program of yours
-  that gets one fill dialog approved receives that one password - the dialog says a browser
-  extension is asking, and the window shows whether an autofill host is connected.
+  since the last unlock; before that it gives handles and match kinds only. Any program of
+  yours that gets one fill dialog approved receives that one password - the dialog says a
+  browser extension is asking, and the window shows whether an autofill host is connected.
+- An autofill client never sees an entry id. Entry ids are an unkeyed hash of (domain,
+  username), so handing them out would let any program confirm a guessed username offline.
+  Every reply carries a handle instead: HMAC-SHA256 of the id under a random key that exists
+  only while the uid is unlocked (made by the unlock, dropped by every lock), so handles mean
+  nothing after a lock and cannot be computed from a guess. A real entry id sent to fill is
+  just an unknown handle (no-match).
 
 - A locked Pear reveals nothing. Unless the uid's tier-1 UI session is unlocked, both ops
   answer as if no account exists for any site: autofill-query returns {"state": "locked"} with
@@ -28,6 +34,8 @@ The rules these handlers implement (docs/protocol.md 'Autofill' is the normative
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 from typing import TYPE_CHECKING
 
@@ -304,6 +312,36 @@ async def _matching_meta(reg: SessionRegistry, session, uid: int, entry_id: str,
     return meta
 
 
+_HANDLE_CONTEXT = b"pear/v2/autofill-handle\x00"
+HANDLE_HEX = 32                      # 128 bits of HMAC-SHA256
+
+
+def handle_for(key: bytes, entry_id: str) -> str:
+    """The opaque handle an autofill client sees for `entry_id` during this unlock."""
+    mac = hmac.new(key, _HANDLE_CONTEXT + entry_id.encode("utf-8"), hashlib.sha256)
+    return "h-" + mac.hexdigest()[:HANDLE_HEX]
+
+
+def _handle_key(session) -> bytes | None:
+    key = getattr(session, "autofill_key", None)
+    return key if isinstance(key, (bytes, bytearray)) and len(key) >= 32 else None
+
+
+async def _resolve(reg: SessionRegistry, session, uid: int, handle: str) -> str:
+    """The entry id behind `handle` in this unlock, or OpError("no-match")."""
+    key = _handle_key(session)
+    if key is None or not _ID_RE.fullmatch(handle) or not handle.startswith("h-"):
+        raise OpError("no-match")
+    try:
+        metas = await reg.run_store(uid, session.store.list_meta)
+    except (StoreLocked, SealError):
+        raise OpError("locked") from None
+    for m in metas:
+        if hmac.compare_digest(handle_for(key, m.id), handle):
+            return m.id
+    raise OpError("no-match")
+
+
 def _notify(reg: SessionRegistry, uid: int, entry_id: str, host: str, outcome: str) -> None:
     reg.notify_ui(uid, {"event": "autofill", "id": entry_id, "origin": host,
                         "outcome": outcome})
@@ -318,11 +356,12 @@ async def handle_autofill_query(session_registry: SessionRegistry, conn: Connect
     empty, tpm-missing, tpm-cleared or damaged): no count, no hint whether the site has
     accounts, and the origin is validated but not used. Unlocked: returns
         {"state": "unlocked", "host": <parsed host>,
-         "accounts": [{"id", "match": "exact"|"related"[, "username", "label"]}, ...]}
-    ranked by match_rank, then newest mdat, then label; at most 20 accounts. "username" and
-    "label" appear only once a fill on this connection has been approved since the last
-    unlock; before that the ids are all a query gives away. Never includes a password, notes,
-    a code or any other entry's data.
+         "accounts": [{"id": <handle>, "match": "exact"|"related"[, "username", "label"]}]}
+    ranked by match_rank, then newest mdat, then label; at most 20 accounts. "id" is the
+    entry's handle (handle_for), never its entry id. "username" and "label" appear only once
+    a fill on this connection has been approved since the last unlock; before that the
+    handles are all a query gives away, and they say nothing about the username. Never
+    includes a password, notes, a code or any other entry's data.
 
     Raises OpError("bad-origin" | "insecure-origin" | "bad-request")."""
     reg, uid = session_registry, conn.uid
@@ -346,9 +385,12 @@ async def handle_autofill_query(session_registry: SessionRegistry, conn: Connect
             ranked.append((rank, -float(meta.mdat or 0), account_label(meta).casefold(), meta))
     ranked.sort(key=lambda r: r[:3])
     named = _approved(conn, session)
+    key = _handle_key(session)
+    if key is None:
+        return {"state": _closed_state(reg, uid)}
     accounts = []
     for rank, _, _, m in ranked[:MAX_ACCOUNTS]:
-        a = {"id": m.id, "match": "exact" if rank == 0 else "related"}
+        a = {"id": handle_for(key, m.id), "match": "exact" if rank == 0 else "related"}
         if named:
             a["username"], a["label"] = m.username or "", account_label(m)
         accounts.append(a)
@@ -357,10 +399,11 @@ async def handle_autofill_query(session_registry: SessionRegistry, conn: Connect
 
 async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connection,
                                req: dict) -> dict:
-    """op "autofill-fill" {origin, id}.
+    """op "autofill-fill" {origin, id}. `id` is a handle from autofill-query, never an
+    entry id; the reply carries the same handle back.
 
     In order: parse the origin; require the uid's session unlocked (else OpError("locked"));
-    look up `id` and require match_rank(host, meta) is not None (else OpError("no-match") -
+    resolve the handle to its entry under this unlock's key, look the entry up and require match_rank(host, meta) is not None (else OpError("no-match") -
     the same code for an unknown id, so ids cannot be probed); raise the `.autofill` dialog via
     session_registry.authorize(conn, ACTION_AUTOFILL, {"account": account_label(meta),
     "origin": host}); after approval, re-check the session is still unlocked and the entry
@@ -380,11 +423,12 @@ async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connecti
     reg, uid = session_registry, conn.uid
     _require_enabled(reg, uid)
     origin = _field(req, "origin")
-    entry_id = _field(req, "id")
+    handle = _field(req, "id")
     host = parse_origin(origin)
     session = _open_session(reg, uid)
     if session is None:
         raise OpError("locked")
+    entry_id = await _resolve(reg, session, uid, handle)
     meta = await _matching_meta(reg, session, uid, entry_id, host)
 
     try:
@@ -413,7 +457,7 @@ async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connecti
         if _open_session(reg, uid) is not session:
             secrets = None
             raise OpError("locked")
-        reply = {"id": entry_id, "username": meta.username or "",
+        reply = {"id": handle, "username": meta.username or "",
                  "password": secrets.password or ""}
         secrets = None
         conn.autofill_epoch = getattr(session, "epoch", 0)
