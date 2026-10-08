@@ -638,6 +638,33 @@ def test_create_writes_tags_as_the_last_line(monkeypatch, edit_env):
     assert got["notes"] == "body\n\nTags: #work"
 
 
+@pytest.mark.parametrize("notes, tags, want", [
+    # A tag line typed at the end of the notes joins the field's tags: one line, last.
+    ("body\nTags: #home #Work", ["work", "travel"], "body\n\nTags: #home #work #travel"),
+    ("Tags: #a", ["b"], "Tags: #a #b"),
+    # Not a tag line (a bad token): body text, kept as typed.
+    ("body\nTags: #a,b", ["c"], "body\nTags: #a,b\n\nTags: #c"),
+])
+def test_create_merges_a_typed_tag_line_with_the_tags(monkeypatch, edit_env, notes, tags, want):
+    got = {}
+    monkeypatch.setattr(push, "create_entry", lambda z, *a, **kw: got.update(kw))
+    edit_env["after"] = [_cred("new.example", "kim", "pw3")]
+    apple.create(_ctx(FakeStore(session=JOINED)),
+                 {"domain": "new.example", "username": "kim", "password": "pw3",
+                  "notes": notes, "tags": tags})
+    assert got["notes"] == want
+
+
+def test_create_refuses_more_than_16_tags_counting_the_typed_line(monkeypatch, edit_env):
+    monkeypatch.setattr(push, "create_entry", lambda *a, **kw: pytest.fail("written"))
+    typed = "Tags: " + " ".join(f"#t{i}" for i in range(10))
+    with pytest.raises(apple.FieldError) as e:
+        apple.create(_ctx(FakeStore(session=JOINED)),
+                     {"domain": "new.example", "username": "kim", "password": "pw3",
+                      "notes": typed, "tags": [f"u{i}" for i in range(7)]})
+    assert e.value.field == "tags" and edit_env["opened"] == 0
+
+
 def test_a_sync_hands_its_item_shape_to_the_context(client):
     client.creds = [_cred()]
     shape = {("inet", "com.apple.cfnetwork"): {"count": 1, "keys": {"acct"}, "inner_keys": set()}}

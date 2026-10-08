@@ -43,6 +43,15 @@ Omarchy's own shell components.
   | `websites` | entries with a website |
   | `wifi` | Wi-Fi networks |
 
+- **Categories and tags in the search field.** Hover the search field (or press Alt+Down, or
+  type `#`) for Apple's categories that Pear can sync, Codes and Wi-Fi, and your own tags. The
+  one you pick sits in the field as a chip before what you type and narrows it; its x or
+  Backspace clears it. Passkeys and Recently Deleted (read-only) wait in Settings until you
+  have checked them on your keychain.
+- **Tags that sync.** Give an entry as many tags as you like (up to 16). They are kept as the
+  last line of its notes, `Tags: #work #family`, so they reach your other devices and show
+  there as plain note text. Anyone who gets past the first dialog sees them, like titles and
+  usernames: never put a secret on that line.
 - **Keyboard first.** Arrows to move, Tab into the details, Enter to copy, Esc to go back.
 - **Browser autofill, if you want it.** Off by default. Turn it on in the window, bring your own
   extension and register it with one command; every fill asks first. See
@@ -64,7 +73,7 @@ asks for a password:
 | --- | --- | --- |
 | `io.github.dragosol.pearpasswords.unlock` | Unlock Pear Passwords to show your accounts | Each time you open Pear, and after it locks |
 | `io.github.dragosol.pearpasswords.reveal` | Use the saved password for $(account) | The first reveal, copy, code, notes, history or edit of one account |
-| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | Signing in or out, adding or deleting, moving from 1.x, starting over, deleting the old 1.x copy, checking clipboard history, turning browser autofill on, moving your keys onto the security chip, turning on a category that waits for a check (Passkeys, Recently Deleted), reading the keychain diagnostic |
+| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | Signing in or out, adding or deleting, moving from 1.x, starting over, deleting the old 1.x copy, checking clipboard history, turning browser autofill on, moving your keys onto the security chip, turning a category that waits for a check (Passkeys, Recently Deleted) on or off, reading the keychain diagnostic |
 | `io.github.dragosol.pearpasswords.autofill` | A browser extension asks to fill the password for $(account) on $(origin) | Every browser fill, if you set up autofill |
 
 1. **Opening Pear** asks once. Approving releases the list of accounts: names, sites and
@@ -107,7 +116,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "3545c54092caff23d2fbf310ebc84d05646106f751dc6243618bcbb0662c5056  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "966e2474f6122ac487c4ab8dda0139a9f3a20942f1fbaedf4b5d2138a5e1e8f7  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -300,9 +309,11 @@ What to know before you turn it on:
   history managers not to keep them.
 - The value never passes through a file: it is held in memory by a small Wayland clipboard
   writer, never `wl-copy`, which stages its input in `/tmp`.
-- The Copy buttons are the only way a secret reaches the clipboard. Ctrl+C, Ctrl+X and the
-  right-click menu do nothing in the fields where you type or edit a password, notes or a
-  setup key.
+- A secret reaches the clipboard only this way: the Copy buttons, and Copy (Ctrl+C or the
+  right-click menu) on text you select in the fields where you type or edit a password, notes
+  or a setup key, which goes to the same writer with the same one paste or 30 seconds. Cut
+  does nothing there, and the Apple ID password, Apple's code and the 1.x passphrase fields
+  copy nothing at all.
 - While a copy is on offer, any program that can read your clipboard can read it. If one reads
   it first, your own paste comes up empty, which at least tells you.
 - Settings can check your clipboard history for passwords copied by older versions (it asks

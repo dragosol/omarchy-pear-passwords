@@ -31,12 +31,12 @@ SECRET_FIELDS = ("edArea", "edSetup", "crSetup", "crNotes", "newPw", "crPass", "
 # the password history.
 SECRET_LABELS = ("fieldValue", "historyValue")
 # Inputs that never hold a secret: the search box (catSearch is its root inside
-# CategorySearch.qml), a nickname, a new entry's name, site and username, a tag being typed
-# (tags are list metadata), and read-only shell commands to copy (one has no id). Only the
-# session-bus layer keeps these off AT-SPI, which is enough: they hold nothing the unlocked
-# list does not show.
-NOT_SECRET = ("search", "catSearch", "nickField", "crName", "crSite", "crUser", "tagInput",
-              "cmdText", "regText", "setReg", None)
+# CategorySearch.qml), a nickname, a new entry's name, site, username and tags, a tag being
+# typed (tags are list metadata), the keychain check's names and counts, and read-only shell
+# commands to copy (one has no id). Only the session-bus layer keeps these off AT-SPI, which
+# is enough: they hold nothing the unlocked list does not show.
+NOT_SECRET = ("search", "catSearch", "nickField", "crName", "crSite", "crUser", "crTags",
+              "tagInput", "diagOut", "cmdText", "regText", "setReg", None)
 
 
 def element_of(ident: str) -> str:

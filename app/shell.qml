@@ -224,6 +224,9 @@ ShellRoot {
     property bool settingsOpen: false
     property string historyCheck: ""             // result line of the clipboard-history check
     property bool historyChecking: false
+    property bool featureBusy: false
+    property bool diagBusy: false
+    property string diagText: ""                 // the keychain check: counts and names only
     property bool purging: false
     property bool windowReady: false
     property bool connectGrace: false
@@ -337,6 +340,8 @@ ShellRoot {
             root.syncing = false;
             root.syncedAt = m.synced_at || 0;
             root.needsLogin = false;
+            // The list follows the flags it was made with (a flag changed in Settings, too).
+            if (m.features) root.takeFeatures(m.features);
             root.setEntries(m.entries || []);
             return;
         case "sync-failed":
@@ -638,8 +643,7 @@ ShellRoot {
             root.syncedAt = d.synced_at || 0;
             root.needsLogin = !!d.needs_login;
             root.tpmMove = !!d.tpm_move;
-            root.features = { passkeys: !!(d.features && d.features.passkeys),
-                              apple_deleted: !!(d.features && d.features.apple_deleted) };
+            root.takeFeatures(d.features);
             root.syncing = true;
             root.setEntries(d.entries || []);
             // No sign-in started from here: "signin" raises its own .manage dialog, and a
@@ -751,7 +755,8 @@ ShellRoot {
         if (root.signinOpen && root.signinMode === "relogin") root.signinOpen = false;
         search.closeCats();
         root.catTag = null;
-        root.features = { passkeys: false, apple_deleted: false };
+        root.takeFeatures(null);
+        root.diagText = "";
         search.text = "";
         root.lockReason = "";
         root.status = reason === "screen-locked" ? "locked because the screen locked"
@@ -873,7 +878,6 @@ ShellRoot {
                          + ((e.tags || []).length ? " #" + e.tags.join(" #") : "")).toLowerCase();
             if (kind ? kind(e) : (!q || hay.indexOf(q) !== -1))
                 out.push(e);
-            if (out.length >= 600) break;
         }
         root.filtered = out;
         if (keep) {
@@ -1318,6 +1322,50 @@ ShellRoot {
         clipHistoryFile.path = root.clipHistoryPath;
     }
 
+    // ---- categories that wait for a check (Passkeys, Recently Deleted)
+    // The unlock reply and every `synced` carry the flags; reading them never asks, so
+    // Settings reads them again when it opens (it can be open while locked).
+    function takeFeatures(f) {
+        root.features = { passkeys: !!(f && f.passkeys), apple_deleted: !!(f && f.apple_deleted) };
+    }
+    function loadFeatures() {
+        root.send("features", { get: true }, function (d) {
+            if (!d.error) root.takeFeatures(d.features);
+        });
+    }
+    // Either way is a change, and a change is a .manage dialog: the window alone never turns
+    // one on. The daemon sends the list again with or without those rows.
+    function setFeature(key, on) {
+        const f = {};
+        f[key] = on;
+        root.featureBusy = true;
+        root.send("features", { set: f }, function (d) {
+            root.featureBusy = false;
+            if (d.error) { root.showFlash(root.errorWords(d)); return; }
+            root.takeFeatures(d.features);
+        });
+    }
+    // What the last sync decrypted, as counts and attribute names (never a value), to check
+    // the passkey and Recently Deleted names once before turning those on.
+    function runDiag() {
+        root.diagBusy = true;
+        root.diagText = "";
+        root.send("diag-items", {}, function (d) {
+            root.diagBusy = false;
+            if (d.error) { root.diagText = root.errorWords(d); return; }
+            if (!d.available) {
+                root.diagText = "Nothing to check yet: sync once since unlocking, then check again.";
+                return;
+            }
+            root.diagText = (d.items || []).map(function (it) {
+                return it.count + " × " + it["class"] + "  " + it.agrp
+                     + "\n    names: " + (it.keys || []).join(", ")
+                     + ((it.inner_keys || []).length ? "\n    inside: " + it.inner_keys.join(", ") : "");
+            }).join("\n");
+        });
+    }
+    onSettingsOpenChanged: if (root.settingsOpen && root.phase === "ready") root.loadFeatures()
+
     FileView {
         id: clipHistoryFile
         printErrors: false
@@ -1377,7 +1425,7 @@ ShellRoot {
         }
         if (mode === "create") {
             crName.text = ""; crSite.text = ""; crUser.text = ""; crPass.text = "";
-            crNotes.text = ""; crSetup.text = "";
+            crNotes.text = ""; crSetup.text = ""; crTags.text = "";
         }
         root.editorOpen = true;
         Qt.callLater(function () {
@@ -1407,7 +1455,8 @@ ShellRoot {
         if (root.editorMode === "create")
             return (crPass.text.length > 0 || root.createGenerate)
                    && (crSite.text.trim().length > 0 || crName.text.trim().length > 0)
-                   && (!crSetup.text.trim() || !!root.totpPreview.code);
+                   && (!crSetup.text.trim() || !!root.totpPreview.code)
+                   && crTags.acceptableInput && root.parseTags(crTags.text) !== null;
         return true;
     }
 
@@ -1436,6 +1485,8 @@ ShellRoot {
             const f = { title: crName.text, domain: crSite.text.trim(), username: crUser.text };
             if (crNotes.text) f.notes = crNotes.text;
             if (crSetup.text.trim()) f.totp = { setup: crSetup.text.trim() };
+            const tags = root.parseTags(crTags.text) || [];
+            if (tags.length) f.tags = tags;
             if (!root.createGenerate) f.password = crPass.text;
             root.send("create", root.createGenerate ? { fields: f, generate: {} } : { fields: f },
                       function (d) {
@@ -1750,6 +1801,18 @@ ShellRoot {
         tagInput.text = "";
         root.tagError = "";
         return true;
+    }
+    // "work #family, side-project" -> canonical tags, or null when one breaks the grammar or
+    // there are more than 16 (the daemon checks them again).
+    function parseTags(text) {
+        const out = [];
+        for (const raw of String(text).split(/[\s,]+/)) {
+            if (raw === "" || raw === "#") continue;
+            const t = Cat.canonTag(raw);
+            if (!t) return null;
+            if (!out.some(function (x) { return Cat.fold(x) === Cat.fold(t); })) out.push(t);
+        }
+        return out.length > 16 ? null : out;
     }
     function removeDraftTag(i) {
         const d = root.tagDraft.slice();
@@ -3595,6 +3658,23 @@ ShellRoot {
                             text: "Code now: " + root.groupCode(root.totpPreview.code)
                             color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall
                         }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.row: 8; Layout.column: 0
+                            visible: root.createMore
+                            text: "Tags"
+                            color: Theme.dim; font.family: Theme.uiFont; font.pixelSize: Theme.fSmall
+                        }
+                        // List metadata, not a secret (the notes' last line): an ordinary field.
+                        O.TextField {
+                            id: crTags
+                            Layout.row: 8; Layout.column: 1; Layout.fillWidth: true
+                            visible: root.createMore
+                            font.family: Theme.uiFont; font.pixelSize: Theme.fBody; verticalPadding: 9
+                            placeholderText: "work family (optional)"
+                            // The grammar's characters, and the spaces, commas and '#' between tags.
+                            validator: RegularExpressionValidator { regularExpression: /^[#\p{L}\p{M}\p{N}_, -]*$/ }
+                        }
                     }
 
                     // ---- working / error
@@ -4595,6 +4675,7 @@ ShellRoot {
                 Keys.onEscapePressed: root.settingsOpen = false
 
                 Flickable {
+                    id: setFlick
                     anchors.fill: parent
                     anchors.margins: 30
                     contentHeight: setSheet.implicitHeight
@@ -4759,6 +4840,94 @@ ShellRoot {
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fSmall
                             wrapMode: Text.Wrap
+                        }
+                    }
+
+                    // ---- categories that wait for a check (features spec 1)
+                    Text {
+                        id: featHead
+                        textFormat: Text.PlainText
+                        Layout.topMargin: 24
+                        text: "Passkeys and Recently Deleted"
+                        color: Theme.fg
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                    }
+                    Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        Layout.topMargin: 6
+                        text: "Pear reads both from your iCloud Keychain, but how Apple names them has not been checked "
+                            + "on a real keychain yet, so they stay out of the list until you turn them on. Check the "
+                            + "names first (counts and names only, never a value), compare the counts with the Passwords "
+                            + "app, then turn them on. Each change needs your approval; both stay read-only."
+                        color: Theme.dim
+                        font.family: Theme.uiFont
+                        font.pixelSize: Theme.fSmall
+                        wrapMode: Text.Wrap
+                    }
+                    Repeater {
+                        model: [{ key: "passkeys", label: "Passkeys" }, { key: "apple_deleted", label: "Recently Deleted" }]
+                        delegate: RowLayout {
+                            id: featRow
+                            required property var modelData
+                            Layout.topMargin: 8
+                            spacing: 6
+                            Text {
+                                textFormat: Text.PlainText
+                                Layout.preferredWidth: 140
+                                text: featRow.modelData.label
+                                color: Theme.fg
+                                font.family: Theme.uiFont
+                                font.pixelSize: Theme.fSmall
+                            }
+                            AppButton {
+                                text: "Off"
+                                active: !root.features[featRow.modelData.key]
+                                enabled: !root.featureBusy
+                                fontSize: Theme.fSmall
+                                onClicked: if (root.features[featRow.modelData.key]) root.setFeature(featRow.modelData.key, false)
+                            }
+                            AppButton {
+                                text: "On"
+                                active: !!root.features[featRow.modelData.key]
+                                enabled: !root.featureBusy
+                                fontSize: Theme.fSmall
+                                onClicked: if (!root.features[featRow.modelData.key]) root.setFeature(featRow.modelData.key, true)
+                            }
+                        }
+                    }
+                    AppButton {
+                        Layout.topMargin: 8
+                        visible: root.appUnlocked
+                        text: root.diagBusy ? "Checking…" : "Check the keychain's item names"
+                        enabled: !root.diagBusy
+                        fontSize: Theme.fSmall
+                        onClicked: root.runDiag()
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 8
+                        visible: root.diagText !== ""
+                        implicitHeight: diagOut.implicitHeight + 16
+                        radius: Theme.radius
+                        color: Theme.panel
+                        // Names and counts only; selectable, so they can be pasted into a report.
+                        TextEdit {
+                            id: diagOut
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.margins: 10
+                            textFormat: TextEdit.PlainText
+                            readOnly: true
+                            selectByMouse: true
+                            wrapMode: TextEdit.WrapAnywhere
+                            text: root.diagText
+                            color: Theme.fg
+                            selectionColor: Theme.selected
+                            font.family: "monospace"
+                            font.pixelSize: Theme.fCaption
                         }
                     }
 
@@ -5017,7 +5186,7 @@ ShellRoot {
                 gone.recently_deleted = true;
                 list_.push(wifi, gone);
             }
-            if (mode === "cats-flags") root.features = { passkeys: true, apple_deleted: true };
+            if (mode === "cats-flags") root.takeFeatures({ passkeys: true, apple_deleted: true });
             root.setEntries(list_);
             if (mode === "cats" || mode === "cats-flags") search.openCats(true, false);
             if (mode === "chip") {
@@ -5038,6 +5207,19 @@ ShellRoot {
                 root.historyLoaded = true;
             }
             if (mode === "settings") root.settingsOpen = true;
+            if (mode === "settings-checked") {
+                root.settingsOpen = true;
+                root.takeFeatures({ passkeys: true, apple_deleted: false });
+                root.diagText = "22 × keys  com.apple.webkit.webauthn\n    names: agrp, cdat, class, klbl, labl, mdat\n"
+                              + "3 × inet  com.apple.password-manager-recently-deleted\n    names: acct, agrp, class, srvr";
+            }
+            if (mode === "create-tags") {
+                root.openEditor("create");
+                root.createMore = true;
+                crName.text = "Example"; crSite.text = "example.com"; crUser.text = "me@example.com";
+                crTags.text = "work #family";
+            }
+            if (mode === "settings-checked") Qt.callLater(function () { setFlick.contentY = featHead.y - 10; });
             if (mode === "copied") root.showFlash("Password copied — clears after one paste or 30 s");
         }
         if (root.snapshotPath) snapshotTimer.start();

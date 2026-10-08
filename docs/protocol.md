@@ -575,7 +575,7 @@ the next grant; `idle_lock_s` restarts the idle clock.
   `apple_deleted`, both `false` until turned on. `get` never asks. A `set` that changes a
   flag raises `.manage`; the window alone can never change one. Remembered in state.json.
   Other keys or non-boolean values are `invalid`. While a flag is off its rows are left out
-  of every list (section 3.1).
+  of every list (section 3.1). After a change the window gets the list again as `synced`.
 - `diag-items`: needs tier 1, raises `.manage`. What the last full sync since this unlock
   decrypted, as counts per (`class`, `agrp`) pair with the set of attribute names (`keys`)
   and, for password-manager metadata records, the names inside the blob (`inner_keys`).
@@ -654,7 +654,8 @@ if their sha256 still matches.
 ```json
 {"event":"locked","reason":"screen-locked"}
 {"event":"synced","entries":[<Meta>...],"synced_at":1791450000.0,
- "counts":{"added":0,"changed":2,"deleted":0,"unchanged":552}}
+ "counts":{"added":0,"changed":2,"deleted":0,"unchanged":552},
+ "features":{"passkeys":false,"apple_deleted":false}}
 {"event":"sync-failed","reason":"anisette-unavailable"|"network"|"needs-login"|"apple","detail":"..."}
 {"event":"needs-login"}
 {"event":"grant-expired","id":"<id>"}
@@ -668,6 +669,8 @@ if their sha256 still matches.
 
 `focus` asks the window to raise itself (`hyprctl dispatch focuswindow`). `autofill-hosts` is
 sent whenever an autofill host connects or goes, so the window can show that one is connected.
+`synced` carries the `features` its list was made with (section 6.10), so the window's
+category rows always match the rows it was sent.
 
 ### 9.2 Sign-in stream (to the UI, carrying the signin rid)
 

@@ -806,6 +806,20 @@ class FeatureFlagTests(Base):
         r = await self.h.unlock(ui2)
         self.assertEqual(r["features"], {"passkeys": True, "apple_deleted": True})
 
+    async def test_every_synced_event_carries_the_flags_its_list_was_made_with(self):
+        await self.ui.call("unlock")
+        ev = await self.ui.event("synced")                  # the background sync
+        self.assertEqual(ev["features"], {"passkeys": False, "apple_deleted": False})
+        await self.h.syncs_done()
+        await self.ui.call("features", set={"apple_deleted": True})
+        ev = await self.ui.event("synced")                  # the list again, after the change
+        self.assertEqual(ev["features"], {"passkeys": False, "apple_deleted": True})
+        self.assertIn("rd", {e["id"] for e in ev["entries"]})
+        await self.ui.call("features", set={"apple_deleted": False})
+        ev = await self.ui.event("synced")
+        self.assertEqual(ev["features"], {"passkeys": False, "apple_deleted": False})
+        self.assertNotIn("rd", {e["id"] for e in ev["entries"]})
+
     async def test_a_refused_dialog_changes_nothing(self):
         await self.h.unlock(self.ui)
         self.h.authority.outcome = "dismissed"

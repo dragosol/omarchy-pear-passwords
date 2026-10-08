@@ -21,10 +21,25 @@ const ALL_TINT = "#3478f6";
 const MAX_TAGS = 16;
 const MAX_TAG_LEN = 32;
 
-// Comparison key: NFKC, then a case fold. JavaScript has no casefold(); upper-then-lower
-// folds the cases that matter here the way Python's does (ß to ss, final sigma, long s).
+// Comparison key: NFKC, then Python's str.casefold(), so a tag the daemon calls one tag is one
+// row here too. JavaScript has no casefold(). Per code point, upper-then-lower case is the
+// same fold (ß to ss, either sigma, long s) except for the 174 code points mapped below: a
+// whole string would get the final-sigma rule, which casefold does not have.
+// test_qml_category_tag checks this against Python for every code point with a case mapping.
+function foldChar(c) {
+    const n = c.codePointAt(0);
+    if (n === 0x131) return c;                                      // dotless i stays
+    if (n === 0x1e9e) return "ss";                                  // capital sharp s
+    // Cherokee folds to its capitals, the other way round from every other script.
+    if (n >= 0x13a0 && n <= 0x13f5) return c;
+    if (n >= 0x13f8 && n <= 0x13fd) return String.fromCodePoint(n - 8);
+    if (n >= 0xab70 && n <= 0xabbf) return String.fromCodePoint(n - 0xab70 + 0x13a0);
+    return c.toUpperCase().toLowerCase();
+}
 function fold(t) {
-    return String(t).normalize("NFKC").toUpperCase().toLowerCase();
+    let out = "";
+    for (const c of String(t).normalize("NFKC")) out += foldChar(c);
+    return out;
 }
 
 // What a typed tag is stored as: NFC, lower case, no leading '#'. "" when it cannot be a tag:

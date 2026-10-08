@@ -66,17 +66,38 @@ class WindowWiringTests(unittest.TestCase):
             self.assertIn(line, box)
         self.assertIn("Cat.count(root.entries, root.catTag)", box)   # "Search 47 Wi-Fi"
 
-    def test_flags_come_only_from_the_unlock_reply_and_default_off(self):
+    def test_flags_come_only_from_the_daemon_and_default_off(self):
         self.assertIn("property var features: ({ passkeys: false, apple_deleted: false })", CODE)
-        sets = re.findall(r"root\.features = ([^;]*);", CODE)
-        auth = function_body("authenticate")
-        self.assertIn("root.features = { passkeys: !!(d.features && d.features.passkeys),", auth)
-        self.assertIn("root.features = { passkeys: false, apple_deleted: false }",
-                      function_body("lockApp"))
-        # The third is the development preview, which never connects.
-        self.assertEqual(len(sets), 3)
-        self.assertIn("root.features = { passkeys: true, apple_deleted: true }",
+        # One setter; it takes only booleans, so anything else reads as off.
+        self.assertEqual(len(re.findall(r"root\.features = ", CODE)), 1)
+        self.assertIn("root.features = { passkeys: !!(f && f.passkeys), apple_deleted: !!(f && f.apple_deleted) };",
+                      function_body("takeFeatures"))
+        calls = re.findall(r"root\.takeFeatures\(([^;]*)\);", CODE)
+        # The unlock reply, every synced event, op features (get and set), a lock (off), and
+        # two development previews, which never connect.
+        self.assertEqual(sorted(calls), sorted(["d.features", "m.features", "d.features",
+                                                "d.features", "null",
+                                                "{ passkeys: true, apple_deleted: true }",
+                                                "{ passkeys: true, apple_deleted: false }"]))
+        self.assertIn("root.takeFeatures(d.features);", function_body("authenticate"))
+        self.assertIn("root.takeFeatures(null);", function_body("lockApp"))
+        synced = CODE[CODE.index('case "synced":'):]
+        synced = synced[:synced.index("return;")]
+        self.assertLess(synced.index("if (m.features) root.takeFeatures(m.features);"),
+                        synced.index("root.setEntries("))
+        self.assertIn("root.takeFeatures({ passkeys: true, apple_deleted: true })",
                       function_body("applyPreview"))
+
+    def test_a_flag_changes_only_through_op_features(self):
+        # Turning a category on or off is op features {set}, which raises .manage in the
+        # daemon; reading is {get}, which never asks. Nothing else sends "features".
+        self.assertEqual(len(re.findall(r'send\("features"', CODE)), 2)
+        self.assertIn('root.send("features", { get: true },', function_body("loadFeatures"))
+        self.assertIn('root.send("features", { set: f },', function_body("setFeature"))
+        self.assertIn('root.send("diag-items", {},', function_body("runDiag"))
+        self.assertRegex(CODE, r"onSettingsOpenChanged: if \(root\.settingsOpen && root\.phase === "
+                               r'"ready"\) root\.loadFeatures\(\)')
+        self.assertIn('root.diagText = "";', function_body("lockApp"))
 
     def test_the_tag_clears_on_lock_and_survives_a_sync_only_while_someone_has_it(self):
         lock = function_body("lockApp")
@@ -617,6 +638,43 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         passed = re.findall(r"^PASS   : qmltestrunner::CategoryTag::(test_\w+)\(\)", r.stdout, re.M)
         self.assertEqual(len(passed), TEST_QML.count("        function test_"), r.stdout)
+
+
+    def test_fold_is_the_daemons(self):
+        """categories.js's fold is tagline.fold (NFKC, then str.casefold) for every code point
+        that has a case mapping, and for strings where a whole-string lower case would differ
+        (final sigma) - so the drop-down groups tags exactly as the daemon de-duplicates them."""
+        import json
+        import unicodedata
+        from icp.keychain import tagline
+        cps = [c for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF
+               and unicodedata.category(chr(c)) != "Cn"
+               and (chr(c).casefold() != chr(c) or chr(c).upper() != chr(c)
+                    or chr(c).lower() != chr(c))]
+        words = ["ΟΔΟΣ", "ὈΔΥΣΣΕΎΣ", "Straße", "ẞIG", "ＷＯＲＫ", "ǅemal", "İstanbul", "ıi",
+                 "ᏣᎳᎩ", "ꮳꮃꭹ", "ﬁle", "café", "cafe\u0301", "Ⅻ", "①", "ﬀ"]
+        samples = [chr(c) for c in cps] + words
+        data = json.dumps([[t, tagline.fold(t)] for t in samples])
+        qml = ('import QtQuick\nimport QtTest\nimport "categories.js" as Cat\n'
+               'TestCase { name: "Fold"\n'
+               '    function test_fold() {\n'
+               '        const d = ' + data + ';\n'
+               '        const bad = [];\n'
+               '        for (let i = 0; i < d.length; i++) if (Cat.fold(d[i][0]) !== d[i][1]) bad.push(d[i][0]);\n'
+               '        compare(bad.length, 0, "fold differs for " + JSON.stringify(bad.slice(0, 20)));\n'
+               '        verify(d.length > 2900);\n'
+               '    }\n}\n')
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(CATS_JS, d)
+            path = os.path.join(d, "tst_fold.qml")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(qml)
+            env = {"PATH": "/usr/bin", "QT_QPA_PLATFORM": "offscreen", "HOME": d,
+                   "XDG_RUNTIME_DIR": d}
+            r = subprocess.run([QMLTESTRUNNER, "-input", path], capture_output=True, text=True,
+                               timeout=180, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertIn("PASS   : qmltestrunner::Fold::test_fold()", r.stdout)
 
 
 

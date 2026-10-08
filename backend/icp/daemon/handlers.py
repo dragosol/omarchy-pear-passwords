@@ -234,7 +234,8 @@ def _notify_list_after(reg, s) -> None:
             reg.notify_ui(s.uid, {"event": "synced", "entries": entries,
                                   "synced_at": st.get("synced_at"),
                                   "counts": {"added": 0, "changed": 0, "deleted": 0,
-                                             "unchanged": len(entries)}})
+                                             "unchanged": len(entries)},
+                                  "features": dict(s.features)})
     after_reply(lambda: spawn(send()))
 
 
@@ -431,7 +432,8 @@ async def background_sync(reg, uid: int) -> str:
             "event": "synced", "entries": wire.entries(metas, s.show_all, s.features),
             "synced_at": counts.get("synced_at", st.get("synced_at")),
             "counts": {k: int(counts.get(k, 0) or 0)
-                       for k in ("added", "changed", "deleted", "unchanged")}})
+                       for k in ("added", "changed", "deleted", "unchanged")},
+            "features": dict(s.features)})
         return "synced"
     except Exception:
         logger.exception("uid %d: sync failed", uid)

@@ -520,8 +520,11 @@ def create(ctx: "UserContext", fields: dict) -> str:
         raise FieldError("domain", str(e)) from None
     notes = _text(fields, "notes")
     if "tags" in fields:
+        # One tag line, last: a "Tags:" line typed at the end of the notes joins the field's
+        # tags rather than staying behind as body text above a second line.
         from ..keychain import tagline
-        notes = tagline.compose(notes.strip("\n"), _tags(fields["tags"]))
+        body, typed = tagline.split(notes.strip("\n"))
+        notes = tagline.compose(body, _tags(typed + _tags(fields["tags"])))
     sites = _sites(fields["sites"]) if "sites" in fields else []
     cfg = _totp_cfg(fields["totp"]) if fields.get("totp") is not None else None
 
