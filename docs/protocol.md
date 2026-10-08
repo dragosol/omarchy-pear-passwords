@@ -461,10 +461,11 @@ the next grant; `idle_lock_s` restarts the idle clock.
 
 - `migrate-begin`: needs state `empty`, a store an earlier `migrate-begin` created that
   never committed (the daemon records `migration_pending` in state.json; that store holds
-  keys and nothing else, and is renamed aside and started over), or any store that holds
-  nothing - no entry or history box, no iCloud session, no aliases or nicknames, read
-  without a key - which is started over the same way (an import abandoned by mistake, or a
-  store reset and never signed in, so a 1.x vault that is there can always still be moved).
+  keys and nothing else, and is started over: deleted when it keeps nothing, else renamed
+  aside), or any store that holds nothing - no entry or history box, no iCloud session, no
+  aliases or nicknames, read without a key - which is started over the same way (an import
+  abandoned by mistake, or a store reset and never signed in, so a 1.x vault that is there
+  can always still be moved).
   Otherwise `not-locked`. When a new store would certainly be refused (a TPM and a
   `tpm2-pcr-public-key.pem`), `seal-refused` with `reason:"pcr-policy"` comes before any
   dialog. Raises `.manage`, creates and seals new keys, opens tier 1 on this connection, and issues
@@ -490,9 +491,12 @@ the next grant; `idle_lock_s` restarts the idle clock.
   recorded (`migration_pending`), and on a store that holds nothing (as for
   `migrate-begin`); else `not-locked`. `seal-refused`/`pcr-policy` before any dialog as for
   `migrate-begin`. Raises `.manage`;
-  the old directory is renamed aside, never deleted. The reply `state:"empty"` means "no
-  entries and no iCloud session": the fresh store already has new sealed keys and tier 1
-  stays open on this connection, so the sign-in the UI then offers needs only its own
+  the old directory is renamed aside. After `tpm-cleared` or `damaged` it is always kept; a
+  store that opens normally and keeps nothing (only key wrappers and settings: no entry or
+  history box, iCloud session, aliases or nicknames) is deleted instead. The reply
+  `state:"empty"` means "no entries and no iCloud session": the fresh store already has new
+  sealed keys and tier 1 stays open on this connection, so the sign-in the UI then offers
+  needs only its own
   `.manage` dialog. No `locked` event is sent; a later `hello` reports `locked`.
 - `autofill-enable`: turning browser autofill on raises `.manage` (once; it is then remembered
   in state.json); turning it off never asks and closes every autofill connection of the uid.

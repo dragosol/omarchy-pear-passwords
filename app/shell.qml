@@ -3805,8 +3805,7 @@ ShellRoot {
                     textFormat: Text.PlainText
                     Layout.fillWidth: true
                     visible: root.startOverConfirm
-                    text: "Start over? New keys are made and you sign in to iCloud again. Local password "
-                        + "history and nicknames can't be brought back. The old files are moved aside, not deleted."
+                    text: root.startOverNote(root.screen)
                     color: Theme.danger
                     font.family: Theme.uiFont
                     font.pixelSize: Theme.fSmall
@@ -4554,6 +4553,16 @@ ShellRoot {
         case "tpm-missing": case "tpm-cleared": case "damaged": return "Try again";
         }
         return "";
+    }
+    // reset keeps the old files after tpm-cleared or damaged; a store that opens normally and
+    // keeps nothing (an unfinished move that saved nothing) is deleted (docs/protocol.md, reset).
+    function startOverNote(screen) {
+        const head = "Start over? New keys are made and you sign in to iCloud again. Local password "
+                   + "history and nicknames can't be brought back. ";
+        if (screen === "tpm-cleared" || screen === "damaged")
+            return head + "The old files are moved aside, not deleted.";
+        return head + "If the unfinished move saved nothing yet, its files are deleted; otherwise "
+             + "they are moved aside.";
     }
     function stateAction() {
         switch (root.screen) {
