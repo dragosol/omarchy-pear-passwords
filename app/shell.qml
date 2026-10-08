@@ -6,6 +6,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui as O
+import "categories.js" as Cat
 
 // Pear Passwords 2: the window.
 //
@@ -131,6 +132,11 @@ ShellRoot {
     property bool authRetry: false
     property bool startOverConfirm: false
     property bool needsLogin: false
+    // The search field's one tag (categories.js): null is All. List metadata only, so it
+    // survives syncs and grants; a lock clears it.
+    property var catTag: null
+    // From the unlock reply: rows that wait for a live check stay hidden until it passes.
+    property var features: ({ passkeys: false, apple_deleted: false })
 
     // ---------------------------------------------------------------- the one account grant
     // At most one account is open at a time, for settings.grant_s seconds (0 = one use).
@@ -153,6 +159,8 @@ ShellRoot {
     property string notesText: ""
     property bool notesLoaded: false
     property int hideAfter: 20
+    // A passkey-only row (features spec 1) has nothing to reveal or copy: said, never asked for.
+    readonly property string noPassword: "This account has no password — it signs in with a passkey"
 
     property string status: ""
     property string flash: ""
@@ -172,6 +180,13 @@ ShellRoot {
     property var totpPreview: ({})
     property bool createMore: false
     property bool createGenerate: false
+    // ---- tags: an inline chip editor in the detail pane, inside the account's grant
+    property bool tagEditing: false
+    property var tagDraft: []
+    property bool tagBusy: false
+    property string tagError: ""
+    // Tags being edited when the approval ran out, given back like editDraft.
+    property var tagKept: null
     property bool panelFocus: false
     property int detailIndex: 0
     readonly property int fieldCount: root.fieldRows().length
@@ -522,7 +537,7 @@ ShellRoot {
     Connections {
         target: Qt.application
         function onStateChanged() {
-            if (Qt.application.state !== Qt.ApplicationActive) root.hideSecrets();
+            if (Qt.application.state !== Qt.ApplicationActive) { root.hideSecrets(); search.closeCats(); }
         }
     }
     Timer {
@@ -623,6 +638,8 @@ ShellRoot {
             root.syncedAt = d.synced_at || 0;
             root.needsLogin = !!d.needs_login;
             root.tpmMove = !!d.tpm_move;
+            root.features = { passkeys: !!(d.features && d.features.passkeys),
+                              apple_deleted: !!(d.features && d.features.apple_deleted) };
             root.syncing = true;
             root.setEntries(d.entries || []);
             // No sign-in started from here: "signin" raises its own .manage dialog, and a
@@ -639,14 +656,36 @@ ShellRoot {
 
     function lockNow() { root.send("lock", {}, null); }
 
-    // After tpm-cleared or damaged: new keys, then sign in again. The daemon moves the old
-    // files aside rather than deleting them.
     // Ctrl+C / Ctrl+X (and Ctrl+Insert, Shift+Delete) in a field that holds a secret would put
     // it on the regular clipboard, past pear-clip's one paste or 30 s and into clipboard
-    // history. Every such field swallows those shortcuts here and has no context menu; the
-    // Copy buttons go through the daemon and pear-clip.
-    function guardSecretKeys(event) {
-        if (event.matches(StandardKey.Copy) || event.matches(StandardKey.Cut)) event.accepted = true;
+    // history, so Qt never sees them here. Copy in a field with a `source` (docs/protocol.md,
+    // copy-text) sends the selection to the daemon, and pear-clip puts it on the clipboard
+    // like any other copy; without one (the Apple ID password, the 2FA code, the 1.x
+    // passphrase) it does nothing. Cut is swallowed everywhere.
+    function guardSecretKeys(event, source, field) {
+        if (event.matches(StandardKey.Copy)) {
+            event.accepted = true;
+            if (source && field && field.selectedText !== "") root.copyText(source, field.selectedText);
+        } else if (event.matches(StandardKey.Cut)) event.accepted = true;
+    }
+
+    // Selected text from a secret field, through the daemon and pear-clip: no dialog (the text
+    // is already in this window), and the edit sources only inside that account's grant.
+    function copyText(source, text) {
+        if (!text) return;
+        if (text.length > 16384) { root.showFlash("That selection is too long to copy"); return; }
+        const bound = source === "notes-edit" || source === "totp-setup-edit" || source === "new-password";
+        const id = root.selectedId;
+        const go = function () {
+            root.send("copy-text", bound ? { source: source, id: id, text: text }
+                                         : { source: source, text: text }, function (d) {
+                if (d.error) { root.showFlash(root.errorWords(d)); return; }
+                clipComponent.createObject(root, { ticket: d.ticket, running: true });
+                root.showFlash("Selection copied — clears after one paste or "
+                               + (root.settings.clip_timeout_s || 30) + " s");
+            });
+        };
+        if (bound) root.withGrant(go); else go();
     }
 
     // An import that never committed, with nothing left to import or "Start fresh instead"
@@ -660,6 +699,8 @@ ShellRoot {
         });
     }
 
+    // After tpm-cleared, damaged or an unfinished move: new keys, then sign in again
+    // (startOverNote says what happens to the old files).
     function startOver() {
         root.send("reset", {}, function (d) {
             root.startOverConfirm = false;
@@ -696,6 +737,7 @@ ShellRoot {
     // Back to the locked window, with nothing in it. Never re-prompts on its own.
     function lockApp(reason) {
         root.editDraft = null;
+        root.tagKept = null;
         root.endGrant();
         root.appUnlocked = false;
         root.autoAuthTried = true;
@@ -707,6 +749,9 @@ ShellRoot {
         root.settingsOpen = false;
         root.historyCheck = "";
         if (root.signinOpen && root.signinMode === "relogin") root.signinOpen = false;
+        search.closeCats();
+        root.catTag = null;
+        root.features = { passkeys: false, apple_deleted: false };
         search.text = "";
         root.lockReason = "";
         root.status = reason === "screen-locked" ? "locked because the screen locked"
@@ -720,6 +765,8 @@ ShellRoot {
 
     function setEntries(list_) {
         const keep = root.selectedId;
+        // A tag nobody has any more (its last entry lost it on another device) goes.
+        if (!Cat.stillValid(list_, root.features, root.catTag)) root.catTag = null;
         root.entries = list_;
         root.applyFilter(keep);
         if (root.snapshotPath) snapshotTimer.start();
@@ -783,9 +830,12 @@ ShellRoot {
             d = d || { id: root.selectedId };
             d.pw = newPw.text;
         }
+        const kept = root.tagEditing && root.selectedId !== ""
+            ? { id: root.selectedId, tags: root.tagDraft.slice(), typed: tagInput.text } : null;
         root.endGrant();
         root.editDraft = d;
-        if (d) root.showFlash("The account's approval ran out — your unsaved edit is kept; open it again to finish");
+        root.tagKept = kept;
+        if (d || kept) root.showFlash("The account's approval ran out — your unsaved edit is kept; open it again to finish");
     }
 
     function hideSecrets() {
@@ -803,6 +853,8 @@ ShellRoot {
         root.renaming = false;
         if (root.editorOpen && root.editorMode !== "create") root.editorOpen = false;
         newPw.text = "";
+        root.tagEditing = false; root.tagBusy = false; root.tagDraft = []; root.tagError = "";
+        tagInput.text = "";
     }
 
     function secretShown() { hideTimer.restart(); }
@@ -814,8 +866,11 @@ ShellRoot {
         const kind = root.searchKind(q);
         const out = [];
         for (const e of root.entries) {
+            // The chip narrows first, with the same predicate its count in the drop-down uses.
+            if (!Cat.matches(e, root.catTag)) continue;
             const hay = (e.primary + " " + e.title + " " + e.secondary + " " + e.domain
-                         + " " + (e.sites || []).join(" ")).toLowerCase();
+                         + " " + (e.sites || []).join(" ")
+                         + ((e.tags || []).length ? " #" + e.tags.join(" #") : "")).toLowerCase();
             if (kind ? kind(e) : (!q || hay.indexOf(q) !== -1))
                 out.push(e);
             if (out.length >= 600) break;
@@ -834,6 +889,12 @@ ShellRoot {
         if (out.length) root.select(out[0]); else root.clearSelection();
     }
 
+    // From the drop-down, the chip's x or Backspace: the list follows at once, the query stays.
+    function setCatTag(t) {
+        root.catTag = t;
+        root.applyFilter(root.selectedId);
+    }
+
     function searchKind(q) {
         if (/^(2fa|mfa|otp|totp|(2fa|mfa|otp) codes?|codes?|verification codes?|two[- ]factor|2[- ]factor)$/.test(q))
             return function (e) { return e.has_totp; };
@@ -849,6 +910,7 @@ ShellRoot {
     function clearSelection() {
         if (root.grantId !== "" || root.granting) root.send("release", {}, null);
         root.editDraft = null;
+        root.tagKept = null;
         root.selected = null; root.selectedId = "";
         root.endGrant();
         root.detailIndex = 0;
@@ -861,6 +923,7 @@ ShellRoot {
         if (root.grantId !== "" || root.granting) root.send("release", {}, null);
         root.granting = false;
         root.editDraft = null;
+        root.tagKept = null;
         root.selected = e; root.selectedId = e.id;
         root.endGrant();
         root.detailIndex = 0;
@@ -877,11 +940,13 @@ ShellRoot {
     // ---------------------------------------------------------------- copy, reveal, codes
     function clipWords(field) {
         return field === "password" ? "Password" : field === "code" ? "Code"
-             : field === "notes" ? "Notes" : field === "domain" ? "Website" : "Username";
+             : field === "notes" ? "Notes" : field === "domain" ? "Website"
+             : field === "text" ? "Selection" : "Username";
     }
 
     function copyField(field) {
         if (!root.selected) return;
+        if (field === "password" && root.selected.has_password === false) { root.showFlash(root.noPassword); return; }
         const id = root.selectedId;
         const go = function () {
             root.send("copy", { id: id, field: field }, function (d) {
@@ -901,6 +966,7 @@ ShellRoot {
     function stillOpen(id) { return id === root.selectedId && root.grantId === id; }
 
     function doReveal() {
+        if (root.selected && root.selected.has_password === false) { root.showFlash(root.noPassword); return; }
         root.withGrant(function () {
             if (root.revealed) { root.revealed = ""; return; }
             const id = root.selectedId;
@@ -1008,7 +1074,10 @@ ShellRoot {
                 : "systemd sealed the keys in a way Pear doesn't recognise, so nothing was saved. "
                   + "See \"TPM\" in the README";
         case "migration-pending": return "the move from 1.x isn't finished — finish it or start fresh first";
-        case "invalid": return "that " + (d.field || "value") + " isn't valid";
+        case "invalid":
+            if (d.detail === "not-utf8")
+                return "these notes aren't plain UTF-8 text, so Pear won't rewrite them to change the tags";
+            return "that " + (d.field || "value") + " isn't valid";
         case "dismissed": case "cancelled": return "cancelled";
         case "denied": return "not approved";
         case "no-grant": case "grant-expired": return "that account closed — open it again";
@@ -1560,6 +1629,9 @@ ShellRoot {
     function fieldRows() {
         const s = root.selected;
         if (!s) return [];
+        // Apple keeps these read-only (the daemon refuses a `set` on them): no edit is offered,
+        // so no approval dialog is raised for one that cannot happen.
+        const readOnly = !!s.recently_deleted || s.kind === "passkey";
         const rows = [{ key: "username", label: s.is_wifi ? "Network" : "Username", value: s.username || "—",
                         quiet: !s.username, actions: [{ key: "username", label: "copy" }] },
                       { key: "password", label: "Password",
@@ -1568,7 +1640,10 @@ ShellRoot {
                         actions: [{ key: "view", label: root.revealed ? "hide" : "view" },
                                   { key: "change", label: "change" },
                                   { key: "password", label: "copy" }] }];
-        if (s.is_wifi) return rows;
+        if (s.has_password === false)
+            rows[1] = { key: "none", label: "Password", value: "none — this account uses a passkey",
+                        quiet: true, actions: [] };
+        if (s.is_wifi) return readOnly ? root.withoutEdits(rows) : rows;
         const sites = root.allSites();
         if (!sites.length)
             rows.push({ key: "editsites", label: "Website", value: "Add a website", quiet: true, actions: [] });
@@ -1590,6 +1665,24 @@ ShellRoot {
                         quiet: !root.notesLoaded, actions: [{ key: "editnotes", label: "edit" }] });
         else
             rows.push({ key: "editnotes", label: "Notes", value: "Add notes", quiet: true, actions: [] });
+        // Tags: list metadata (the notes' final "Tags:" line, read by the daemon at sync), so
+        // they show without the account's grant; editing them is an edit and needs it.
+        // Rows Apple keeps read-only (recently deleted, passkey-only) show them, nothing more.
+        const tags = s.tags || [];
+        rows.push({ key: readOnly ? "tags" : "edittags", label: "Tags",
+                    value: root.tagEditing ? "editing below" : tags.length ? "#" + tags.join("  #")
+                         : readOnly ? "—" : "Add tags",
+                    quiet: !tags.length || root.tagEditing, chips: root.tagEditing ? [] : tags,
+                    actions: tags.length && !readOnly ? [{ key: "edittags", label: "edit" }] : [] });
+        return readOnly ? root.withoutEdits(rows) : rows;
+    }
+    function withoutEdits(rows) {
+        for (let i = 0; i < rows.length; i++) {
+            rows[i].actions = rows[i].actions.filter(function (a) {
+                return a.key !== "change" && a.key.indexOf("edit") !== 0;
+            });
+            if (rows[i].key.indexOf("edit") === 0) { rows[i].key = "none"; rows[i].value = "—"; }
+        }
         return rows;
     }
 
@@ -1622,6 +1715,58 @@ ShellRoot {
         else if (key === "edittotp") root.withGrant(function () { root.openEditor("totp"); });
         else if (key === "notes") root.loadNotes(root.notesLoaded ? function () { root.openEditor("notes"); } : null);
         else if (key === "editnotes") root.loadNotes(function () { root.openEditor("notes"); });
+        else if (key === "edittags") root.withGrant(function () { root.openTagEditor(); });
+    }
+
+    // ---- tags --------------------------------------------------------------------------
+    function openTagEditor() {
+        if (!root.selected) return;
+        const kept = root.tagKept;
+        const fromKept = !!kept && kept.id === root.selectedId;
+        root.tagKept = null;
+        root.tagDraft = fromKept ? kept.tags : (root.selected.tags || []).slice();
+        tagInput.text = fromKept ? kept.typed || "" : "";
+        root.tagError = ""; root.tagBusy = false;
+        root.tagEditing = true;
+        Qt.callLater(function () { tagInput.forceActiveFocus(); });
+    }
+    function closeTagEditor() {
+        if (root.tagBusy) return;
+        root.tagEditing = false; root.tagDraft = []; root.tagError = "";
+        tagInput.text = "";
+    }
+    // What is typed becomes a chip: the field only lets the grammar's characters in (letters,
+    // marks, digits, - and _), this checks the rest; the daemon checks every tag again.
+    function commitTagInput() {
+        const raw = tagInput.text;
+        if (raw === "" || raw === "#") { tagInput.text = ""; return true; }
+        const t = Cat.canonTag(raw);
+        if (!tagInput.acceptableInput || !t) { root.tagError = "a tag is 1 to 32 letters, digits, - or _"; return false; }
+        const k = Cat.fold(t);
+        for (const x of root.tagDraft)
+            if (Cat.fold(x) === k) { tagInput.text = ""; return true; }
+        if (root.tagDraft.length >= 16) { root.tagError = "at most 16 tags"; return false; }
+        root.tagDraft = root.tagDraft.concat([t]);
+        tagInput.text = "";
+        root.tagError = "";
+        return true;
+    }
+    function removeDraftTag(i) {
+        const d = root.tagDraft.slice();
+        d.splice(i, 1);
+        root.tagDraft = d;
+    }
+    function saveTags() {
+        if (root.tagBusy || !root.commitTagInput()) return;
+        const tags = root.tagDraft.slice();
+        root.tagBusy = true;
+        root.tagError = "";
+        root.setFields({ tags: tags }, null, function (d) {
+            root.tagBusy = false;
+            if (d.error) { root.tagError = root.errorWords(d); return; }
+            root.tagEditing = false; root.tagDraft = [];
+            root.showFlash("Tags saved to iCloud — on all your devices");
+        });
     }
 
     // ---- keyboard: the detail panel -------------------------------------------------------
@@ -1727,6 +1872,7 @@ ShellRoot {
                     else if (root.revealed) { root.revealed = ""; }
                     else if (root.settingsOpen) { root.settingsOpen = false; }
                     else if (search.text.length) { search.text = ""; }
+                    else if (root.catTag) { root.setCatTag(null); }
                     else Qt.quit();
                     ev.accepted = true;
                 } else if (ev.key === Qt.Key_Down) { root.moveCursor(1); ev.accepted = true; }
@@ -1820,6 +1966,8 @@ ShellRoot {
                         Rectangle {
                             Layout.fillWidth: true
                             implicitHeight: 58
+                            // Above the list, so the search's drop-down draws over it.
+                            z: 2
                             color: Theme.panel
                             // Plain text in the corner, no box: a search that looks like a form
                             // field makes the whole window read as a dialog.
@@ -1838,16 +1986,24 @@ ShellRoot {
                                 HoverHandler { id: hNew; cursorShape: Qt.PointingHandCursor }
                                 TapHandler { onTapped: root.openEditor("create") }
                             }
-                            TextField {
+                            // Hover it (or Alt+Down, or a leading '#') for the categories and
+                            // tags; the chosen one sits before the query as a chip
+                            // (CategorySearch.qml). Down/Up/Enter/Tab keep their list meanings.
+                            CategorySearch {
                                 id: search
                                 anchors.fill: parent
                                 anchors.leftMargin: 14
                                 anchors.rightMargin: newButton.visible ? newButton.width + 28 : 14
                                 enabled: root.appUnlocked
                                 opacity: root.appUnlocked ? 1 : 0.6
+                                entries: root.entries
+                                features: root.features
+                                tag: root.catTag
                                 placeholderText: !root.appUnlocked ? "Locked"
                                     : root.entries.length === 0 ? "No passwords"
-                                    : "Search " + root.entries.length + " passwords"
+                                    : root.catTag ? "Search " + Cat.count(root.entries, root.catTag) + " "
+                                                    + Cat.chipText(root.catTag)
+                                    : "Search " + Cat.count(root.entries, null) + " passwords"
                                 color: Theme.fg
                                 placeholderTextColor: Theme.dim
                                 background: Rectangle { color: "transparent" }
@@ -1855,11 +2011,10 @@ ShellRoot {
                                 font.pixelSize: Theme.fBody
                                 focus: true
                                 onTextChanged: root.applyFilter(root.selectedId)
-                                Keys.onDownPressed: root.moveCursor(1)
-                                Keys.onTabPressed: root.enterPanel(0)
-                                Keys.onUpPressed: root.moveCursor(-1)
-                                Keys.onReturnPressed: root.copyPassword()
-                                Keys.onEscapePressed: function (ev) { ev.accepted = false; }
+                                onTagPicked: (t) => root.setCatTag(t)
+                                onMoveRequested: (delta) => root.moveCursor(delta)
+                                onCopyRequested: root.copyPassword()
+                                onTabbed: root.enterPanel(0)
                             }
                         }
 
@@ -2463,11 +2618,42 @@ ShellRoot {
                                             Accessible.ignored: true
                                             textFormat: Text.PlainText
                                             Layout.fillWidth: true
+                                            visible: !(frow.modelData.chips && frow.modelData.chips.length)
                                             text: frow.modelData.value
                                             color: frow.modelData.quiet ? Theme.dim : Theme.fg
                                             font.family: Theme.uiFont
                                             font.pixelSize: Theme.fBody
                                             elide: Text.ElideRight
+                                        }
+                                        // Tags as chips, the way the search field shows one.
+                                        Item {
+                                            visible: !!frow.modelData.chips && frow.modelData.chips.length > 0
+                                            Layout.fillWidth: true
+                                            implicitHeight: 26
+                                            clip: true
+                                            Row {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                spacing: 6
+                                                Repeater {
+                                                    model: frow.modelData.chips || []
+                                                    delegate: Rectangle {
+                                                        required property var modelData
+                                                        width: tagChip.implicitWidth + 16
+                                                        height: tagChip.implicitHeight + 6
+                                                        radius: 9
+                                                        color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
+                                                        Text {
+                                                            id: tagChip
+                                                            textFormat: Text.PlainText
+                                                            anchors.centerIn: parent
+                                                            text: "#" + modelData
+                                                            color: Theme.fg
+                                                            font.family: Theme.uiFont
+                                                            font.pixelSize: Theme.fBody - 1
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                         // Secondary actions: declared on top, so a click on one
                                         // is taken here and never reaches the row's own action.
@@ -2528,6 +2714,145 @@ ShellRoot {
                                 }
                             }
 
+                            // ---- tags: chips you can remove, and a field for new ones (the grant
+                            // is open while this shows; Save is one `set`, pushed to iCloud)
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                Layout.fillHeight: false
+                                Layout.topMargin: 12
+                                spacing: 8
+                                visible: root.tagEditing
+
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    implicitHeight: tagFlow.implicitHeight + 16
+                                    radius: Theme.radius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: tagInput.activeFocus ? Theme.accent : Theme.line
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.IBeamCursor
+                                        onClicked: tagInput.forceActiveFocus()
+                                    }
+                                    Flow {
+                                        id: tagFlow
+                                        x: 8; y: 8
+                                        width: parent.width - 16
+                                        spacing: 6
+                                        Repeater {
+                                            model: root.tagDraft
+                                            delegate: Rectangle {
+                                                required property var modelData
+                                                required property int index
+                                                width: draftRow.width + 16
+                                                height: 26
+                                                radius: 9
+                                                color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
+                                                Row {
+                                                    id: draftRow
+                                                    x: 8
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    spacing: 5
+                                                    Text {
+                                                        textFormat: Text.PlainText
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        text: "#" + modelData
+                                                        color: Theme.fg
+                                                        font.family: Theme.uiFont
+                                                        font.pixelSize: Theme.fBody - 1
+                                                    }
+                                                    Text {
+                                                        textFormat: Text.PlainText
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        text: "×"
+                                                        color: hDraftX.hovered ? Theme.fg : Theme.dim
+                                                        font.family: Theme.uiFont
+                                                        font.pixelSize: Theme.fBody
+                                                        HoverHandler { id: hDraftX; cursorShape: Qt.PointingHandCursor }
+                                                        TapHandler { onTapped: root.removeDraftTag(index) }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        TextInput {
+                                            id: tagInput
+                                            width: Math.max(140, Math.min(contentWidth + 12, tagFlow.width))
+                                            height: 26
+                                            verticalAlignment: TextInput.AlignVCenter
+                                            color: Theme.fg
+                                            selectionColor: Theme.selected
+                                            font.family: Theme.uiFont
+                                            font.pixelSize: Theme.fBody
+                                            // The grammar's characters only (features spec 5b.2);
+                                            // Space, comma and Enter end a tag instead.
+                                            validator: RegularExpressionValidator {
+                                                regularExpression: /^#?[\p{L}\p{M}\p{N}_-]{0,32}$/
+                                            }
+                                            onTextChanged: root.tagError = ""
+                                            Keys.onPressed: function (ev) {
+                                                const k = ev.key;
+                                                if (k === Qt.Key_Escape) root.closeTagEditor();
+                                                else if (k === Qt.Key_Return || k === Qt.Key_Enter) {
+                                                    if (tagInput.text !== "") root.commitTagInput();
+                                                    else root.saveTags();
+                                                } else if (k === Qt.Key_Space || k === Qt.Key_Comma || ev.text === ",")
+                                                    root.commitTagInput();
+                                                else if (k === Qt.Key_Backspace && tagInput.text === "" && root.tagDraft.length)
+                                                    root.removeDraftTag(root.tagDraft.length - 1);
+                                                else return;
+                                                ev.accepted = true;
+                                            }
+                                            Text {
+                                                textFormat: Text.PlainText
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                visible: tagInput.text === ""
+                                                text: root.tagDraft.length ? "add a tag" : "work, family, side-project…"
+                                                color: Theme.dim
+                                                font.family: Theme.uiFont
+                                                font.pixelSize: Theme.fBody
+                                            }
+                                        }
+                                    }
+                                }
+                                // The same words as docs/security.md 2: what a tag is not.
+                                Text {
+                                    textFormat: Text.PlainText
+                                    Layout.fillWidth: true
+                                    text: "Whatever is on a note's final Tags: line is list metadata, not a secret: it is "
+                                          + "visible to anyone who passes the first dialog, like titles and usernames. "
+                                          + "Do not put secrets on that line."
+                                    color: Theme.dim
+                                    font.family: Theme.uiFont
+                                    font.pixelSize: Theme.fSmall
+                                    wrapMode: Text.Wrap
+                                }
+                                Text {
+                                    textFormat: Text.PlainText
+                                    Layout.fillWidth: true
+                                    visible: root.tagBusy || root.tagError !== ""
+                                    text: root.tagBusy ? "Saving to iCloud and checking it arrived…" : root.tagError
+                                    color: root.tagBusy ? Theme.dim : Theme.danger
+                                    font.family: Theme.uiFont
+                                    font.pixelSize: Theme.fSmall
+                                    wrapMode: Text.Wrap
+                                }
+                                RowLayout {
+                                    spacing: 8
+                                    AppButton {
+                                        active: true
+                                        text: "Save"
+                                        enabled: !root.tagBusy
+                                        onClicked: root.saveTags()
+                                    }
+                                    AppButton {
+                                        text: "Cancel"
+                                        enabled: !root.tagBusy
+                                        onClicked: root.closeTagEditor()
+                                    }
+                                }
+                            }
+
                             // ---- change password: hidden until asked for
                             ColumnLayout {
                                 Layout.fillWidth: true
@@ -2544,9 +2869,10 @@ ShellRoot {
                                         id: newPw
                                         Accessible.ignored: true
                                         // A secret leaves this window only through pear-clip (one paste or 30 s, never in
-                                        // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
-                                        Keys.onPressed: (event) => root.guardSecretKeys(event)
-                                        ContextMenu.menu: null
+                                        // clipboard history): Ctrl+C and the menu's Copy go through root.copyText; Ctrl+X does nothing.
+                                        Keys.onPressed: (event) => root.guardSecretKeys(event, "new-password", newPw)
+                                        ContextMenu.menu: secretMenu
+                                        ContextMenu.onRequested: secretMenu.aim(newPw, "new-password")
                                         // No IME learning, no prediction (pear-exec also keeps input methods and the
                                         // primary selection away from the window).
                                         inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -2626,10 +2952,12 @@ ShellRoot {
                             }
 
                             // ---- history: the one locked section, so it carries the lock
+                            // (out of the way while the tag editor takes its room)
                             RowLayout {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: false
                                 Layout.topMargin: 30
+                                visible: !root.tagEditing
                                 spacing: 10
                                 Text {
                                     textFormat: Text.PlainText
@@ -2664,7 +2992,7 @@ ShellRoot {
                                 textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 Layout.topMargin: 10
-                                visible: !!root.selected && (root.selected.history_count === 0
+                                visible: !!root.selected && !root.tagEditing && (root.selected.history_count === 0
                                          || (root.historyLoaded && root.historyRows.length === 0))
                                 text: "No changes recorded yet."
                                 color: Theme.dim
@@ -2674,7 +3002,7 @@ ShellRoot {
 
                             Item {
                                 Layout.fillHeight: true
-                                visible: !(root.historyLoaded && root.historyRows.length > 0)
+                                visible: !(root.historyLoaded && root.historyRows.length > 0) || root.tagEditing
                             }
 
                             // The list is widened 12px each side and its text inset by the same,
@@ -2685,7 +3013,7 @@ ShellRoot {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
                                 Layout.topMargin: 6
-                                visible: root.historyLoaded && root.historyRows.length > 0
+                                visible: root.historyLoaded && root.historyRows.length > 0 && !root.tagEditing
                             ListView {
                                 id: historyList
                                 anchors.fill: parent
@@ -2775,7 +3103,7 @@ ShellRoot {
                                 : root.status ? root.status
                                 : !root.appUnlocked ? "locked"
                                 : root.entries.length === 0 ? ""
-                                : root.filtered.length + " of " + root.entries.length + " shown"
+                                : root.filtered.length + " of " + Cat.count(root.entries, null) + " shown"
                             color: root.flash ? Theme.accent : Theme.dim
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fSmall
@@ -2854,6 +3182,47 @@ ShellRoot {
                         }
                     }
                 }
+            }
+        }
+
+        // Copy, Paste and Select All for the fields that hold a secret and may be copied (the
+        // Apple ID password, the 2FA code and the 1.x passphrase have no menu at all). Copy is
+        // root.copyText: the daemon and pear-clip, never Qt's clipboard. There is no Cut.
+        Menu {
+            id: secretMenu
+            parent: scope
+            property Item target: null
+            property string source: ""
+            function aim(field, source_) { secretMenu.target = field; secretMenu.source = source_; }
+            palette.window: Theme.bg
+            palette.windowText: Theme.fg
+            palette.base: Theme.bg
+            palette.text: Theme.fg
+            palette.buttonText: Theme.fg
+            palette.highlight: Theme.selected
+            palette.highlightedText: Theme.fg
+            background: Rectangle {
+                implicitWidth: 180
+                color: Theme.bg
+                border.width: 1
+                border.color: Theme.line
+                radius: Theme.radius
+            }
+            MenuItem {
+                text: "Copy"
+                enabled: !!secretMenu.target && secretMenu.source !== ""
+                         && secretMenu.target.selectedText !== ""
+                onTriggered: root.copyText(secretMenu.source, secretMenu.target.selectedText)
+            }
+            MenuItem {
+                text: "Paste"
+                enabled: !!secretMenu.target && secretMenu.target.canPaste
+                onTriggered: secretMenu.target.paste()
+            }
+            MenuItem {
+                text: "Select All"
+                enabled: !!secretMenu.target && secretMenu.target.length > 0
+                onTriggered: secretMenu.target.selectAll()
             }
         }
 
@@ -2970,9 +3339,10 @@ ShellRoot {
                                     id: edArea
                                     Accessible.ignored: true
                                     // A secret leaves this window only through pear-clip (one paste or 30 s, never in
-                                    // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
-                                    Keys.onPressed: (event) => root.guardSecretKeys(event)
-                                    ContextMenu.menu: null
+                                    // clipboard history): Ctrl+C and the menu's Copy go through root.copyText; Ctrl+X does nothing.
+                                    Keys.onPressed: (event) => root.guardSecretKeys(event, root.editorMode === "notes" ? "notes-edit" : "", edArea)
+                                    ContextMenu.menu: root.editorMode === "notes" ? secretMenu : null
+                                    ContextMenu.onRequested: secretMenu.aim(edArea, "notes-edit")
                                     // No IME learning, no prediction (pear-exec also keeps input methods and the
                                     // primary selection away from the window).
                                     inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -3014,9 +3384,10 @@ ShellRoot {
                                 id: edSetup
                                 Accessible.ignored: true
                                 // A secret leaves this window only through pear-clip (one paste or 30 s, never in
-                                // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
-                                Keys.onPressed: (event) => root.guardSecretKeys(event)
-                                ContextMenu.menu: null
+                                // clipboard history): Ctrl+C and the menu's Copy go through root.copyText; Ctrl+X does nothing.
+                                Keys.onPressed: (event) => root.guardSecretKeys(event, "totp-setup-edit", edSetup)
+                                ContextMenu.menu: secretMenu
+                                ContextMenu.onRequested: secretMenu.aim(edSetup, "totp-setup-edit")
                                 // No IME learning, no prediction (pear-exec also keeps input methods and the
                                 // primary selection away from the window).
                                 inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -3130,9 +3501,10 @@ ShellRoot {
                                 id: crPass
                                 Accessible.ignored: true
                                 // A secret leaves this window only through pear-clip (one paste or 30 s, never in
-                                // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
-                                Keys.onPressed: (event) => root.guardSecretKeys(event)
-                                ContextMenu.menu: null
+                                // clipboard history): Ctrl+C and the menu's Copy go through root.copyText; Ctrl+X does nothing.
+                                Keys.onPressed: (event) => root.guardSecretKeys(event, "create-password", crPass)
+                                ContextMenu.menu: secretMenu
+                                ContextMenu.onRequested: secretMenu.aim(crPass, "create-password")
                                 Layout.fillWidth: true
                                 visible: !root.createGenerate
                                 password: true
@@ -3176,9 +3548,10 @@ ShellRoot {
                             id: crNotes
                             Accessible.ignored: true
                             // A secret leaves this window only through pear-clip (one paste or 30 s, never in
-                            // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
-                            Keys.onPressed: (event) => root.guardSecretKeys(event)
-                            ContextMenu.menu: null
+                            // clipboard history): Ctrl+C and the menu's Copy go through root.copyText; Ctrl+X does nothing.
+                            Keys.onPressed: (event) => root.guardSecretKeys(event, "create-notes", crNotes)
+                            ContextMenu.menu: secretMenu
+                            ContextMenu.onRequested: secretMenu.aim(crNotes, "create-notes")
                             // No IME learning, no prediction (pear-exec also keeps input methods and the
                             // primary selection away from the window).
                             inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -3202,9 +3575,10 @@ ShellRoot {
                                 id: crSetup
                                 Accessible.ignored: true
                                 // A secret leaves this window only through pear-clip (one paste or 30 s, never in
-                                // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
-                                Keys.onPressed: (event) => root.guardSecretKeys(event)
-                                ContextMenu.menu: null
+                                // clipboard history): Ctrl+C and the menu's Copy go through root.copyText; Ctrl+X does nothing.
+                                Keys.onPressed: (event) => root.guardSecretKeys(event, "create-totp-setup", crSetup)
+                                ContextMenu.menu: secretMenu
+                                ContextMenu.onRequested: secretMenu.aim(crSetup, "create-totp-setup")
                                 // No IME learning, no prediction (pear-exec also keeps input methods and the
                                 // primary selection away from the window).
                                 inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
@@ -3453,7 +3827,7 @@ ShellRoot {
                             id: signinField
                             Accessible.ignored: true
                             // A secret leaves this window only through pear-clip (one paste or 30 s, never in
-                            // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                            // clipboard history): an account credential, not vault data, so nothing copies from here (no Ctrl+C, Ctrl+X or menu).
                             Keys.onPressed: (event) => root.guardSecretKeys(event)
                             ContextMenu.menu: null
                             Layout.fillWidth: true
@@ -3488,7 +3862,7 @@ ShellRoot {
                             id: codeField
                             Accessible.ignored: true
                             // A secret leaves this window only through pear-clip (one paste or 30 s, never in
-                            // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                            // clipboard history): an account credential, not vault data, so nothing copies from here (no Ctrl+C, Ctrl+X or menu).
                             Keys.onPressed: (event) => root.guardSecretKeys(event)
                             ContextMenu.menu: null
                             width: 1; height: 1; opacity: 0
@@ -4040,7 +4414,7 @@ ShellRoot {
                             id: oldPass
                             Accessible.ignored: true
                             // A secret leaves this window only through pear-clip (one paste or 30 s, never in
-                            // clipboard history): no Ctrl+C / Ctrl+X to the clipboard and no context menu here.
+                            // clipboard history): an account credential, not vault data, so nothing copies from here (no Ctrl+C, Ctrl+X or menu).
                             Keys.onPressed: (event) => root.guardSecretKeys(event)
                             ContextMenu.menu: null
                             Layout.fillWidth: true
@@ -4629,10 +5003,32 @@ ShellRoot {
             root.appUnlocked = true;
             root.vaultState = "unlocked";
             root.oldCopy = { dir: root.home + "/.config/icp.v1-backup-20261008", migrated_at: now - 9 * 86400 };
-            root.setEntries([mk(1, "dummyuser1", ["login.example-1.com"], true, true, false),
-                             mk(2, "dummyuser2", [], false, true, false),
-                             mk(3, "alex@example.com", [], true, false, false),
-                             mk(4, "sam@example.com", [], false, false, true)]);
+            const list_ = [mk(1, "dummyuser1", ["login.example-1.com"], true, true, false),
+                           mk(2, "dummyuser2", [], false, true, false),
+                           mk(3, "alex@example.com", [], true, false, false),
+                           mk(4, "sam@example.com", [], false, false, true)];
+            if (["cats", "cats-flags", "chip", "tags", "tageditor"].indexOf(mode) >= 0) {
+                list_[0].tags = ["work", "finance"];
+                list_[1].tags = ["work"];
+                list_[2].tags = ["side-project"];
+                const wifi = mk(5, "", [], false, false, true, "Home Network");
+                wifi.primary = "Home Network"; wifi.title = "Home Network"; wifi.is_wifi = true;
+                const gone = mk(6, "old@example.com", [], false, false, false);
+                gone.recently_deleted = true;
+                list_.push(wifi, gone);
+            }
+            if (mode === "cats-flags") root.features = { passkeys: true, apple_deleted: true };
+            root.setEntries(list_);
+            if (mode === "cats" || mode === "cats-flags") search.openCats(true, false);
+            if (mode === "chip") {
+                root.setCatTag({ kind: "tag", key: "work", label: "work" });
+                search.text = "acc";
+            }
+            if (mode === "tageditor") {
+                root.grantId = "demo1"; root.grantExpires = now + 118; root.grantLeft = 118;
+                root.openTagEditor();
+                tagInput.text = "taxes";
+            }
             if (mode === "detail") {
                 root.grantId = "demo1"; root.grantExpires = now + 118; root.grantLeft = 118;
                 root.revealed = "correct-horse-battery";
