@@ -110,5 +110,32 @@ class SecretFieldTests(unittest.TestCase):
                                    r"Qt\.ImhNoPredictiveText", ident)
 
 
+class MigrationScreenTests(unittest.TestCase):
+    def test_a_pending_migration_is_offered_again(self):
+        # function-migration-never-reoffered
+        hello = function_body("onHello")
+        self.assertIn("root.migrationPending = !!m.migration_pending", hello)
+        self.assertRegex(hello, r'if \(root\.vaultState === "empty" \|\| root\.migrationPending\) '
+                                r'\{ v1Check\.check\(\); return; \}')
+        screen = CODE[CODE.index("readonly property string screen:"):]
+        screen = screen[:screen.index("\n    }\n")]
+        self.assertRegex(screen, r'root\.migrationPending && root\.vaultState === "locked"')
+        self.assertIn("root.migrationPending = false", function_body("migrateFinish"))
+
+    def test_a_keyring_only_1x_vault_gets_its_own_screen(self):
+        # function-keyring-vaults-not-migrated
+        self.assertIn('vaultFile.path = root.v1Dir + "/vault.enc"', CODE)
+        self.assertIn("root.v1KeyringOnly = vault && !root.v1Present", CODE)
+        self.assertIn('"migrate-keyring"', function_body("stateTitle"))
+        self.assertIn("icp passphrase", function_body("stateCommand"))
+        self.assertIn("v1Check.check()", function_body("stateAction"))
+
+    def test_units_that_were_not_stopped_are_shown_with_the_command(self):
+        # function-legacy-units-not-stopped
+        self.assertIn("migrateResult.units_not_stopped", CODE)
+        self.assertIn('"systemctl --user disable --now "', CODE)
+        self.assertNotIn("The old background services are stopped and turned off", CODE)
+
+
 if __name__ == "__main__":
     unittest.main()

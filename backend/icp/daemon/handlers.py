@@ -305,7 +305,11 @@ async def hello(reg, conn, req: dict) -> dict:
             reg.lock(conn.uid, None, notify=False)
             state = "locked"
         oc = s.old_copy
+        # A migrate-begin whose import never committed: the window offers the move again
+        # instead of unlocking an empty store and signing in afresh.
+        pending = state != "empty" and await _migration_pending(reg, s)
         return {**_hello_base(), "state": state, "signed_in": bool(st.get("signed_in")),
+                "migration_pending": bool(pending),
                 "sealed_with": st.get("sealed_with"), "synced_at": None, "needs_login": None,
                 "settings": dict(s.settings),
                 "autofill": {"enabled": bool(s.autofill_enabled),
@@ -727,6 +731,10 @@ async def op_signin(reg, conn, req):
     if mode == "login":
         if st.get("state") == "empty":
             fresh = True
+        elif await _migration_pending(reg, s):
+            # Signing in over an import that never committed would join escrow afresh and
+            # leave the 1.x history behind; the window offers the move again instead.
+            raise OpError("migration-pending")
         elif not (s.unlocked() and s.tier1 is conn):
             raise OpError("locked")
         elif st.get("signed_in"):

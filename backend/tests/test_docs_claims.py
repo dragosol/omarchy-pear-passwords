@@ -191,10 +191,14 @@ class OwnerDecisionsInDocsTests(unittest.TestCase):
         self.assertIn("/var/lib/systemd/credential.secret", _section(self.readme, "Backups"))
 
     def test_retired_claims_are_gone(self):
+        # The migration section may name 1.x's own keyring mode and its `icp passphrase`
+        # command: that is what moving a keyring-keyed 1.x vault needs (2.0 uses neither).
+        migration = _section(self.readme, "Migrating from 1.x")
+        rest = self.readme.replace(migration, "")
         for stale in ("never uses sudo", "all under your home", "sudo tee", "One scan",
                       "ICP_KEY_GATE", "ICP_LOCK_TIMEOUT", "icp passphrase", "login keyring",
                       "ALWAYS_CHECK", "polkit-1 includes system-auth"):
-            self.assertNotIn(stale, self.readme, stale)
+            self.assertNotIn(stale, rest, stale)
 
 
 if __name__ == "__main__":

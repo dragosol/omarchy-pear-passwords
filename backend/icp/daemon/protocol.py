@@ -158,6 +158,7 @@ ERRORS: dict[str, str] = {
     "not-found": "no entry with this id",
     "no-match": "autofill: no such id, or its sites do not match the origin",
     "not-signed-in": "needs an iCloud session and there is none",
+    "migration-pending": "a 1.x import was started and never committed; finish or retry it first",
     "needs-login": "Apple wants an interactive sign-in",
     "empty": "no vault yet for this uid",
     "tpm-missing": "seal state, see docs/protocol.md 'States'",

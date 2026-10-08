@@ -91,7 +91,7 @@ Replies:
 {"rid":0,"proto":2,"version":"2.0.0","state":"locked","signed_in":true,
  "sealed_with":"host","synced_at":null,"needs_login":null,
  "settings":{"grant_s":120,"idle_lock_s":0,"clip_timeout_s":30},
- "autofill":{"enabled":false,"hosts":0},
+ "migration_pending":false,"autofill":{"enabled":false,"hosts":0},
  "old_copy":{"dir":"/home/u/.config/icp.v1-backup-20261008","migrated_at":1791450000.0}}
 ```
 
@@ -103,6 +103,9 @@ Replies:
 - `synced_at`, `needs_login`: `null` while locked (they live under the metadata key).
 - `old_copy`: the v1 backup recorded by a migration, or `null`.
 - `autofill`: whether browser autofill is turned on, and how many autofill hosts are connected.
+- `migration_pending`: an earlier `migrate-begin` created keys but its import never committed
+  (the window was closed at the passphrase step). The window then offers the move again; a
+  `signin` with mode `login` is refused with `migration-pending` until it has.
 
 `clip` (after the ticket is checked):
 
@@ -695,6 +698,7 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
 | `not-found` | no live entry with this id |
 | `no-match` | autofill: unknown id, or the entry does not match the origin |
 | `not-signed-in` | needs an iCloud session and there is none |
+| `migration-pending` | `signin` login while a 1.x import was started and never committed |
 | `needs-login` | Apple wants an interactive sign-in |
 | `empty` | no store for this uid |
 | `tpm-missing` | see section 4.1 |

@@ -14,8 +14,10 @@ import
      goes to the daemon in memory, which runs Argon2id itself.
   3. import-commit. Only after the daemon has verified the converted store against counts and
      a digest does anything here change a file: the old agent is told to LOCK and QUIT, stray
-     key copies are deleted, the legacy user units are stopped, consented browser manifests
-     are moved, and ~/.config/icp is renamed to ~/.config/icp.v1-backup-YYYYMMDD.
+     key copies are deleted, the legacy user units are stopped (over D-Bus; any that could not
+     be are reported with the command to run), consented browser manifests are moved, the 1.x
+     launcher and backend are removed when they are byte-for-byte what 1.x installed, and
+     ~/.config/icp is renamed to ~/.config/icp.v1-backup-YYYYMMDD.
   It never registers the new autofill host; the window shows the command for that instead.
 
 purge
@@ -35,7 +37,6 @@ import re
 import socket
 import stat
 import struct
-import subprocess
 import sys
 
 from ..daemon import paths, protocol
@@ -62,7 +63,19 @@ LEGACY_MANIFEST_DIRS = (("firefox", ".mozilla/native-messaging-hosts"),
 LEGACY_EXTENSION_ID = "{5ad01040-3351-492c-9a42-1d56b881da78}"
 MANIFESTS_SUBDIR = "legacy-browser-manifests"
 
-SYSTEMCTL = "/usr/bin/systemctl"
+# The 1.x launcher, retired once the vault has moved: it would start 1.3.2's first-run
+# sign-in (its own passphrase prompts) against a ~/.config/icp that is no longer there. Removed
+# only when it is byte-for-byte a released copy, with the user's data directory written as
+# @DATA@ (system/lib/user-files.sh holds the same list; a test keeps them equal).
+LAUNCHER_1X = ".local/share/applications/pear-passwords.desktop"
+DATA_1X = ".local/share/pear-passwords"
+RELEASED_LAUNCHER_SHA256 = frozenset({
+    "720986736414f5ffc6ae8119650ce72bb85ebdba0c0814ed07514d92952cac53",
+    "500f1ad818d777801e2d7929dc8aa90d454fd1faf835ebee5788b36c3554ac70",
+    "9fea786026bfbfa8c9cc3146bd93d8ddb31fcc9e73b88e26c3865fd4442d9c1a",
+    "282145fd9d9d173f38c2e5a68b2e17bcfc22907d8cc5105cc1b25769a9803065",
+})
+DATA_1X_PARTS = ("venv", "app", "app.new", "app.old")
 
 
 class MigrateError(Exception):
@@ -272,19 +285,126 @@ def purge_secret_service() -> int:
     return removed
 
 
-def stop_legacy_units(run=subprocess.run) -> list[str]:
-    """`systemctl --user disable --now` each legacy unit; a unit that does not exist is fine."""
-    stopped = []
-    for unit in LEGACY_UNITS:
-        try:
-            r = run([SYSTEMCTL, "--user", "disable", "--now", unit],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, timeout=30, check=False)
-            if r.returncode == 0:
+def stop_legacy_units(open_bus=None) -> tuple[list[str], list[str]]:
+    """Disable and stop each legacy unit through the systemd user manager over D-Bus.
+
+    Not `systemctl --user`: this process runs set-gid (AT_SECURE), and libsystemd reads
+    DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR with secure_getenv, so systemctl cannot find
+    the user bus here at all. Python reads its environment directly; pear-exec has already
+    checked the bus address is unix:path=$XDG_RUNTIME_DIR/bus.
+
+    Returns (stopped, not_stopped): a unit with no unit file is neither; one that exists and
+    could not be disabled or stopped is not_stopped, and the window shows the command for it."""
+    try:
+        from jeepney import DBusAddress, HeaderFields, MessageType, new_method_call
+        from jeepney.io.blocking import open_dbus_connection
+    except ImportError:
+        return [], list(LEGACY_UNITS)
+    mgr = DBusAddress("/org/freedesktop/systemd1", bus_name="org.freedesktop.systemd1",
+                      interface="org.freedesktop.systemd1.Manager")
+
+    def call(conn, method, sig=None, body=()):
+        reply = conn.send_and_get_reply(new_method_call(mgr, method, sig, body), timeout=30)
+        if reply.header.message_type == MessageType.error:
+            raise RuntimeError(str(reply.header.fields.get(HeaderFields.error_name, "error")))
+        return reply.body
+    try:
+        conn = (open_bus or (lambda: open_dbus_connection(bus="SESSION")))()
+    except Exception:
+        return [], list(LEGACY_UNITS)
+    stopped, failed = [], []
+    try:
+        present = []
+        for unit in LEGACY_UNITS:
+            try:
+                call(conn, "GetUnitFileState", "s", (unit,))
+            except RuntimeError as e:
+                if any(k in str(e) for k in ("NoSuchUnit", "FileNotFound", "NoSuchFile")):
+                    continue                      # no such unit file: nothing to stop
+                failed.append(unit)
+                continue
+            except Exception:
+                failed.append(unit)
+                continue
+            present.append(unit)
+        if present:
+            try:
+                call(conn, "DisableUnitFiles", "asb", (present, False))
+            except Exception:
+                failed.extend(present)
+                present = []
+        for unit in present:
+            try:
+                call(conn, "StopUnit", "ss", (unit, "replace"))
                 stopped.append(unit)
-        except (OSError, subprocess.SubprocessError):
+            except RuntimeError as e:
+                if "NoSuchUnit" in str(e):         # disabled and not loaded: nothing ran
+                    stopped.append(unit)
+                else:
+                    failed.append(unit)
+            except Exception:
+                failed.append(unit)
+        try:
+            call(conn, "Reload")
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return stopped, failed
+
+
+def launcher_sha(data: bytes, home: str) -> str:
+    return hashlib.sha256(data.replace(os.path.join(home, DATA_1X).encode(), b"@DATA@")).hexdigest()
+
+
+def retire_1x_app(home: str, desktop_file: str = paths.DESKTOP_FILE) -> list[str]:
+    """After a verified import, with the 2.0 launcher installed: remove the 1.x launcher if it
+    is a released copy, and 1.x's backend and window copy. Returns what was removed."""
+    removed = []
+    if not os.path.exists(desktop_file):
+        return removed
+    path = os.path.join(home, LAUNCHER_1X)
+    try:
+        dfd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                      | os.O_CLOEXEC)
+    except OSError:
+        dfd = None
+    if dfd is not None:
+        try:
+            data = _read_own_file(dfd, os.path.basename(path), 64 * 1024)
+            if data is not None and launcher_sha(data, home) in RELEASED_LAUNCHER_SHA256 \
+                    and _unlink_own(dfd, os.path.basename(path)):
+                removed.append(path)
+        except MigrateError:
+            pass
+        finally:
+            os.close(dfd)
+    data_dir = os.path.join(home, DATA_1X)
+    try:
+        st = os.lstat(data_dir)
+    except OSError:
+        return removed
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        return removed
+    import shutil
+    for part in DATA_1X_PARTS:
+        p = os.path.join(data_dir, part)
+        try:
+            pst = os.lstat(p)
+        except OSError:
             continue
-    return stopped
+        if stat.S_ISDIR(pst.st_mode) and pst.st_uid == os.getuid():
+            shutil.rmtree(p, ignore_errors=True)
+            if not os.path.lexists(p):
+                removed.append(p)
+    try:
+        os.rmdir(data_dir)
+    except OSError:
+        pass
+    return removed
 
 
 def legacy_manifest_matches(data: bytes, home: str) -> bool:
@@ -383,7 +503,7 @@ def _send_key(daemon: Channel, **field) -> bool:
 
 
 def do_import(daemon: Channel, stdin, out: Out, home: str, runtime: str,
-              run=subprocess.run, secret_service=None) -> int:
+              stop_units=None, secret_service=None, retire_app=None) -> int:
     try:
         opts = json.loads(stdin_line(stdin) or "{}")
     except ValueError:
@@ -445,7 +565,7 @@ def do_import(daemon: Channel, stdin, out: Out, home: str, runtime: str,
     except MigrateError:
         pass
     (secret_service or purge_secret_service)()
-    stop_legacy_units(run)
+    units_stopped, units_not_stopped = (stop_units or stop_legacy_units)()
     renamed = None
     try:
         os.rename(config_dir, backup_dir)
@@ -455,9 +575,11 @@ def do_import(daemon: Channel, stdin, out: Out, home: str, runtime: str,
         out(error="daemon", detail=f"imported, but ~/.config/icp could not be renamed "
                                    f"({e.strerror})")
     kept, seen_legacy = move_legacy_manifests(home, renamed, consent)
+    retired = (retire_app or retire_1x_app)(home) if renamed else []
     extra = {"extension_id": LEGACY_EXTENSION_ID} if seen_legacy else {}
     out(done=True, counts=counts, digest=digest, backup_dir=renamed or config_dir,
-        kept_manifests=kept, **extra)
+        kept_manifests=kept, units_stopped=units_stopped,
+        units_not_stopped=units_not_stopped, retired_1x=retired, **extra)
     return 0
 
 
@@ -518,7 +640,7 @@ def do_purge(daemon: Channel, hello: dict, out: Out, home: str) -> int:
 
 
 def run(stdin, stdout, socket_path: str, home: str, runtime: str,
-        subprocess_run=subprocess.run, secret_service=None) -> int:
+        stop_units=None, secret_service=None, retire_app=None) -> int:
     out = Out(stdout)
     try:
         ticket = stdin_line(stdin, 256)
@@ -535,7 +657,8 @@ def run(stdin, stdout, socket_path: str, home: str, runtime: str,
         return 3
     try:
         if hello.get("purpose") == "import":
-            return do_import(daemon, stdin, out, home, runtime, subprocess_run, secret_service)
+            return do_import(daemon, stdin, out, home, runtime, stop_units, secret_service,
+                             retire_app)
         if hello.get("purpose") == "purge":
             return do_purge(daemon, hello, out, home)
         out(error="daemon", detail="unknown purpose")

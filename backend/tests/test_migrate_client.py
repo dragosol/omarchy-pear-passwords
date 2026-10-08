@@ -140,10 +140,16 @@ class Scratch:
         p = mock.patch.dict(os.environ, {"DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent"})
         p.start()
         test.addCleanup(p.stop)
+        self.not_stopped = []
+        self.retired = []
 
-    def fake_run(self, argv, **kw):
-        self.units.append(argv)
-        return mock.Mock(returncode=0)
+    def fake_stop_units(self):
+        self.units.extend(migrate.LEGACY_UNITS)
+        return [u for u in migrate.LEGACY_UNITS if u not in self.not_stopped], list(self.not_stopped)
+
+    def fake_retire_app(self, home):
+        self.retired.append(home)
+        return []
 
     def fake_secret_service(self):
         self.secret_service_calls += 1
@@ -153,7 +159,8 @@ class Scratch:
         out = io.StringIO()
         rc = migrate.run(io.StringIO("".join(line + "\n" for line in stdin_lines)), out,
                          daemon.path, self.home, self.runtime,
-                         subprocess_run=self.fake_run, secret_service=self.fake_secret_service)
+                         stop_units=self.fake_stop_units, secret_service=self.fake_secret_service,
+                         retire_app=self.fake_retire_app)
         msgs = [json.loads(line) for line in out.getvalue().splitlines()]
         return rc, msgs
 
@@ -206,9 +213,9 @@ class ImportTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(backup, "vault.key")))
         self.assertTrue(os.path.exists(os.path.join(backup, "vault.enc")))
         self.assertFalse(os.path.exists(agent.path))
-        self.assertEqual([a[-1] for a in s.units], list(migrate.LEGACY_UNITS))
-        self.assertTrue(all(a[:4] == ["/usr/bin/systemctl", "--user", "disable", "--now"]
-                            for a in s.units))
+        self.assertEqual(s.units, list(migrate.LEGACY_UNITS))
+        self.assertEqual(done["units_not_stopped"], [])
+        self.assertEqual(s.retired, [s.home])
         self.assertEqual(s.secret_service_calls, 1)
         self.assertEqual([m.get("stage") for m in msgs if "stage" in m],
                          ["reading", "peek", "converting", "cleanup"])
@@ -375,6 +382,17 @@ class ManifestTests(unittest.TestCase):
         # The legacy units are stopped regardless of the checkbox.
         self.assertEqual(len(s.units), len(migrate.LEGACY_UNITS))
 
+    def test_units_that_could_not_be_stopped_are_reported(self):
+        # function-legacy-units-not-stopped: a failure is no longer silent.
+        s = Scratch(self)
+        s.not_stopped = ["icp-host.service"]
+        d = FakeDaemon(self, s.root)
+        FakeAgent(self, s.runtime, warm=True)
+        rc, msgs = s.run(d, [TICKET, OPTS])
+        self.assertEqual(rc, 0, msgs)
+        self.assertEqual(msgs[-1]["units_not_stopped"], ["icp-host.service"])
+        self.assertNotIn("icp-host.service", msgs[-1]["units_stopped"])
+
     def test_matcher(self):
         home = "/home/u"
         ok = json.dumps({"name": "org.icp.native", "description": "x",
@@ -437,6 +455,117 @@ class PurgeTests(unittest.TestCase):
         rc, msgs = s.run(d, [TICKET])
         self.assertEqual(rc, 0)
         self.assertTrue(os.path.exists(os.path.join(b, "keepme")))
+
+
+class FakeBus:
+    """The systemd user manager on the session bus, as far as stop_legacy_units uses it."""
+
+    def __init__(self, files=(), fail=()):
+        self.files, self.fail = set(files), set(fail)
+        self.calls = []
+        self.closed = False
+
+    def send_and_get_reply(self, msg, timeout=None):
+        from jeepney import HeaderFields, MessageType
+        member = msg.header.fields[HeaderFields.member]
+        self.calls.append((member, msg.body))
+        err = None
+        if member == "GetUnitFileState" and msg.body[0] not in self.files:
+            err = "org.freedesktop.DBus.Error.FileNotFound"
+        elif member == "DisableUnitFiles" and set(msg.body[0]) & self.fail:
+            err = "org.freedesktop.DBus.Error.AccessDenied"
+        elif member == "StopUnit" and msg.body[0] in self.fail:
+            err = "org.freedesktop.DBus.Error.AccessDenied"
+        mtype = MessageType.error if err else MessageType.method_return
+        fields = {HeaderFields.error_name: err} if err else {}
+        return mock.Mock(header=mock.Mock(message_type=mtype, fields=fields), body=("enabled",))
+
+    def close(self):
+        self.closed = True
+
+
+class LegacyUnitTests(unittest.TestCase):
+    """function-legacy-units-not-stopped: the importer runs set-gid, where systemctl --user
+    cannot find the user bus (secure_getenv); the units are stopped over D-Bus instead."""
+
+    def test_present_units_are_disabled_and_stopped_absent_ones_skipped(self):
+        bus = FakeBus(files={"icp-host.service", "icp-sync.timer"})
+        stopped, failed = migrate.stop_legacy_units(open_bus=lambda: bus)
+        self.assertEqual(stopped, ["icp-host.service", "icp-sync.timer"])
+        self.assertEqual(failed, [])
+        self.assertIn(("DisableUnitFiles", (["icp-host.service", "icp-sync.timer"], False)),
+                      bus.calls)
+        self.assertEqual([b for m, b in bus.calls if m == "StopUnit"],
+                         [("icp-host.service", "replace"), ("icp-sync.timer", "replace")])
+        self.assertTrue(bus.closed)
+
+    def test_a_failure_is_reported_not_swallowed(self):
+        bus = FakeBus(files={"icp-host.service"}, fail={"icp-host.service"})
+        stopped, failed = migrate.stop_legacy_units(open_bus=lambda: bus)
+        self.assertEqual((stopped, failed), ([], ["icp-host.service"]))
+
+    def test_no_bus_means_none_stopped(self):
+        def broken():
+            raise OSError("no bus")
+        stopped, failed = migrate.stop_legacy_units(open_bus=broken)
+        self.assertEqual((stopped, failed), ([], list(migrate.LEGACY_UNITS)))
+
+    def test_systemctl_is_never_run(self):
+        self.assertFalse(hasattr(migrate, "SYSTEMCTL"))
+        self.assertFalse(hasattr(migrate, "subprocess"))
+
+
+LAUNCHER_132 = ("[Desktop Entry]\nType=Application\nName=Pear Passwords\n"
+                "Comment=Your passwords on iCloud\nExec=@DATA@/app/launch.sh\n"
+                "Icon=@DATA@/app/icon.svg\nTerminal=false\nCategories=Utility;Security;\n"
+                "Keywords=password;passwords;icloud;login;credentials;2fa;pear;\n")
+
+
+class RetireOneXAppTests(unittest.TestCase):
+    """installer-1x-launcher-never-retired: after the move, the 1.x launcher (which would start
+    1.3.2's own first-run passphrase prompts) goes, if it is a released copy."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = self.tmp.name
+        self.data = os.path.join(self.home, migrate.DATA_1X)
+        self.launcher = os.path.join(self.home, migrate.LAUNCHER_1X)
+        os.makedirs(os.path.dirname(self.launcher))
+        os.makedirs(os.path.join(self.data, "venv", "bin"))
+        os.makedirs(os.path.join(self.data, "app"))
+        self.desktop_2x = os.path.join(self.home, "system.desktop")
+        open(self.desktop_2x, "w").close()
+
+    def write_launcher(self, text):
+        with open(self.launcher, "w") as f:
+            f.write(text.replace("@DATA@", self.data))
+
+    def test_released_launcher_and_backend_are_removed(self):
+        self.write_launcher(LAUNCHER_132)
+        removed = migrate.retire_1x_app(self.home, self.desktop_2x)
+        self.assertFalse(os.path.exists(self.launcher))
+        self.assertFalse(os.path.exists(self.data))
+        self.assertIn(self.launcher, removed)
+
+    def test_an_edited_launcher_stays(self):
+        self.write_launcher(LAUNCHER_132 + "# mine\n")
+        migrate.retire_1x_app(self.home, self.desktop_2x)
+        self.assertTrue(os.path.exists(self.launcher))
+
+    def test_nothing_goes_before_the_2x_launcher_exists(self):
+        self.write_launcher(LAUNCHER_132)
+        os.unlink(self.desktop_2x)
+        self.assertEqual(migrate.retire_1x_app(self.home, self.desktop_2x), [])
+        self.assertTrue(os.path.exists(self.launcher))
+        self.assertTrue(os.path.isdir(os.path.join(self.data, "venv")))
+
+    def test_hashes_match_the_installers(self):
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        with open(os.path.join(root, "system", "lib", "user-files.sh")) as f:
+            shell = {l.split()[0] for l in f if l.strip().endswith(" pear-passwords.desktop")
+                     and len(l.split()[0]) == 64}
+        self.assertEqual(shell, set(migrate.RELEASED_LAUNCHER_SHA256))
 
 
 if __name__ == "__main__":

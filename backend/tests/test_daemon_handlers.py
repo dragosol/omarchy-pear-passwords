@@ -38,6 +38,7 @@ class HelloAndUnlockTests(Base):
                                  "synced_at": None, "needs_login": None,
                                  "settings": {"grant_s": 120, "idle_lock_s": 0,
                                               "clip_timeout_s": 30},
+                                 "migration_pending": False,
                                  "autofill": {"enabled": False, "hosts": 0},
                                  "old_copy": None})
 
@@ -260,6 +261,27 @@ class MigrationTests(Base):
         self.assertEqual((await m.call("import-commit"))["error"], "mismatch")
         self.assertEqual((await m.call("import-commit"))["error"], "incomplete")
         m2 = await self.migrate()                         # same window: started over
+        self.assertIsNotNone(m2)
+        self.assertIn("reset", self.h.store().calls)
+
+    async def test_an_uncommitted_migration_is_offered_again_after_the_window_closed(self):
+        # function-migration-never-reoffered: the window closed at the passphrase step.
+        m = await self.migrate()
+        await self.send_file(m, "vault.enc", b"x")
+        m.close()
+        self.ui.close()
+        await asyncio.sleep(0.1)
+        self.ui, self.peer = await self.h.ui()
+        hello = self.ui.hello
+        self.assertEqual(hello["state"], "locked")            # keys exist now
+        self.assertTrue(hello["migration_pending"])
+        # No fresh iCloud sign-in (and its escrow join) over the half-done import...
+        await self.ui.call("unlock")
+        r = await self.ui.call("signin", mode="login")
+        self.assertEqual(r.get("error"), "migration-pending")
+        self.assertNotIn(paths.ACTION_MANAGE, self.dialogs()[1:])
+        # ...but migrate-begin starts it over.
+        m2 = await self.migrate()
         self.assertIsNotNone(m2)
         self.assertIn("reset", self.h.store().calls)
 

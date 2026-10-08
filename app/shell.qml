@@ -84,6 +84,13 @@ ShellRoot {
     property bool syncing: false
     property bool v1Present: false
     property bool v1Checked: false
+    // A 1.x vault keyed by the login keyring (1.x's default): vault.enc but no kdf.json or
+    // check.enc. 2.0 can only import a passphrase vault, so it says how to get one first.
+    property bool v1KeyringOnly: false
+    property bool keyringStartFresh: false
+    // migrate-begin made keys but the import never committed (the window was closed at the
+    // passphrase step): the daemon says so at hello, and the move is offered again.
+    property bool migrationPending: false
     property bool everConnected: false
 
     // The screen follows from the above; nothing else decides it.
@@ -91,8 +98,12 @@ ShellRoot {
         if (root.phase !== "ready") return root.phase;
         if (root.migrateStep !== "") return "migrate";
         if (root.appUnlocked) return "list";
+        if (root.migrationPending && root.vaultState === "locked")
+            return !root.v1Checked ? "connecting" : (root.v1Present ? "migrate" : "locked");
         switch (root.vaultState) {
-        case "empty": return !root.v1Checked ? "connecting" : (root.v1Present ? "migrate" : "empty");
+        case "empty": return !root.v1Checked ? "connecting"
+                           : root.v1Present ? "migrate"
+                           : root.v1KeyringOnly && !root.keyringStartFresh ? "migrate-keyring" : "empty";
         case "tpm-missing": case "tpm-cleared": case "damaged": return root.vaultState;
         }
         if (root.lockReason === "no-agent" || root.lockReason === "busy") return "no-agent";
@@ -282,7 +293,9 @@ ShellRoot {
         root.autofillEnabled = !!(m.autofill && m.autofill.enabled);
         root.autofillHosts = (m.autofill && m.autofill.hosts) || 0;
         root.oldCopy = m.old_copy || null;
-        if (root.vaultState === "empty") { v1Check.check(); return; }
+        root.migrationPending = !!m.migration_pending;
+        // A migration that never committed is offered again (no unlock, no sign-in first).
+        if (root.vaultState === "empty" || root.migrationPending) { v1Check.check(); return; }
         // Opening the window is the request to see it: ask once, straight away. Never for a
         // window nobody can see (an offscreen load), and never again on our own after that.
         if (root.vaultState === "locked" && !root.autoAuthTried && !root.headless) {
@@ -390,18 +403,36 @@ ShellRoot {
         property int pendingChecks: 0
         property bool kdf: false
         property bool check_: false
+        property bool vault: false
         function check() {
-            kdf = false; check_ = false; pendingChecks = 2;
+            kdf = false; check_ = false; vault = false; pendingChecks = 3;
             kdfFile.path = ""; kdfFile.path = root.v1Dir + "/kdf.json";
             checkFile.path = ""; checkFile.path = root.v1Dir + "/check.enc";
+            vaultFile.path = ""; vaultFile.path = root.v1Dir + "/vault.enc";
         }
         function settle() {
             if (--pendingChecks > 0) return;
             root.v1Present = kdf && check_;
+            root.v1KeyringOnly = vault && !root.v1Present;
             root.v1Checked = true;
             if (root.v1Present && root.migrateStep === "") root.migrateStep = "intro";
+            if (root.migrationPending && !root.v1Present) {
+                // Nothing left to import (the 1.x vault is gone): carry on as a normal store.
+                root.migrationPending = false;
+                if (root.vaultState === "locked" && !root.autoAuthTried && !root.headless) {
+                    root.autoAuthTried = true;
+                    root.authenticate();
+                }
+            }
             if (root.snapshotPath) snapshotTimer.start();
         }
+    }
+    FileView {
+        id: vaultFile
+        printErrors: false
+        // Only whether it exists; its contents are never used here. Large, so not watched.
+        onLoaded: { v1Check.vault = true; v1Check.settle(); }
+        onLoadFailed: v1Check.settle()
     }
     FileView {
         id: kdfFile
@@ -1078,6 +1109,7 @@ ShellRoot {
     function migrateFinish() {
         root.migrateStep = "";
         root.v1Present = false;
+        root.migrationPending = false;
         root.signedIn = true;
         // migrate-begin opened the list on this connection; fetch it without a dialog.
         root.authenticate();
@@ -3583,7 +3615,7 @@ ShellRoot {
             anchors.fill: parent
             color: Theme.bg
             visible: ["connecting", "not-installed", "launcher", "daemon-failed", "abi-mismatch",
-                      "empty", "tpm-missing", "tpm-cleared", "damaged"].indexOf(root.screen) >= 0
+                      "empty", "migrate-keyring", "tpm-missing", "tpm-cleared", "damaged"].indexOf(root.screen) >= 0
             MouseArea { anchors.fill: parent }
 
             ColumnLayout {
@@ -3651,6 +3683,11 @@ ShellRoot {
                 RowLayout {
                     Layout.topMargin: 10
                     spacing: 10
+                    AppButton {
+                        visible: root.screen === "migrate-keyring"
+                        text: "Start fresh instead…"
+                        onClicked: root.keyringStartFresh = true
+                    }
                     AppButton {
                         visible: root.screen === "tpm-cleared" || root.screen === "damaged"
                         text: root.startOverConfirm ? "Yes, start over" : "Start over…"
@@ -3741,7 +3778,7 @@ ShellRoot {
                         Text {
                             textFormat: Text.PlainText
                             Layout.fillWidth: true
-                            text: "The old background services are stopped and turned off: " + root.legacyUnits.join(", ") + "."
+                            text: "The old background services will be stopped and turned off: " + root.legacyUnits.join(", ") + "."
                             color: Theme.dim
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fSmall
@@ -3879,11 +3916,36 @@ ShellRoot {
                             lineHeight: 1.15
                             wrapMode: Text.Wrap
                         }
+                        // What the importer could not stop is said, with the command: the old
+                        // services would keep serving 1.x and could pop its old dialogs.
                         Text {
                             textFormat: Text.PlainText
                             Layout.fillWidth: true
-                            text: "Browser autofill is off until you turn it on. If you use a Pear Passwords "
-                                + "browser extension, register it once:"
+                            visible: (root.migrateResult.units_not_stopped || []).length > 0
+                            text: "These old background services could not be stopped from here. Run this in a terminal:"
+                            color: Theme.fg
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            wrapMode: Text.Wrap
+                        }
+                        TextEdit {
+                            Layout.fillWidth: true
+                            visible: (root.migrateResult.units_not_stopped || []).length > 0
+                            readOnly: true
+                            selectByMouse: true
+                            textFormat: TextEdit.PlainText
+                            wrapMode: TextEdit.WrapAnywhere
+                            text: "systemctl --user disable --now "
+                                + (root.migrateResult.units_not_stopped || []).join(" ")
+                            color: Theme.fg
+                            font.family: "monospace"
+                            font.pixelSize: Theme.fSmall
+                        }
+                        Text {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: "Browser autofill is off until you turn it on in Settings. If you use a Pear "
+                                + "Passwords browser extension, turn it on there and register the extension once:"
                             color: Theme.dim
                             font.family: Theme.uiFont
                             font.pixelSize: Theme.fSmall
@@ -4256,6 +4318,7 @@ ShellRoot {
         case "daemon-failed": return "Pear's background service didn't start";
         case "abi-mismatch": return "Python was upgraded";
         case "empty": return "No passwords yet";
+        case "migrate-keyring": return "Your 1.x vault needs a passphrase first";
         case "tpm-missing": return "The security chip is switched off";
         case "tpm-cleared": return "The security chip refused the keys";
         case "damaged": return "Pear Passwords can't read its data";
@@ -4278,7 +4341,14 @@ ShellRoot {
             return "Pear's system part was built for the previous Python. Re-run the system step: run "
                  + "./install.sh from the plugin folder, then paste the command it prints.";
         case "empty":
-            return "Sign in to iCloud to bring in the passwords saved on your iPhone, iPad and Mac.";
+            return "Sign in to iCloud to bring in the passwords saved on your iPhone, iPad and Mac."
+                 + (root.v1KeyringOnly ? " Your 1.x vault in ~/.config/icp stays where it is, protected by your "
+                                         + "login keyring, and its history and nicknames are not brought over." : "");
+        case "migrate-keyring":
+            return "Pear Passwords 1.x kept this vault's key in your login keyring, and 2.0 can only move a vault "
+                 + "protected by a passphrase. To keep your password history and nicknames, set one in 1.3.2 "
+                 + "with the command below, then check again. Starting fresh instead signs this computer in to "
+                 + "iCloud again and leaves the 1.x vault and its keyring entry where they are.";
         case "tpm-missing":
             return "The security chip (PTT) is switched off. Turn it back on in the BIOS and your "
                  + "passwords come back.";
@@ -4299,13 +4369,16 @@ ShellRoot {
         return "";
     }
     function stateCommand() {
-        return root.screen === "daemon-failed" ? "journalctl -b -u pear-passwordsd" : "";
+        return root.screen === "daemon-failed" ? "journalctl -b -u pear-passwordsd"
+             : root.screen === "migrate-keyring" ? "~/.local/share/pear-passwords/venv/bin/icp passphrase"
+             : "";
     }
     function stateButton() {
         switch (root.screen) {
         case "not-installed": case "daemon-failed": case "abi-mismatch": return "Try again";
         case "launcher": return "Close";
         case "empty": return "Sign in to iCloud";
+        case "migrate-keyring": return "Check again";
         case "tpm-missing": case "tpm-cleared": case "damaged": return "Try again";
         }
         return "";
@@ -4315,6 +4388,7 @@ ShellRoot {
         case "not-installed": case "daemon-failed": case "abi-mismatch": root.reconnect(); return;
         case "launcher": Qt.quit(); return;
         case "empty": root.startSignin("login"); return;
+        case "migrate-keyring": v1Check.check(); return;
         case "tpm-missing": case "tpm-cleared": case "damaged": root.authenticate(); return;
         }
     }

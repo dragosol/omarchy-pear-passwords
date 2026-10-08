@@ -177,6 +177,13 @@ These are Apple's credentials, used only to sign in. They never unlock Pear.
 Your 1.x vault in `~/.config/icp` is moved into 2.0 once, when you say so. It keeps your
 history and nicknames, and it does not sign this computer in again.
 
+> **If 1.x never asked you for a passphrase**, its key is in your login keyring (1.x's
+> default), and 2.0 can only move a vault protected by a passphrase. Pear then shows **Your
+> 1.x vault needs a passphrase first** with the command to set one in 1.3.2
+> (`~/.local/share/pear-passwords/venv/bin/icp passphrase`); do that, then **Check again**.
+> **Start fresh instead** signs this computer in to iCloud again, without the 1.x history and
+> nicknames, and leaves `~/.config/icp` and its keyring entry where they are.
+
 > **For the smoothest move, open and unlock Pear Passwords 1.3.2 within 15 minutes before this
 > step.** 2.0 then asks 1.3.2's background agent for the key, and you type nothing.
 
@@ -190,8 +197,12 @@ history and nicknames, and it does not sign this computer in again.
 4. Pear converts everything, re-opens what it wrote and compares counts and a checksum with
    what it read. Only on an exact match does it take over: it stops 1.3.2's agent, removes the
    1.x key files and the keyring entries, stops and disables the 1.x units (`icp-host`,
-   `icp-sync`, `pear-passwords-sync`), and renames `~/.config/icp` to
-   `~/.config/icp.v1-backup-YYYYMMDD`. On any mismatch nothing is kept and 1.x stays as it was.
+   `icp-sync`, `pear-passwords-sync`; any it could not stop are listed with the command to
+   run), renames `~/.config/icp` to `~/.config/icp.v1-backup-YYYYMMDD`, and removes the 1.x
+   launcher and its backend in `~/.local/share/pear-passwords` (the launcher only if it is
+   unchanged). On any mismatch nothing is kept and 1.x stays as it was.
+   If you close the window before this step finishes (for example to go and unlock 1.3.2),
+   the next time you open Pear it offers the move again; it does not sign in afresh.
 5. If you used 1.x's browser autofill: with the checkbox on the migration screen, the old
    `org.icp.native.json` manifests (only those that point at the 1.x host) are moved into the
    backup. `~/icp` itself is never touched. The new host is **not** registered for you; the
