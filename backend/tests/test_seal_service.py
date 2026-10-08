@@ -6,6 +6,7 @@ runner; nothing here is root or touches a real credential.
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -172,6 +173,16 @@ class UnitTests(unittest.TestCase):
                      "ProtectSystem=strict", "ProtectHome=yes", "PrivateNetwork=yes",
                      "DevicePolicy=closed", "RestrictAddressFamilies=AF_UNIX", "LimitCORE=0"):
             self.assertIn(line + "\n", u)
+
+    @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze not installed")
+    def test_exposure_score(self):
+        path = os.path.join(ROOT, "system", "units", paths.SEAL_SERVICE_UNIT)
+        out = subprocess.run(["systemd-analyze", "security", "--offline=true", "--no-pager",
+                              path], capture_output=True, text=True, timeout=60)
+        m = re.search(r"Overall exposure level for \S+: ([0-9.]+)", out.stdout + out.stderr)
+        if not m:
+            self.skipTest("systemd-analyze gave no score: " + (out.stderr or "")[-200:])
+        self.assertLessEqual(float(m.group(1)), 2.5)
 
     def test_daemon_unit_ships_with_the_primary_path(self):
         """The switch is off: systemd-creds --user (gate G1) until the VM says otherwise."""

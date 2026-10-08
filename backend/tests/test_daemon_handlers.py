@@ -278,6 +278,9 @@ class EditTests(Base):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         await self.ui.call("unlock")
+        # Let the sync the unlock started finish: while it runs every edit is busy-sync, and
+        # its end clears `busy` (a race that made test_busy_sync flaky under load).
+        await self.ui.event("synced")
 
     async def test_set_with_generate(self):
         await self.ui.call("grant", id="e.0")
