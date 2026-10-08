@@ -95,8 +95,10 @@ def refetch(zone: Zone, zone_name: str = ZONE_PASSWORDS) -> CredentialStore:
 
 
 def find(store: CredentialStore, domain: str, username: str):
-    """The newest credential for exactly (domain, username), or None."""
-    hits = [c for c in store.all() if c.domain == domain and c.username == username]
+    """The newest live login for exactly (domain, username), or None. A copy in Recently
+    Deleted or a passkey-only row is never the entry an edit wrote."""
+    hits = [c for c in store.all() if c.domain == domain and c.username == username
+            and not c.recently_deleted and c.kind == "login"]
     return max(hits, key=lambda c: c.mdat) if hits else None
 
 
@@ -188,18 +190,25 @@ def create_entry(zone: Zone, site: str, username: str, password: str, *, title: 
 
 
 def push_details(zone: Zone, domain: str, username: str, *, notes=up._KEEP, sites=up._KEEP,
-                 totp=up._KEEP) -> int:
+                 totp=up._KEEP, notes_body=up._KEEP, tags=up._KEEP,
+                 expect: dict | None = None) -> int:
     """Change the notes, extra websites or verification code of one entry.
 
     Only the details record moves; the password record is never rewritten. An entry that has
     no details record yet (common for logins saved before Apple's Passwords app) gets one,
-    built like Apple's own. Returns records written."""
+    built like Apple's own. `notes_body` and `tags` splice into the notes as this fetch has
+    them, never into a copy the window or a grant holds, so a note edited on an Apple device a
+    moment ago is not overwritten (update.edit_details). With `expect`, expect["notes"] is set
+    to the exact notes text written, for details_landed. Returns records written."""
+    from ..keychain import metadata as md
+    from ..keychain import tagline
     targets = _pair(zone.records, zone.class_keys, domain, username)
     if AGRP_PASSWORD not in targets:
         raise PushError(f"no password record found for {username} at {domain}")
     if AGRP_METADATA in targets:
         mrec, mck, mplist = targets[AGRP_METADATA]
-        edited = up.edit_details(mplist, notes=notes, sites=sites, totp=totp)
+        edited = up.edit_details(mplist, notes=notes, sites=sites, totp=totp,
+                                 notes_body=notes_body, tags=tags)
         if set(up.diff_plists(mplist, edited)) - {"mdat", "v_Data"}:
             raise PushError("refusing to push: the edit changed unexpected fields")
         fields = dict(mrec.fields)
@@ -207,18 +216,45 @@ def push_details(zone: Zone, domain: str, username: str, *, notes=up._KEEP, site
         _save(zone.client, mrec, fields)
     else:
         rec, ck, plist = targets[AGRP_PASSWORD]
-        meta = up.new_metadata_plist(
-            domain, username, ptcl=str(plist.get("ptcl") or "htps"),
-            notes="" if notes is up._KEEP else notes,
+        text = "" if notes is up._KEEP else notes
+        if notes_body is not up._KEEP:
+            text = (notes_body or "").strip("\n")
+        if tags is not up._KEEP:
+            text = tagline.replace_tags(text, list(tags or ()))
+        edited = up.new_metadata_plist(
+            domain, username, ptcl=str(plist.get("ptcl") or "htps"), notes=text,
             sites=() if sites is up._KEEP else sites,
             totp=None if totp is up._KEEP else totp)
-        _create(zone.client, ck, rec.get_str("parentkeyref"), meta)
+        _create(zone.client, ck, rec.get_str("parentkeyref"), edited)
+    if expect is not None:
+        expect["notes"] = md.notes(md.parse(edited["v_Data"]))
     return 1
 
 
-def details_landed(c, domain: str, *, notes=up._KEEP, sites=up._KEEP, totp=up._KEEP) -> bool:
-    """Whether a re-fetched credential shows the details edit."""
+def notes_editable(zone: Zone, domain: str, username: str) -> bool:
+    """Whether a tag edit can splice this entry's stored notes: False only when its details
+    record holds notes that are not UTF-8. Checked before anything is written, so a combined
+    edit is refused whole rather than half pushed."""
+    targets = _pair(zone.records, zone.class_keys, domain, username)
+    if AGRP_METADATA not in targets:
+        return True
+    blob = targets[AGRP_METADATA][2].get("v_Data")
+    try:
+        import plistlib
+        up.stored_notes(plistlib.loads(bytes(blob)), strict=True)
+    except up.NotesNotUtf8:
+        return False
+    except Exception:
+        return True           # not a blob it can read: push_details refuses that itself
+    return True
+
+
+def details_landed(c, domain: str, *, notes=up._KEEP, sites=up._KEEP, totp=up._KEEP,
+                   notes_raw=up._KEEP) -> bool:
+    """Whether a re-fetched credential shows the details edit. `notes_raw` is the exact text
+    push_details wrote (its `expect`), compared byte for byte."""
     return ((notes is up._KEEP or c.notes == (notes or "").strip("\n"))
+            and (notes_raw is up._KEEP or c.notes == notes_raw)
             and (sites is up._KEEP
                  or list(c.sites) == [s for s in up.clean_sites(sites or ()) if s != domain])
             and (totp is up._KEEP or bool(c.totp) == bool(totp)))

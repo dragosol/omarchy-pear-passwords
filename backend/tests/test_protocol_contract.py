@@ -84,6 +84,59 @@ class ProtocolDocTests(unittest.TestCase):
         self.assertFalse(any("lease" in k for k in protocol.SETTINGS_KEYS))
 
 
+class FeaturesContractTests(unittest.TestCase):
+    """The category, tag and copy-text additions (features spec 4, 6) in both places."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(DOC, encoding="utf-8") as f:
+            cls.doc = f.read()
+
+    def test_meta_example_has_exactly_the_wire_fields(self):
+        import json
+        from icp import vstore
+        from icp.daemon import wire
+        block = re.search(r"### 3.1 Meta.*?```json\n(.*?)```", self.doc, re.S).group(1)
+        documented = set(json.loads(block))
+        m = vstore.Meta(id="x", title="t", domain="d", sites=[], username="u", nickname="",
+                        has_totp=False, has_notes=False, mdat=0.0, history_count=0)
+        sent = set(wire.entries([m], show_all=True)[0])
+        self.assertEqual(documented, sent)
+
+    def test_tags_in_set_and_create(self):
+        self.assertIn("tags", protocol.SET_FIELDS)
+        self.assertIn("tags", protocol.CREATE_FIELDS)
+        section = _section(self.doc, "6. UI ops (role `ui`)")
+        self.assertIn("`tags` (array of at most 16", section)
+        self.assertIn('"field":"notes","detail":"not-utf8"', section)
+
+    def test_copy_text_sources_and_limits(self):
+        from icp.daemon import handlers
+        self.assertEqual(protocol.COPY_TEXT_SOURCES_GRANT,
+                         {"notes-edit", "totp-setup-edit", "new-password"})
+        self.assertEqual(protocol.COPY_TEXT_SOURCES_CREATE,
+                         {"create-password", "create-notes", "create-totp-setup"})
+        self.assertFalse(protocol.COPY_TEXT_SOURCES_GRANT & protocol.COPY_TEXT_SOURCES_CREATE)
+        self.assertEqual(protocol.COPY_TEXT_MAX, handlers.MAX_NOTES)
+        self.assertEqual(protocol.COPY_TEXT_PER_MIN, 10)
+        self.assertNotIn("copy-text", protocol.PROMPT_ACTION)
+        self.assertNotIn("copy-text", protocol.GRANT_OPS)
+        section = _section(self.doc, "6. UI ops (role `ui`)")
+        for source in protocol.COPY_TEXT_SOURCES:
+            self.assertIn(f"`{source}`", section)
+        self.assertIn("1 to 16384 characters after NFC", section)
+        self.assertIn("At most 10 per rolling minute", section)
+
+    def test_features_and_diag(self):
+        self.assertEqual(protocol.FEATURES, ("passkeys", "apple_deleted"))
+        self.assertEqual(protocol.DEFAULT_FEATURES, {"passkeys": False, "apple_deleted": False})
+        self.assertNotIn("features", protocol.SETTINGS_KEYS)        # never a window setting
+        self.assertEqual(protocol.PROMPT_ACTION["features"], paths.ACTION_MANAGE)
+        self.assertEqual(protocol.PROMPT_ACTION["diag-items"], paths.ACTION_MANAGE)
+        self.assertIn('"features":{"passkeys":false,"apple_deleted":false}', self.doc)
+        self.assertIn("**Never a value**", self.doc)
+
+
 class ProtocolValueTests(unittest.TestCase):
     def test_owner_decided_defaults(self):
         self.assertEqual(protocol.GRANT_S_DEFAULT, 120)

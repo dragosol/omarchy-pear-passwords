@@ -217,10 +217,13 @@ def match_rank(host: str, meta: "Meta") -> int | None:
     None otherwise - including name-only matches and `meta.aliases`, which are never used.
 
     Apple's internal service records (PCS keys, HomeKit commissioning, "_Apple..." items) are
-    never a match either, whatever their domain says."""
+    never a match either, whatever their domain says, and neither is a copy in Apple's
+    Recently Deleted or a passkey-only row (it has no password to fill)."""
     # The page host is held to parse_origin's form, not tidied up like a stored value.
     page = _canonical_host(host) if isinstance(host, str) and host.isascii() else None
     if page is None or _is_internal(meta):
+        return None
+    if getattr(meta, "recently_deleted", False) or getattr(meta, "kind", "login") == "passkey":
         return None
     best = None
     for value in [meta.domain, *(meta.sites or ())]:

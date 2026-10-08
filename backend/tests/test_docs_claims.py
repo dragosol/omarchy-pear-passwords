@@ -150,6 +150,20 @@ class ClaimsHaveTestsTests(unittest.TestCase):
         self.assertEqual(sorted(planned), [], "security.md names tests that do not exist")
 
 
+class FeatureClaimsTests(unittest.TestCase):
+    """The claims the categories, tags and copy-text work adds to docs/security.md (features
+    spec 5), each of which ClaimsHaveTestsTests also holds to its named tests."""
+
+    def test_the_three_claims_are_made(self):
+        sec = _read("docs", "security.md")
+        self.assertIn("**The tag line is tier-1 list metadata.**", sec)
+        self.assertIn("Do not put secrets on that line.", sec)
+        self.assertIn("**Passkey key material is never stored.**", sec)
+        self.assertIn("**copy-text: no dialog, text already in the window; fixed sources; "
+                      "16 KiB; 10/min; one\n  offer at a time.**", sec)
+        self.assertIn("**except the\n  tag line's tags**", _read("docs", "protocol.md"))
+
+
 class OwnerDecisionsInDocsTests(unittest.TestCase):
     def setUp(self):
         self.readme = _read("README.md")

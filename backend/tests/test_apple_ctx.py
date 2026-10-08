@@ -515,8 +515,11 @@ def test_details_change_is_not_password_history(edit_env):
     store = FakeStore(session=JOINED, metas=[_meta_for(c)])
     apple.push_set(_ctx(store), items.entry_id("github.com", "alex"),
                    {"notes": "hello", "sites": ["https://gist.github.com/x"]})
-    assert edit_env["pushed"] == [("details", {"notes": "hello",
-                                               "sites": ["https://gist.github.com/x"]})]
+    # fields.notes is the body: push_details splices it under the stored tag line, on the
+    # notes as this fetch has them, and reports what it wrote through `expect`.
+    (kind, kw), = edit_env["pushed"]
+    assert kind == "details" and kw.pop("expect") == {}
+    assert kw == {"notes_body": "hello", "sites": ["https://gist.github.com/x"]}
     assert store.secrets_set == []
     assert store.applied[0][0][0].secrets.notes == "hello"
 
@@ -554,7 +557,8 @@ def test_a_rename_goes_to_apple_or_stays_a_local_nickname(monkeypatch, edit_env,
 @pytest.mark.parametrize("fields,field", [
     ({"title": "x"}, "title"), ({"password": 5}, "password"), ({"password": ""}, "password"),
     ({"sites": "a.com"}, "sites"), ({"totp": {"setup": "not base32!"}}, "totp"),
-    ({"totp": "x"}, "totp"),
+    ({"totp": "x"}, "totp"), ({"tags": ["a b"]}, "tags"), ({"tags": "work"}, "tags"),
+    ({"tags": [f"t{i}" for i in range(17)]}, "tags"),
 ])
 def test_bad_fields_are_refused_before_anything_is_sent(edit_env, fields, field):
     c = _cred()
@@ -562,6 +566,91 @@ def test_bad_fields_are_refused_before_anything_is_sent(edit_env, fields, field)
     with pytest.raises(apple.FieldError) as e:
         apple.push_set(_ctx(store), items.entry_id(c.domain, c.username), fields)
     assert e.value.field == field and edit_env["opened"] == 0
+
+
+def test_tags_and_notes_body_reach_push_details(monkeypatch, edit_env):
+    checked = []
+    monkeypatch.setattr(push, "notes_editable", lambda z, d, u: checked.append(d) or True)
+    c = _cred("github.com", "alex", "pw")
+    edit_env["after"] = [_cred("github.com", "alex", "pw", notes="b\n\nTags: #work")]
+    store = FakeStore(session=JOINED, metas=[_meta_for(c)])
+    apple.push_set(_ctx(store), items.entry_id("github.com", "alex"),
+                   {"notes": "b", "tags": ["#Work", "work"]})
+    (kind, kw), = edit_env["pushed"]
+    kw.pop("expect")
+    assert kw == {"notes_body": "b", "tags": ["work"]} and checked == ["github.com"]
+    assert store.applied[0][0][0].meta.tags == ["work"]
+
+
+def test_the_landed_check_uses_the_exact_notes_written(monkeypatch, edit_env):
+    monkeypatch.setattr(push, "notes_editable", lambda z, d, u: True)
+
+    def details(z, d, u, expect=None, **kw):
+        edit_env["pushed"].append(("details", kw))
+        expect["notes"] = "\nkept leading newline\n\nTags: #a"
+    monkeypatch.setattr(push, "push_details", details)
+    c = _cred("github.com", "alex", "pw")
+    store = FakeStore(session=JOINED, metas=[_meta_for(c)])
+    eid = items.entry_id("github.com", "alex")
+    # iCloud gives back the notes trimmed: that is not what was written, so it did not land.
+    edit_env["after"] = [_cred("github.com", "alex", "pw", notes="kept leading newline\n\nTags: #a")]
+    with pytest.raises(push.PushError):
+        apple.push_set(_ctx(store), eid, {"tags": ["a"]})
+    assert store.applied == []
+    edit_env["after"] = [_cred("github.com", "alex", "pw",
+                               notes="\nkept leading newline\n\nTags: #a")]
+    apple.push_set(_ctx(store), eid, {"tags": ["a"]})
+    assert store.applied
+
+
+def test_tags_on_notes_that_are_not_utf8_are_refused_before_any_write(monkeypatch, edit_env):
+    monkeypatch.setattr(push, "notes_editable", lambda z, d, u: False)
+    c = _cred("github.com", "alex", "pw")
+    store = FakeStore(session=JOINED, metas=[_meta_for(c)])
+    with pytest.raises(apple.FieldError) as e:
+        apple.push_set(_ctx(store), items.entry_id("github.com", "alex"),
+                       {"password": "new", "tags": ["a"]})
+    assert (e.value.field, e.value.detail) == ("notes", "not-utf8")
+    assert edit_env["pushed"] == [] and store.applied == []
+    from icp.daemon.handlers import apple_error
+    err = apple_error(e.value)
+    assert (err.code, err.extra) == ("invalid", {"field": "notes", "detail": "not-utf8"})
+
+
+@pytest.mark.parametrize("flag", ["recently_deleted", "passkey"])
+def test_read_only_rows_are_refused_before_any_network(edit_env, flag):
+    c = _cred("github.com", "alex", "pw", recently_deleted=flag == "recently_deleted",
+              kind="passkey" if flag == "passkey" else "login")
+    m = _meta_for(c)
+    store = FakeStore(session=JOINED, metas=[m])
+    with pytest.raises(apple.FieldError) as e:
+        apple.push_set(_ctx(store), m.id, {"notes": "x"})
+    assert e.value.field == "id" and edit_env["opened"] == 0
+
+
+def test_create_writes_tags_as_the_last_line(monkeypatch, edit_env):
+    got = {}
+    monkeypatch.setattr(push, "create_entry", lambda z, *a, **kw: got.update(kw))
+    edit_env["after"] = [_cred("new.example", "kim", "pw3")]
+    apple.create(_ctx(FakeStore(session=JOINED)),
+                 {"domain": "new.example", "username": "kim", "password": "pw3",
+                  "notes": "\nbody\n", "tags": ["Work"]})
+    assert got["notes"] == "body\n\nTags: #work"
+
+
+def test_a_sync_hands_its_item_shape_to_the_context(client):
+    client.creds = [_cred()]
+    shape = {("inet", "com.apple.cfnetwork"): {"count": 1, "keys": {"acct"}, "inner_keys": set()}}
+
+    class Shaped(_FakeClient):
+        def sync_and_decrypt(self, nicknames=None):
+            self.item_shape = shape
+            return super().sync_and_decrypt(nicknames)
+    import icp.octagon.client as oc
+    with mock.patch.object(oc, "OctagonClient", Shaped):
+        ctx = _ctx(FakeStore(session=JOINED))
+        apple.sync(ctx)
+    assert ctx.item_shape is shape
 
 
 def test_unknown_id_is_not_found_before_any_network(edit_env):

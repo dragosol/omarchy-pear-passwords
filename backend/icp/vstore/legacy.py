@@ -36,6 +36,7 @@ import nacl.pwhash
 import nacl.secret
 
 from .. import totp as _otp
+from ..keychain import tagline
 from . import ImportMismatch, Meta, Secrets
 from . import entries as _entries
 from . import format as fmt
@@ -216,9 +217,15 @@ def credential_parts(c: dict) -> tuple[Meta, Secrets]:
     m = Meta(id="", title=str(c.get("title") or ""), domain=str(c.get("domain") or ""),
              sites=[str(s) for s in (c.get("sites") or [])],
              username=str(c.get("username") or ""), nickname="", has_totp=seed is not None,
-             has_notes=bool(notes), mdat=_num(c.get("mdat")), history_count=0,
+             has_notes=False, mdat=_num(c.get("mdat")), history_count=0,
              apple_title=str(c.get("apple_title") or ""),
-             aliases=[str(a) for a in (c.get("aliases") or [])])
+             aliases=[str(a) for a in (c.get("aliases") or [])],
+             has_passkey=c.get("has_passkey") is True,
+             kind="passkey" if c.get("kind") == "passkey" else "login",
+             has_password=c.get("kind") != "passkey",
+             recently_deleted=c.get("recently_deleted") is True)
+    nf = _meta.notes_fields(notes)
+    m.has_notes, m.tags = nf["has_notes"], nf["tags"]
     return m, secrets
 
 
@@ -256,9 +263,12 @@ def merge_duplicate(kept: tuple[Meta, Secrets], dropped: tuple[Meta, Secrets]
     importer and every sync compute the same entry."""
     km, ks = kept
     m, s = dropped
-    notes = ks.notes or ""
-    if s.notes and s.notes != notes and s.notes not in notes:
-        notes = f"{notes}\n\n{s.notes}" if notes else s.notes
+    # Bodies merge as before; the tag lines merge into one line under the merged body, or the
+    # older item's line would end up in the middle of the notes as plain text.
+    notes, tags = tagline.split(ks.notes or "")
+    other, more = tagline.split(s.notes or "")
+    if other and other != notes and other not in notes:
+        notes = f"{notes}\n\n{other}" if notes else other
     seed, params = ks.totp_secret, dict(ks.totp_params or {})
     if s.totp_secret and not seed:
         seed, params = s.totp_secret, dict(s.totp_params or {})
@@ -278,9 +288,23 @@ def merge_duplicate(kept: tuple[Meta, Secrets], dropped: tuple[Meta, Secrets]
         if h not in hist:
             hist.append(h)
     sites = list(km.sites) + [x for x in m.sites if x not in km.sites and x != km.domain]
+    seen = {tagline.fold(t) for t in tags}
+    merged = list(tags)
+    for t in more:
+        if tagline.fold(t) not in seen and len(merged) < tagline.MAX_TAGS:
+            seen.add(tagline.fold(t))
+            merged.append(t)
+    # Splice into the kept item's own notes, so what nothing changed stays byte for byte.
+    raw = ks.notes or ""
+    if notes != tagline.split(raw)[0]:
+        raw = tagline.replace_body(raw, notes)
+    if merged != tags:
+        raw = tagline.replace_tags(raw, merged)
+    notes = raw
     ks2 = Secrets(password=ks.password, notes=notes, totp_secret=seed, apple_history=hist,
                   totp_params=params)
-    km2 = Meta(**{**vars(km), "sites": sites, "has_notes": bool(notes), "has_totp": bool(seed)})
+    km2 = Meta(**{**vars(km), "sites": sites, "has_totp": bool(seed),
+                  **_meta.notes_fields(notes)})
     return km2, ks2
 
 

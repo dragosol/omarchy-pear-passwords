@@ -109,6 +109,9 @@ class UserContext:
     store: "UserStore"
     anisette_url: str
     frontend: Frontend | None = None
+    # Set by a full sync: (class, agrp) counts and attribute names of what it decrypted, no
+    # value (vault.host.strip_and_shape). The daemon keeps it for op diag-items.
+    item_shape: dict | None = None
 
     @property
     def interactive(self) -> bool:

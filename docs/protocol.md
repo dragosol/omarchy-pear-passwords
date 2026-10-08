@@ -161,18 +161,33 @@ with `state` one of `locked`, `unlocked`, `unavailable` only. `unavailable` cove
  "username":"me@example.com","nickname":"","apple_title":"GitHub","aliases":[],
  "has_totp":true,"has_notes":false,"mdat":1791450000.0,"history_count":2,
  "primary":"GitHub","secondary":"me@example.com","no_site":false,"is_wifi":false,
- "ambiguous":false}
+ "ambiguous":false,"tags":["work","finance"],"has_passkey":false,"kind":"login",
+ "has_password":true,"recently_deleted":false}
 ```
 
-- The first twelve fields are `vstore.Meta`. `id` is opaque to clients: at most 128 characters
-  of `[A-Za-z0-9._:-]`, stable for the same keychain item across syncs.
+- The first twelve fields and the last five are `vstore.Meta`. `id` is opaque to clients: at
+  most 128 characters of `[A-Za-z0-9._:-]`, stable for the same keychain item across syncs.
+- `tags` are the tags on the final `Tags: #a #b` line of the entry's notes (canonical: NFC,
+  lower case, at most 16, first-seen order), and `has_notes` says whether the notes **body**
+  (the notes without that line) has anything in it. The grammar: the whole last line must be
+  `[WS] Tags: WS1 #tag *(WS1 #tag) [WS]`, "Tags" in any case, each tag 1 to 32 Unicode
+  letters, marks, digits, `_` or `-`; any other last line is body text.
+- `kind` is `passkey` for a row that is only a passkey (`has_password` false); `has_passkey`
+  marks a login that also has one. `recently_deleted` marks a copy in Apple's Recently Deleted
+  (an access group ending in `-recently-deleted`); it never merges with, or stands in for, the
+  live entry. Passkey-only rows and Recently Deleted copies are in the list only while their
+  feature is on (`features`, section 6.10), and `has_passkey` is false while `passkeys` is
+  off. Both are read-only: `set` on one is `invalid` with `field:"id"`, and autofill never
+  offers one.
 - `primary`, `secondary`, `no_site`, `is_wifi`, `ambiguous` are display fields the daemon
   derives exactly as 1.3.2's `app-list` did (nickname, then Apple's title, then the derived
   title; Wi-Fi items are domain `AirPort`; `ambiguous` when two rows would look identical).
 - Entries 1.3.2 hid as internal (Apple service records, HomeKit keys, ...) are omitted unless
   `unlock` was sent with `"all":true`.
 - The list is sorted by `primary`, then `secondary`, case-insensitively.
-- Meta never contains a password, notes text, a TOTP seed or code, or a pwmac.
+- Meta never contains a password, notes text, a TOTP seed or code, or a pwmac, **except the
+  tag line's tags**, which are list metadata like titles and usernames: anyone who passes the
+  first dialog sees them.
 
 ### 3.2 Settings
 
@@ -237,7 +252,7 @@ lease: a locked uid does not sync.
 |---|---|---|
 | `io.github.dragosol.pearpasswords.unlock` | Unlock Pear Passwords to show your accounts | `unlock` |
 | `io.github.dragosol.pearpasswords.reveal` | Use the saved password for $(account) | `grant` |
-| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | `create`, `delete`, `signin`, `signout`, `migrate-begin`, `reset`, `purge-old-copy`, `clip-history-check`, `autofill-enable`, `tpm-move` |
+| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | `create`, `delete`, `signin`, `signout`, `migrate-begin`, `reset`, `purge-old-copy`, `clip-history-check`, `autofill-enable`, `tpm-move`, `features` (a change), `diag-items` |
 | `io.github.dragosol.pearpasswords.autofill` | A browser extension asks to fill the password for $(account) on $(origin) | `autofill-fill` |
 
 All four: `auth_self` for active local sessions, `no` for any and inactive, no `_keep`, owner
@@ -287,10 +302,12 @@ name an `id` return `not-found` for an id with no live entry.
 Raises `.unlock` (no dialog if already unlocked on this connection). Success:
 
 ```json
-{"rid":1,"entries":[<Meta>...],"synced_at":1791450000.0,"needs_login":false,"tpm_move":false}
+{"rid":1,"entries":[<Meta>...],"synced_at":1791450000.0,"needs_login":false,"tpm_move":false,
+ "features":{"passkeys":false,"apple_deleted":false}}
 ```
 
-then a background sync. Refusal (a reply, not an error):
+then a background sync. `features` are the categories that wait for a check on a real
+keychain (section 6.10); the window shows a category only when its flag is true. Refusal (a reply, not an error):
 
 ```json
 {"rid":1,"locked":true,"reason":"dismissed"}
@@ -333,8 +350,9 @@ Needs tier 1. Wipes any existing grant (one grant per uid), then raises `.reveal
 
 - `expires` is `null` and `single_use` is `true` when `grant_s` is 0: the first `reveal`,
   `totp`, `history`, `copy` of a secret field, or `set` on that id uses it up.
-- `fields` lists what the entry has: `password` always, `notes` if `has_notes`, `code` if
-  `has_totp`, `history` if `history_count > 0`.
+- `fields` lists what the entry has: `password` if `has_password` (not on a passkey-only
+  row), `notes` if `has_notes` (a body that is not empty), `code` if `has_totp`, `history` if
+  `history_count > 0`.
 - When the grant ends the daemon zeroes the entry's buffer and sends
   `{"event":"grant-expired","id":"<id>"}` (also after `release`, a new `grant`, or single use).
 
@@ -351,7 +369,8 @@ Each returns `no-grant` with no live grant on that id, `grant-expired` if it jus
   -> {"rid":8,"id":"<id>","items":[{"date":"2026-09-01T10:00:00Z","value":"...","source":"apple"}]}
 ```
 
-- `reveal` `field`: `password` or `notes` (else `invalid`). The UI shows the value for at most
+- `reveal` `field`: `password` or `notes` (else `invalid`). `notes` is the body: the tag line
+  is not in it (it reaches the window as `tags`). The UI shows the value for at most
   `hide_after` seconds or until it loses focus.
 - `totp`: `invalid` if the entry has no code. The seed never leaves the daemon.
 - `history`: newest first; `source` is `apple` (Apple's own record) or `local` (a change this
@@ -366,10 +385,36 @@ Each returns `no-grant` with no live grant on that id, `grant-expired` if it jus
 ```
 
 - `field`: `username`, `domain` (tier 1 only, no grant), or `password`, `code`, `notes`
-  (need a grant). `code` is computed at issue time.
+  (need a grant). `code` is computed at issue time; `notes` is the body, without the tag
+  line.
 - The value is snapshotted into the ticket. The UI then runs `pear-exec clip` and writes the
   ticket to its stdin (section 10.1). The outcome arrives later as the `clip` event.
 - A new `copy` withdraws the uid's previous live clip offer (`withdraw` to that clip).
+
+**copy-text**: Ctrl+C or the context menu's Copy on selected text in one of the window's secret
+fields. The text goes through pear-clip like a `copy`, never onto the persistent clipboard.
+
+```json
+{"op":"copy-text","rid":26,"source":"notes-edit","id":"<id>","text":"<selected text>"}
+  -> {"rid":26,"ticket":"<43 chars>","ttl":10}
+{"op":"copy-text","rid":27,"source":"create-password","text":"<selected text>"}
+```
+
+- No dialog: the text is already in the window, so a prompt would protect nothing. Needs
+  tier 1.
+- `source` is one of a fixed list (else `invalid`, `field:"source"`): `notes-edit`,
+  `totp-setup-edit`, `new-password` need `id` and a live grant on it (`no-grant` or
+  `grant-expired`; the check never uses up a single-use grant, since nothing is read from
+  the store); `create-password`, `create-notes`, `create-totp-setup` take no `id` (one is
+  `invalid`, `field:"id"`). The window never sends it for the Apple ID password, the Apple
+  2FA code or the old 1.x passphrase.
+- `text`: 1 to 16384 characters after NFC, no NUL (else `invalid`, `field:"text"`).
+- At most 10 per rolling minute per uid, then `rate-limited` with `retry_after`; this shares
+  nothing with the dialog limits.
+- The ticket carries `field:"text"`, the `id` (or none) and the text, `sensitive` true; as
+  with `copy` it first withdraws the uid's previous offer, and a lock revokes it. The outcome
+  arrives as the `clip` event with `"field":"text"`. The daemon never stores, logs or MACs
+  the text.
 
 ### 6.6 set, create, delete, totp-preview
 
@@ -383,7 +428,15 @@ Each returns `no-grant` with no live grant on that id, `grant-expired` if it jus
 
 - `set` needs a grant on `id`. `fields` may hold any of `password` (string), `notes`
   (string), `sites` (array of strings), `nickname` (string), `totp`
-  (`{"setup":"<key or otpauth link>"}` or `{"remove":true}`). `generate:{}` sets the password
+  (`{"setup":"<key or otpauth link>"}` or `{"remove":true}`), `tags` (array of at most 16
+  strings, each a tag with or without its `#`; `[]` removes the line). `notes` is the **body**:
+  the daemon keeps the entry's current tag line under it, so editing the body never drops
+  tags. Both `notes` and `tags` are spliced into the notes **as iCloud holds them at that
+  moment** (fetched for the edit), never into a copy the window sent: a body edit replaces
+  everything before the tag line, a tag edit replaces only that line and keeps every byte
+  before it. Tags on notes whose stored bytes are not UTF-8 are refused before anything is
+  written: `{"error":"invalid","field":"notes","detail":"not-utf8"}`. `set` on a passkey-only
+  row or a Recently Deleted copy is `invalid` with `field:"id"`. `generate:{}` sets the password
   to a daemon-generated one in Apple's shape (`generate` and `fields.password` together are
   `invalid`); the generated value is never in the reply, only `reveal` shows it.
   Reply: `{"rid":10,"id":"<id>","synced":true}` (`synced:false` when only a local nickname
@@ -391,7 +444,8 @@ Each returns `no-grant` with no live grant on that id, `grant-expired` if it jus
   fields when the entry has a details record there (so every device shows it); otherwise,
   or with no iCloud session at all, it is kept on this computer only and `synced` is false.
 - `create` needs `.manage` and tier 1. `fields` from `domain`, `username`, `password`,
-  `title`, `notes`, `sites`, `totp`; a password is required unless `generate:{}`.
+  `title`, `notes`, `sites`, `totp`, `tags` (written as the notes' last line); a password is
+  required unless `generate:{}`.
   Reply: `{"rid":11,"id":"<new id>"}`.
 - `delete` needs `.manage` and tier 1. Reply: `{"rid":12,"deleted":true}`.
 - `totp-preview` needs tier 1, no grant, reads nothing from the store: parses the setup text
@@ -507,6 +561,29 @@ the next grant; `idle_lock_s` restarts the idle clock.
   newest first, up to about 56 KB. Compares pwmac only (no entry key); `matches` are indexes into `items`.
   Values are never logged.
 
+### 6.10 features, diag-items
+
+```json
+{"op":"features","rid":28,"get":true}      -> {"rid":28,"features":{"passkeys":false,"apple_deleted":false}}
+{"op":"features","rid":28,"set":{"passkeys":true}}  -> {"rid":28,"features":{...}}
+{"op":"diag-items","rid":29}
+  -> {"rid":29,"available":true,"items":[{"class":"keys","agrp":"com.apple.webkit.webauthn",
+      "count":22,"keys":["agrp","class","klbl","labl","v_Data"],"inner_keys":[]}]}
+```
+
+- `features`: the categories that wait for a check on a real keychain, `passkeys` and
+  `apple_deleted`, both `false` until turned on. `get` never asks. A `set` that changes a
+  flag raises `.manage`; the window alone can never change one. Remembered in state.json.
+  Other keys or non-boolean values are `invalid`. While a flag is off its rows are left out
+  of every list (section 3.1).
+- `diag-items`: needs tier 1, raises `.manage`. What the last full sync since this unlock
+  decrypted, as counts per (`class`, `agrp`) pair with the set of attribute names (`keys`)
+  and, for password-manager metadata records, the names inside the blob (`inner_keys`).
+  **Never a value**: names that are not plain identifiers show as `?`. `available:false`
+  with no items before the first sync after an unlock; a lock forgets it. It exists to
+  confirm the passkey and Recently Deleted names on the owner's keychain once, before those
+  categories are turned on.
+
 ## 7. clip ops (role `clip`)
 
 ```json
@@ -517,7 +594,7 @@ the next grant; `idle_lock_s` restarts the idle clock.
 ```
 
 - `redeem` works once per connection; a second one is `bad-ticket`. `sensitive` is true for
-  `password`, `code` and `notes`. `timeout` is the uid's `clip_timeout_s`.
+  `password`, `code`, `notes` and a `copy-text` selection. `timeout` is the uid's `clip_timeout_s`.
 - `outcome`: `pasted` (the single counted paste), `expired` (timeout; cleared only if still
   the selection), `replaced` (someone else set the selection), `withdrawn` (the daemon sent
   `withdraw`), `failed` (no data-control protocol, compositor gone). The daemon relays it as
@@ -582,6 +659,7 @@ if their sha256 still matches.
 {"event":"needs-login"}
 {"event":"grant-expired","id":"<id>"}
 {"event":"clip","id":"<id>","field":"password","outcome":"pasted"}
+{"event":"clip","id":null,"field":"text","outcome":"expired"}
 {"event":"autofill","id":"<id>","origin":"github.com","outcome":"filled"|"dismissed"|"denied"|"failed"}
 {"event":"autofill-hosts","count":1}
 {"event":"migrated","counts":{...}}
@@ -790,7 +868,7 @@ traceback.
 | op | role | dialog | needs | reply |
 |---|---|---|---|---|
 | `hello` | all | – | first line | section 2.2 |
-| `unlock` | ui | `.unlock` | store present | `{entries, synced_at, needs_login}` or `{locked, reason}` |
+| `unlock` | ui | `.unlock` | store present | `{entries, synced_at, needs_login, tpm_move, features}` or `{locked, reason}` |
 | `lock` | ui | – | – | `{locked:true}` |
 | `release` | ui | – | – | `{released:true}` |
 | `cancel` | ui | – | – | `{cancelled}` |
@@ -815,6 +893,9 @@ traceback.
 | `clip-history-check` | ui | `.manage` | tier 1 | `{matches}` |
 | `autofill-enable` | ui | `.manage` | – | `{autofill:{enabled, hosts}}` |
 | `tpm-move` | ui | `.manage` | tier 1, `tpm_move` | `{sealed_with:"host+tpm2"}` |
+| `copy-text` | ui | – | tier 1; grant for notes-edit, totp-setup-edit, new-password | `{ticket, ttl:10}` |
+| `features` | ui | `.manage` | – (a change only) | `{features}` |
+| `diag-items` | ui | `.manage` | tier 1 | `{available, items}` |
 | `redeem` | clip | – | ticket at hello | `{value, sensitive, timeout}` |
 | `clip-result` | clip | – | after redeem | `{ok:true}` |
 | `import-file` | migrate | – | purpose import | `{ok, size?, sha256?}` |

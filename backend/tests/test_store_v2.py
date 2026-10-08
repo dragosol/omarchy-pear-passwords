@@ -420,6 +420,81 @@ class TierOneTests(StoreCase):
         self.assertEqual(self.backend.count("decrypt", "secret"), n)
 
 
+class TagMetaTests(StoreCase):
+    """Tags and the other list fields added for categories (features spec 4.1, 4.4)."""
+
+    def test_tags_and_has_notes_follow_the_body(self):
+        s = vstore.UserStore.create(UID)
+        a = item("a.example.test", "me", notes="PIN 1234\n\nTags: #Work #finance")
+        b = item("b.example.test", "me", notes="Tags: #work")
+        c = item("c.example.test", "me", notes="  \n\nTags: #x")
+        d = item("d.example.test", "me", notes="plain note")
+        s.apply_sync([a, b, c, d], set())
+        got = {m.domain: (m.tags, m.has_notes) for m in s.list_meta()}
+        self.assertEqual(got, {"a.example.test": (["work", "finance"], True),
+                               "b.example.test": (["work"], False),
+                               "c.example.test": (["x"], False),
+                               "d.example.test": ([], True)})
+        # The box keeps the whole raw notes, tag line and all.
+        self.assertEqual(s.open_entry(a.id).notes, "PIN 1234\n\nTags: #Work #finance")
+
+    def test_new_fields_round_trip_meta_v2(self):
+        s = vstore.UserStore.create(UID)
+        it = item("pk.example.test", "kim", pw="", notes="Tags: #a")
+        it.meta.kind, it.meta.has_passkey, it.meta.has_password = "passkey", True, False
+        rd = item("rd.example.test", "kim")
+        rd.meta.recently_deleted = True
+        s.apply_sync([it, rd], set())
+        s.lock()
+        again = vstore.UserStore.open(UID)
+        again.unlock()
+        m = again.get_meta(it.id)
+        self.assertEqual((m.tags, m.kind, m.has_passkey, m.has_password, m.recently_deleted),
+                         (["a"], "passkey", True, False, False))
+        self.assertTrue(again.get_meta(rd.id).recently_deleted)
+        self.assertEqual(again.get_meta(rd.id).kind, "login")
+
+    def test_an_old_meta_v2_loads_with_defaults_and_causes_no_change_storm(self):
+        s = vstore.UserStore.create(UID)
+        items = [item(f"s{i}.example.test", "me", f"pw{i}", notes="n" if i else "")
+                 for i in range(4)]
+        s.apply_sync(items, set())
+        # What a meta.v2 written before these fields existed holds.
+        for rec in s._doc["entries"].values():
+            for k in ("tags", "has_passkey", "kind", "has_password", "recently_deleted"):
+                del rec[k]
+        s._write_meta()
+        s.lock()
+        old = vstore.UserStore.open(UID)
+        old.unlock()
+        for m in old.list_meta():
+            self.assertEqual((m.tags, m.has_passkey, m.kind, m.has_password,
+                              m.recently_deleted), ([], False, "login", True, False))
+        again = [item(f"s{i}.example.test", "me", f"pw{i}", notes="n" if i else "")
+                 for i in range(4)]
+        self.assertEqual(old.apply_sync(again, set()),
+                         {"added": 0, "changed": 0, "deleted": 0, "unchanged": 4})
+
+    def test_an_old_record_with_a_tag_line_gets_its_tags_on_the_next_sync(self):
+        s = vstore.UserStore.create(UID)
+        it = item("t.example.test", "me", notes="body\n\nTags: #a")
+        s.apply_sync([it], set())
+        rec = s._doc["entries"][it.id]
+        del rec["tags"]
+        rec["has_notes"] = True
+        counts = s.apply_sync([item("t.example.test", "me", notes="body\n\nTags: #a")], set())
+        self.assertEqual(counts["changed"], 1)
+        self.assertEqual(s.get_meta(it.id).tags, ["a"])
+
+    def test_fields_from_normalises(self):
+        from icp.vstore import meta as vmeta
+        m = item("x.example.test", "me").meta
+        m.kind, m.tags = "something-else", [f"t{i}" for i in range(20)]
+        f = vmeta.fields_from(m)
+        self.assertEqual(f["kind"], "login")
+        self.assertEqual(len(f["tags"]), 16)
+
+
 class SettingsTests(StoreCase):
     def test_defaults_and_overlay_work_while_locked(self):
         s = vstore.UserStore.open(UID)

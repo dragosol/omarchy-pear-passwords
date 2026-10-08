@@ -4,6 +4,7 @@ The display fields are derived exactly as 1.3.2's `app-list` derived them, so th
 same after the move: a nickname wins, then Apple's own title, then the keychain title with its
 "(username)" suffix stripped; an entry with no real title leads with its account; Wi-Fi items
 are those whose site is AirPort; rows that would look identical are flagged `ambiguous`.
+`tags`, `has_passkey`, `kind`, `has_password` and `recently_deleted` are list metadata too.
 """
 
 from __future__ import annotations
@@ -23,7 +24,19 @@ def _display(title: str, username: str, domain: str) -> dict:
     return {"primary": title, "secondary": user, "no_site": False}
 
 
-def meta_to_wire(m) -> dict:
+def visible(m, features: dict | None = None) -> bool:
+    """Whether the window may list `m`. Recently Deleted copies and passkey-only rows wait for
+    their feature flag (unlock reply `features`), which waits for a check on a real keychain."""
+    f = features or {}
+    if getattr(m, "recently_deleted", False) and not f.get("apple_deleted"):
+        return False
+    if getattr(m, "kind", "login") == "passkey" and not f.get("passkeys"):
+        return False
+    return True
+
+
+def meta_to_wire(m, features: dict | None = None) -> dict:
+    f = features or {}
     d = _display(m.title, m.username, m.domain)
     local = (m.nickname or "").strip()
     apple = (getattr(m, "apple_title", "") or "").strip()
@@ -39,6 +52,11 @@ def meta_to_wire(m) -> dict:
         "primary": name or d["primary"], "secondary": d["secondary"],
         "no_site": d["no_site"], "is_wifi": (m.domain or "") == "AirPort",
         "ambiguous": False,
+        "tags": [str(t) for t in (getattr(m, "tags", None) or ())],
+        "has_passkey": bool(getattr(m, "has_passkey", False)) and bool(f.get("passkeys")),
+        "kind": "passkey" if getattr(m, "kind", "login") == "passkey" else "login",
+        "has_password": bool(getattr(m, "has_password", True)),
+        "recently_deleted": bool(getattr(m, "recently_deleted", False)),
         "_real_title": d["primary"],
     }
 
@@ -58,9 +76,10 @@ def is_internal(e: dict) -> bool:
     return not domain and not (e["primary"] or "")
 
 
-def entries(metas, show_all: bool = False) -> list[dict]:
-    """The sorted wire list. Internal records are left out unless `show_all`."""
-    out = [meta_to_wire(m) for m in metas]
+def entries(metas, show_all: bool = False, features: dict | None = None) -> list[dict]:
+    """The sorted wire list. Internal records are left out unless `show_all`, and rows whose
+    feature is off are left out always (visible())."""
+    out = [meta_to_wire(m, features) for m in metas if visible(m, features)]
     if not show_all:
         out = [e for e in out if not is_internal(e)]
     out.sort(key=lambda e: (e["primary"].lower(), e["secondary"].lower()))

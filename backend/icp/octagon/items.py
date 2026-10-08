@@ -35,13 +35,20 @@ def v1_entry_key(domain: str, username: str) -> str:
     return f"{domain}\x1f{username}"
 
 
+def credential_id(c) -> str:
+    """The entry id of a Credential. A copy in Apple's Recently Deleted is salted, so it is
+    never the live entry and never collapses into it."""
+    salt = _ids.RECENTLY_DELETED if getattr(c, "recently_deleted", False) else ""
+    return entry_id(c.domain, c.username, salt)
+
+
 def to_sync_item(c, nicknames: dict | None = None) -> SyncItem:
     """One Credential as a SyncItem. `nicknames` are the store's local names by entry id.
 
     The Meta/Secrets split is vstore.legacy's, the same code the 1.x importer uses, so the
     first sync after a migration finds every imported box already holding exactly these
     secrets (TOTP seed as raw bytes, Apple history as {date, value}) and rewrites nothing."""
-    eid = entry_id(c.domain, c.username)
+    eid = credential_id(c)
     m, secrets = _legacy.credential_parts(c.storage_dict())
     meta = dataclasses.replace(m, id=eid, nickname=str((nicknames or {}).get(eid, "")),
                                history_count=len(secrets.apple_history))

@@ -137,7 +137,16 @@ def decrypt_to_sync_items(records_by_type: dict, oct_state: dict, tlks: dict | N
     There is no diff against an old vault here any more: the store notices a changed password
     by its pwmac and moves the previous box into history itself, without decrypting it."""
     store = decrypt_credentials(records_by_type, oct_state, tlks)
-    return sync_items.to_sync_items(store.all(), nicknames)
+    out = SyncItems(sync_items.to_sync_items(store.all(), nicknames))
+    out.item_shape = store.item_shape
+    return out
+
+
+class SyncItems(list):
+    """The SyncItems of one fetch, plus `item_shape`: (class, agrp) counts and attribute names
+    of everything decrypted, without a value (vault.host.strip_and_shape)."""
+
+    item_shape: dict | None = None
 
 
 class OctagonError(AppleError):
@@ -335,4 +344,6 @@ class OctagonClient:
         tlks, view_synckeys = self.fetch_recoverable_tlks()
         records = self.sync_keychain()
         records.setdefault("synckey", []).extend(view_synckeys)
-        return decrypt_to_sync_items(records, self.record["octagon"], tlks, nicknames)
+        items = decrypt_to_sync_items(records, self.record["octagon"], tlks, nicknames)
+        self.item_shape = getattr(items, "item_shape", None)
+        return items

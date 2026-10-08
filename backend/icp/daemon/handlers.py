@@ -24,8 +24,10 @@ import hashlib
 import logging
 import math
 import re
+import unicodedata
 
 from .. import vstore
+from ..keychain import tagline
 from . import paths, protocol, wire
 from .context import NeedsLogin, UserContext
 from .frontend import SocketFrontend
@@ -171,7 +173,8 @@ def apple_error(e: BaseException) -> OpError:
     if isinstance(e, NotSignedIn):
         return OpError("not-signed-in")
     if isinstance(e, FieldError):
-        return OpError("invalid", field=_detail(e.field)[:64])
+        extra = {"detail": _detail(e.detail)[:64]} if getattr(e, "detail", "") else {}
+        return OpError("invalid", field=_detail(e.field)[:64], **extra)
     try:
         from ..auth.anisette import AnisetteError
         if isinstance(e, AnisetteError):
@@ -213,7 +216,7 @@ async def _mark_needs_login(reg, s) -> None:
 async def _wire_list(reg, s) -> tuple[list, dict]:
     metas = await _store(reg, s.uid, s.store.list_meta)
     st = await _store(reg, s.uid, s.store.status)
-    return wire.entries(metas, s.show_all), st
+    return wire.entries(metas, s.show_all, s.features), st
 
 
 def _notify_list_after(reg, s) -> None:
@@ -291,6 +294,11 @@ def validate_fields(fields: dict, generate, allowed: frozenset) -> dict:
             out[key] = [_clean_host(v, key) for v in value]
         elif key == "totp":
             out[key] = _clean_totp(value)
+        elif key == "tags":
+            try:
+                out[key] = tagline.canon_list(value)
+            except ValueError:
+                raise OpError("invalid", field=key) from None
     if generate is not None:
         if "password" in out:
             raise OpError("invalid", field="generate")
@@ -413,12 +421,14 @@ async def background_sync(reg, uid: int) -> str:
             return "failed"
         if s.epoch != epoch or not s.unlocked():
             return "locked"
+        if ctx.item_shape is not None:
+            s.item_shape = ctx.item_shape
         metas = await reg.run_store(uid, s.store.list_meta)
         st = await reg.run_store(uid, s.store.status)
         if s.epoch != epoch or not s.unlocked():
             return "locked"
         reg.notify_ui(uid, {
-            "event": "synced", "entries": wire.entries(metas, s.show_all),
+            "event": "synced", "entries": wire.entries(metas, s.show_all, s.features),
             "synced_at": counts.get("synced_at", st.get("synced_at")),
             "counts": {k: int(counts.get(k, 0) or 0)
                        for k in ("added", "changed", "deleted", "unchanged")}})
@@ -518,7 +528,7 @@ async def op_tpm_move(reg, conn, req):
 async def _unlocked_reply(reg, s) -> dict:
     entries, st = await _wire_list(reg, s)
     return {"entries": entries, "synced_at": st.get("synced_at"),
-            "needs_login": bool(st.get("needs_login"))}
+            "needs_login": bool(st.get("needs_login")), "features": dict(s.features)}
 
 
 async def op_lock(reg, conn, req):
@@ -558,8 +568,8 @@ async def op_grant(reg, conn, req):
     if s.epoch != epoch or not s.unlocked():
         raise OpError("locked")
     g = reg.put_grant(s, id, secrets_)
-    fields = ["password"]
-    if meta.has_notes:
+    fields = ["password"] if getattr(meta, "has_password", True) else []
+    if meta.has_notes:                       # the body, without the tag line
         fields.append("notes")
     if meta.has_totp:
         fields.append("code")
@@ -567,6 +577,10 @@ async def op_grant(reg, conn, req):
         fields.append("history")
     return {"id": id, "expires": g.expires_wall, "grant_s": s.settings["grant_s"],
             "single_use": g.single_use, "fields": fields}
+
+
+def _notes_body(secrets_) -> str:
+    return tagline.split(getattr(secrets_, "notes", "") or "")[0]
 
 
 def _use_grant(reg, s, id):
@@ -581,7 +595,8 @@ async def op_reveal(reg, conn, req):
         raise OpError("invalid", field="field")
     s = _tier1(reg, conn)
     g, ended = _use_grant(reg, s, id)
-    value = g.secrets.password if field == "password" else (g.secrets.notes or "")
+    # Notes are the body: the tag line is list metadata and reaches the window as `tags`.
+    value = g.secrets.password if field == "password" else _notes_body(g.secrets)
     if ended:
         reg.end_grant(conn.uid)
     return {"id": id, "field": field, "value": value,
@@ -644,7 +659,7 @@ async def op_copy(reg, conn, req):
         elif field == "password":
             value = g.secrets.password
         else:
-            value = g.secrets.notes or ""
+            value = _notes_body(g.secrets)
         _, ended = _use_grant(reg, s, id)
         if ended:
             reg.end_grant(conn.uid)
@@ -662,6 +677,46 @@ async def op_copy(reg, conn, req):
     return {"ticket": token, "ttl": protocol.TICKET_TTL_S}
 
 
+async def op_copy_text(reg, conn, req):
+    """Selected text in one of the window's secret fields (Ctrl+C, the context menu's Copy),
+    put on the clipboard through pear-clip like `copy`, so it never lands on the persistent
+    clipboard or in its history.
+
+    No dialog: the text is already in the window, so a prompt would protect nothing and would
+    make Copy unusable. The guard is the fixed list of sources, a live grant on the entry for
+    the edit fields (checked, never consumed: nothing is read from the store), the length,
+    and COPY_TEXT_PER_MIN per uid. The text is held only in the ticket; it is never stored,
+    logged or MACed."""
+    source = _need(req, "source", str)
+    text = _need(req, "text", str)
+    s = _tier1(reg, conn)
+    if source not in protocol.COPY_TEXT_SOURCES:
+        raise OpError("invalid", field="source")
+    id = None
+    if source in protocol.COPY_TEXT_SOURCES_GRANT:
+        id = _need_id(req)
+    elif "id" in req:
+        raise OpError("invalid", field="id")
+    text = unicodedata.normalize("NFC", text)
+    if not 1 <= len(text) <= protocol.COPY_TEXT_MAX or "\x00" in text:
+        raise OpError("invalid", field="text")
+    if id is not None:
+        reg.grant_check(conn.uid, id)
+    now = reg.clock()
+    times = s.copy_texts
+    while times and now - times[0] >= 60:
+        times.popleft()
+    if len(times) >= protocol.COPY_TEXT_PER_MIN:
+        raise OpError("rate-limited", retry_after=max(1, math.ceil(60 - (now - times[0]))))
+    times.append(now)
+    # One offer at a time, as for copy: a new one withdraws the previous one.
+    reg.tickets.revoke_uid(conn.uid, role="clip")
+    reg.withdraw(conn.uid, roles=("clip",))
+    token = reg.tickets.issue(uid=conn.uid, role="clip", purpose="copy", ui_conn=conn, id=id,
+                              field="text", value=text, sensitive=True)
+    return {"ticket": token, "ttl": protocol.TICKET_TTL_S}
+
+
 async def op_set(reg, conn, req):
     id = _need_id(req)
     fields = _need(req, "fields", dict)
@@ -669,10 +724,16 @@ async def op_set(reg, conn, req):
     clean = validate_fields(fields, generate, protocol.SET_FIELDS)
     s = _tier1(reg, conn)
     reg.grant_check(conn.uid, id)
+    # A Recently Deleted copy and a passkey-only row are read-only: nothing to push them to.
+    epoch = s.epoch
+    meta = await _store(reg, conn.uid, s.store.get_meta, id)
+    _still(s, conn, epoch)
+    if getattr(meta, "recently_deleted", False) or getattr(meta, "kind", "login") == "passkey":
+        raise OpError("invalid", field="id")
+    reg.grant_check(conn.uid, id)
     if s.busy:
         raise OpError("busy-sync")
     g, ended = _use_grant(reg, s, id)
-    epoch = s.epoch
     # A rename goes to iCloud like any other field: apple.push_set writes it to the entry's
     # details record when it has one (so it reaches every device) and keeps it as a local
     # nickname otherwise, as 1.x did. Without an iCloud session a rename alone stays local.
@@ -832,6 +893,8 @@ async def op_signin(reg, conn, req):
         s.signin = None
         s.busy = None
     _still(s, conn, epoch)
+    if ctx.item_shape is not None:
+        s.item_shape = ctx.item_shape
     s.next_sync_at = None
     _notify_list_after(reg, s)
     return {"ok": True}
@@ -929,6 +992,52 @@ async def op_autofill_enable(reg, conn, req):
         reg.withdraw(conn.uid, roles=("autofill",))
     return {"autofill": {"enabled": enabled,
                          "hosts": len(reg.connections(conn.uid, "autofill"))}}
+
+
+async def op_features(reg, conn, req):
+    """The categories that wait for a check on a real keychain (protocol.FEATURES), both off
+    by default. Reading them never asks; changing one raises .manage, so the window alone can
+    never turn them on. They decide which rows the list carries (wire.visible)."""
+    s = _session(reg, conn)
+    if s.ui is not conn:
+        raise OpError("forbidden")
+    if "set" not in req:
+        if req.get("get") is not True:
+            raise OpError("bad-request")
+        return {"features": dict(s.features)}
+    new = _need(req, "set", dict)
+    for key, value in new.items():
+        if key not in protocol.FEATURES or not isinstance(value, bool):
+            raise OpError("invalid", field=str(key)[:64])
+    merged = {**s.features, **new}
+    if merged != s.features:
+        epoch = s.epoch
+        await reg.authorize(conn, paths.ACTION_MANAGE, {})
+        if conn.closed or s.ui is not conn or s.epoch != epoch:
+            raise OpError("cancelled")
+        await _save_setting_keys(reg, s, features=dict(merged))
+        s.features = merged
+        if s.unlocked() and s.tier1 is conn:
+            _notify_list_after(reg, s)
+    return {"features": dict(s.features)}
+
+
+async def op_diag_items(reg, conn, req):
+    """What the last sync since this unlock decrypted, as counts of (class, agrp) pairs and the
+    attribute names each pair carries: never a value. Run once on the owner's machine to
+    confirm the passkey and Recently Deleted names before those categories are turned on.
+    Needs tier 1 and raises .manage."""
+    s = _tier1(reg, conn)
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    _still(s, conn, epoch)
+    shape = s.item_shape
+    if shape is None:
+        return {"available": False, "items": []}
+    items = [{"class": cls, "agrp": agrp, "count": int(v["count"]),
+              "keys": sorted(v["keys"]), "inner_keys": sorted(v["inner_keys"])}
+             for (cls, agrp), v in sorted(shape.items())]
+    return {"available": True, "items": items}
 
 
 # --- ui: migration and cleanup ------------------------------------------------------------------
@@ -1343,4 +1452,5 @@ HANDLERS = {
     "import-commit": op_import_commit, "purge-result": op_purge_result,
     "autofill-query": op_autofill_query, "autofill-fill": op_autofill_fill,
     "autofill-enable": op_autofill_enable,
+    "copy-text": op_copy_text, "features": op_features, "diag-items": op_diag_items,
 }

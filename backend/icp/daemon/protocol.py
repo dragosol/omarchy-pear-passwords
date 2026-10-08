@@ -85,7 +85,7 @@ ROLE_OPS: dict[str, frozenset[str]] = {
         "create", "delete", "totp-preview", "signin", "answer", "signout", "sync", "settings",
         "migrate-begin", "migrate-abandon", "reset", "purge-old-copy", "clip-history-check",
         "cancel", "tpm-move",
-        "autofill-enable",
+        "autofill-enable", "copy-text", "features", "diag-items",
     }),
     "clip": frozenset({"redeem", "clip-result"}),
     "migrate": frozenset({"import-file", "import-key", "import-commit", "purge-result"}),
@@ -107,6 +107,8 @@ PROMPT_ACTION: dict[str, str] = {
     "clip-history-check": paths.ACTION_MANAGE,
     "autofill-enable": paths.ACTION_MANAGE,      # turning it on only; off never asks
     "tpm-move": paths.ACTION_MANAGE,
+    "features": paths.ACTION_MANAGE,             # changing a flag only; reading never asks
+    "diag-items": paths.ACTION_MANAGE,
     "autofill-fill": paths.ACTION_AUTOFILL,
 }
 # Rate-limit bucket per role: the UI and the browser never starve each other.
@@ -119,10 +121,23 @@ REVEAL_FIELDS = frozenset({"password", "notes"})
 COPY_FIELDS = frozenset({"username", "domain", "password", "code", "notes"})
 COPY_FIELDS_NEED_GRANT = frozenset({"password", "code", "notes"})
 COPY_FIELDS_SENSITIVE = COPY_FIELDS_NEED_GRANT
-SET_FIELDS = frozenset({"password", "notes", "sites", "nickname", "totp"})
+SET_FIELDS = frozenset({"password", "notes", "sites", "nickname", "totp", "tags"})
 CREATE_FIELDS = frozenset({"domain", "username", "password", "title", "notes", "sites",
-                           "totp"})
+                           "totp", "tags"})
 SETTINGS_KEYS = frozenset(DEFAULT_SETTINGS)
+
+# copy-text: selected text in one of the window's secret fields, put on the clipboard through
+# pear-clip like a copy. No dialog: the text is already in the window.
+COPY_TEXT_SOURCES_GRANT = frozenset({"notes-edit", "totp-setup-edit", "new-password"})
+COPY_TEXT_SOURCES_CREATE = frozenset({"create-password", "create-notes", "create-totp-setup"})
+COPY_TEXT_SOURCES = COPY_TEXT_SOURCES_GRANT | COPY_TEXT_SOURCES_CREATE
+COPY_TEXT_MAX = 16 * 1024            # characters after NFC, the notes limit
+COPY_TEXT_PER_MIN = 10               # per uid, rolling; shares nothing with the prompt limits
+
+# Categories that wait for a check on a real keychain. Both off until the user turns them on,
+# which is a .manage dialog (op features), never the window alone.
+FEATURES = ("passkeys", "apple_deleted")
+DEFAULT_FEATURES = {k: False for k in FEATURES}
 
 CLIP_OUTCOMES = ("pasted", "expired", "replaced", "withdrawn", "failed")
 LOCK_REASONS = ("user", "screen-locked", "sleep", "session-ended", "idle", "reset",

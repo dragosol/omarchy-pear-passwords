@@ -21,13 +21,14 @@ import dataclasses
 
 from ..vstore import Meta, Secrets, SyncItem, UserStore
 from ..vstore import legacy as _legacy
-from ..vstore.ids import collapse, entry_id
+from ..vstore.ids import RECENTLY_DELETED, collapse, entry_id
 from .host import Credential, CredentialStore
 
 
 def credential_id(c: Credential) -> str:
-    """The 2.0 id of a credential: the same one the 1.x import gave it."""
-    return entry_id(c.domain, c.username)
+    """The 2.0 id of a credential: the same one the 1.x import gave it (salted for a copy in
+    Apple's Recently Deleted, as a sync does)."""
+    return entry_id(c.domain, c.username, RECENTLY_DELETED if c.recently_deleted else "")
 
 
 def credential_parts(c: Credential) -> tuple[Meta, Secrets]:
