@@ -1,14 +1,16 @@
 """Octagon join + keychain sync orchestration: ensure_peer_identity -> fetch_changes ->
-join(voucher) -> sync_keychain -> decrypt_to_vault. See RESEARCH.md (Stages 4-5)."""
+join(voucher) -> sync_keychain -> decrypt_to_sync_items. See RESEARCH.md (Stages 4-5).
+
+Decrypted items leave this module as SyncItems for UserStore.apply_sync; nothing here reads or
+writes a vault file, so a sync never needs - and never opens - the entry key."""
 
 from __future__ import annotations
 
 import logging
 import time
 
-from . import keys as ok
+from . import items as sync_items, keys as ok
 from .. import const
-from ..vault import history, store as vault
 from ..escrow import bottle as escrow, srp as escrow_srp
 from ..transport import ckks, cloudkit
 from ..keychain import pipeline
@@ -119,25 +121,23 @@ def build_join_peer(oct_state: dict, keys: ok.PeerKeySet, voucher: cf.SignedBlob
         voucher=voucher)
 
 
-def decrypt_to_vault(records_by_type: dict, oct_state: dict, tlks: dict | None = None) -> int:
-    """Decrypt fetched CKKS records into the encrypted vault. Returns credential count. `tlks` are
-    the pre-fetched per-view TLKs (from fetchRecoverableTLKShares), UNIONed with the plain tlkshare
-    records addressed to us."""
+def decrypt_credentials(records_by_type: dict, oct_state: dict, tlks: dict | None = None):
+    """Decrypt fetched CKKS records into a CredentialStore (plaintext, in memory only). `tlks`
+    are the pre-fetched per-view TLKs (from fetchRecoverableTLKShares), UNIONed with the plain
+    tlkshare records addressed to us."""
     keys = load_peer_keys(oct_state)
-    store = pipeline.build_credential_store(
+    return pipeline.build_credential_store(
         records_by_type, oct_state["peer_id"], keys.encryption.private_key, tlks=tlks)
-    # Diff against what we held before overwriting it: this is the only moment a password
-    # changed on another device is observable, and Apple keeps no history for most items.
-    try:
-        previous = vault.load_vault().all()
-    except Exception:
-        previous = []
-    vault.save_vault(store)
-    try:
-        history.observe_sync(previous, store.all())
-    except Exception as e:  # history must never be able to fail a sync
-        logging.getLogger(__name__).warning("could not update password history: %s", e)
-    return len(store)
+
+
+def decrypt_to_sync_items(records_by_type: dict, oct_state: dict, tlks: dict | None = None,
+                          nicknames: dict | None = None) -> list:
+    """Decrypt fetched CKKS records into SyncItems for UserStore.apply_sync, one per entry id.
+
+    There is no diff against an old vault here any more: the store notices a changed password
+    by its pwmac and moves the previous box into history itself, without decrypting it."""
+    store = decrypt_credentials(records_by_type, oct_state, tlks)
+    return sync_items.to_sync_items(store.all(), nicknames)
 
 
 class OctagonError(AppleError):
@@ -170,22 +170,23 @@ class OctagonClient:
         self.mme_token = mme.get("mmeAuthToken")
         self.adsid = record.get("dsid") or ""   # the GUID adsid (escrow key derivation)
         if not self.ck_token:
-            raise OctagonError("no cloudKitToken in session - run `icp login` first")
+            raise OctagonError("no cloudKitToken in session - sign in first")
         # x-cloudkit-userid = per-container cloudKitUserId from ckAppInit (NOT the dsid -> 401). Cached.
         self.user_id = mme.get("cloudKitUserId")
         if not self.user_id:
             if not self.mme_token:
-                raise OctagonError("no mmeAuthToken in session - run `icp login`")
+                raise OctagonError("no mmeAuthToken in session - sign in first")
             self.user_id = cloudkit.ck_app_init(
                 cloudkit.CUTTLEFISH_CONTAINER, cloudkit.CUTTLEFISH_BUNDLE,
                 self.mme_dsid, self.mme_token, anisette)
             mme["cloudKitUserId"] = self.user_id
-            record["mme"] = mme   # persisted by the caller's next session.save
+            record["mme"] = mme   # persisted by the caller's next store.save_session
         dev = cloudkit.DeviceConfig(
             device_uuid=getattr(device, "device_id", ""),
             serial=getattr(device, "serial", "") or "0000000000",
             name=getattr(device, "name", "") or "Mac")
         self.transport = cloudkit.CloudKitTransport(self.ck_token, self.user_id, dev, anisette)
+        self.failed_zones: list[str] = []
 
     def fetch_changes(self, sync_token: str | None = None) -> dict:
         result = self.transport.invoke("fetchChanges", cf.encode_fetch_changes_request(sync_token))
@@ -215,8 +216,10 @@ class OctagonClient:
 
     def sync_keychain(self, zones=ckks.KEYCHAIN_ZONES) -> dict:
         """Fetch every keychain zone's records (live) and group them by CKKS type. A missing or
-        empty zone is skipped rather than failing the whole sync."""
+        empty zone is skipped rather than failing the whole sync, but is recorded in
+        `failed_zones`: an entry absent because its zone did not load is not a deletion."""
         grouped: dict[str, list] = {}
+        self.failed_zones = []
         for zone in zones:
             zid = ckks.record_zone_identifier(zone, self.user_id)
             continuation = None
@@ -230,7 +233,9 @@ class OctagonClient:
                     continuation = page.get("continuation_token")
                     if page.get("status") != 1 or not continuation:
                         break
-            except cloudkit.CloudKitError:
+            except cloudkit.CloudKitError as e:
+                logging.getLogger(__name__).warning("zone %s did not load: %s", zone, e)
+                self.failed_zones.append(zone)
                 continue
         return grouped
 
@@ -324,10 +329,10 @@ class OctagonClient:
             view_synckeys = view_synckeys + sp_synckeys
         return tlks, view_synckeys
 
-    def sync_and_decrypt(self) -> int:
+    def sync_and_decrypt(self, nicknames: dict | None = None) -> list:
         """Fetch every view's TLK (via fetchRecoverableTLKShares), then fetch the keychain zones
-        and decrypt them into the vault. Returns credential count."""
+        and decrypt them. Returns the SyncItems; `failed_zones` says what did not load."""
         tlks, view_synckeys = self.fetch_recoverable_tlks()
         records = self.sync_keychain()
         records.setdefault("synckey", []).extend(view_synckeys)
-        return decrypt_to_vault(records, self.record["octagon"], tlks)
+        return decrypt_to_sync_items(records, self.record["octagon"], tlks, nicknames)

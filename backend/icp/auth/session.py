@@ -1,152 +1,32 @@
-"""Encrypted session store: persistent auth artifacts encrypted with a libsodium secret box,
-the master key held in the GNOME login keyring (Secret Service), or a 0600 key file if absent."""
+"""The iCloud session record: tokens, the saved Apple ID password (if any), web-auth cookies,
+the Octagon peer identity and the escrow sponsor key.
 
-import base64
-import binascii
-import json
-import logging
-import os
+In 2.0 this is a thin view over the per-user store. The daemon holds the store unlocked while
+the Pear window has tier 1 open, and session.v2 is sealed under a subkey of RK_list there; there
+is no master key here, no keyring item and no key file. Anything that needs the session is
+handed the store by its caller (daemon/apple.py, through a UserContext) - nothing in this module
+finds a key on its own, so nothing here can prompt.
+"""
 
-import nacl.exceptions
-import nacl.secret
-import nacl.utils
+from __future__ import annotations
 
-from .. import paths
 from ..errors import AppleError
-
-logger = logging.getLogger(__name__)
-
-_ATTRS = {"application": "icp", "type": "master-key"}
-_LABEL = "ApplePasswords-Linux master key"
-_KEY_SIZE = nacl.secret.SecretBox.KEY_SIZE
 
 
 class SessionError(AppleError):
-    """The stored session exists but cannot be read with the current master key."""
+    """The session exists but is not usable for what was asked (for example, not joined)."""
 
 
-def _decode_key(stored: bytes | str | None) -> bytes | None:
-    if stored is None:
-        return None
-    raw = stored.encode() if isinstance(stored, str) else bytes(stored)
-    if len(raw) == _KEY_SIZE:
-        return raw
-    try:
-        key = base64.b64decode(raw.strip(), validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    return key if len(key) == _KEY_SIZE else None
+def load(store) -> dict | None:
+    """The session record, or None when signed out. Raises vstore.StoreLocked while locked."""
+    d = store.load_session()
+    return dict(d) if d else None
 
 
-def _key_from_secret_service() -> bytes | None:
-    try:
-        import secretstorage
-    except Exception:
-        return None
-    try:
-        conn = secretstorage.dbus_init()
-        coll = secretstorage.get_default_collection(conn)
-        if coll.is_locked() and coll.unlock():
-            logger.warning("keyring unlock dismissed; using key file fallback")
-            return None
-        unusable = 0
-        for item in coll.search_items(_ATTRS):
-            key = _decode_key(item.get_secret())
-            if key is not None:
-                return key
-            unusable += 1
-        if unusable:
-            logger.warning("keyring holds %d unusable master-key item(s); replacing them", unusable)
-        key = nacl.utils.random(_KEY_SIZE)
-        coll.create_item(_LABEL, _ATTRS, base64.b64encode(key), replace=True)
-        return key
-    except Exception as e:  # dbus not running, no keyring, etc.
-        logger.warning("Secret Service unavailable (%s); using key file fallback", e)
-        return None
+def save(store, data: dict) -> None:
+    """Replace the session record. An empty dict signs out (session.v2 is removed)."""
+    store.save_session(dict(data or {}))
 
 
-def _key_from_file() -> bytes:
-    f = paths.fallback_key_file()
-    if f.exists():
-        key = _decode_key(f.read_bytes())
-        if key is not None:
-            return key
-        logger.warning("master key file %s is unusable; writing a fresh key", f)
-    key = nacl.utils.random(_KEY_SIZE)
-    _write_private(f, base64.b64encode(key))
-    logger.warning("Stored master key at %s (0600) - less safe than the keyring", f)
-    return key
-
-
-def _master_key() -> bytes:
-    # Once a passphrase is set, it is the only source of the key. Nothing derived from it is
-    # written to disk, so a copy of the config directory cannot be decrypted without it. The
-    # agent holds it in memory. Releasing it goes through polkit where that action is
-    # installed - a fingerprint, or the account password in the same dialog - and falls back to
-    # an ICP_LOCK_TIMEOUT idle drop where it is not. See auth/agent.py.
-    from . import agent, held_key, lockbox, prompt
-    if lockbox.is_initialised():
-        # An older version wrote the derived key to disk beside the vault, which let a copy of
-        # ~/.config/icp be decrypted without the passphrase. Clear that out on the way past.
-        held_key.purge()
-        if prompt.is_allowed():
-            # GET may put a polkit prompt on screen (a fingerprint, or the account password in
-            # the same dialog). That is only acceptable because someone is at the keyboard.
-            key = agent.get_key()
-            if key is None:
-                agent.unlock(prompt.ask_passphrase())
-                key = agent.get_key()
-        else:
-            # PEEK never prompts and never scans: it answers only from the grace window the
-            # agent is already inside. An unattended run gets a locked keychain instead of a
-            # dialog nobody asked for.
-            key = agent.peek_key()
-        if key is None:
-            raise SessionError("keychain is locked")
-        return key
-
-    key = _key_from_secret_service()
-    if key is not None:
-        return key
-    # Falling back writes the vault key to disk in the clear, which silently drops this to
-    # "any process running as you reads everything". A dismissed keyring prompt must not be
-    # enough to trigger that, so require an explicit opt-in.
-    if os.environ.get("ICP_ALLOW_KEYFILE") != "1":
-        raise SessionError(
-            "Keyring unavailable and the plaintext key-file fallback is disabled.\n"
-            "Unlock your login keyring and retry, or set ICP_ALLOW_KEYFILE=1 to accept an "
-            f"unprotected master key at {paths.fallback_key_file()}."
-        )
-    return _key_from_file()
-
-
-def _write_private(f, data: bytes) -> None:
-    """Write 0600 from creation - secrets must never exist world-readable, even briefly."""
-    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
-    os.chmod(f, 0o600)
-
-
-def save(data: dict) -> None:
-    box = nacl.secret.SecretBox(_master_key())
-    _write_private(paths.session_file(), box.encrypt(json.dumps(data).encode()))
-
-
-def load() -> dict | None:
-    f = paths.session_file()
-    if not f.exists():
-        return None
-    box = nacl.secret.SecretBox(_master_key())
-    try:
-        return json.loads(box.decrypt(f.read_bytes()).decode())
-    except nacl.exceptions.CryptoError as e:
-        raise SessionError(
-            f"cannot decrypt {f} - the master key no longer matches it (the keyring entry was "
-            "lost or replaced). Run `icp logout`, then `icp login` to sign in again.") from e
-
-
-def clear() -> None:
-    f = paths.session_file()
-    if f.exists():
-        f.unlink()
+def clear(store) -> None:
+    store.save_session({})
