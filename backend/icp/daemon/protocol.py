@@ -83,7 +83,7 @@ ROLE_OPS: dict[str, frozenset[str]] = {
         "unlock", "lock", "release", "grant", "reveal", "totp", "history", "copy", "set",
         "create", "delete", "totp-preview", "signin", "answer", "signout", "sync", "settings",
         "migrate-begin", "migrate-abandon", "reset", "purge-old-copy", "clip-history-check",
-        "cancel",
+        "cancel", "tpm-move",
         "autofill-enable",
     }),
     "clip": frozenset({"redeem", "clip-result"}),
@@ -105,6 +105,7 @@ PROMPT_ACTION: dict[str, str] = {
     "purge-old-copy": paths.ACTION_MANAGE,
     "clip-history-check": paths.ACTION_MANAGE,
     "autofill-enable": paths.ACTION_MANAGE,      # turning it on only; off never asks
+    "tpm-move": paths.ACTION_MANAGE,
     "autofill-fill": paths.ACTION_AUTOFILL,
 }
 # Rate-limit bucket per role: the UI and the browser never starve each other.

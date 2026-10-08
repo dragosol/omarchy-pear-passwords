@@ -517,6 +517,30 @@ class ResealTests(StoreCase):
             s.reseal_if_tpm_available()
 
 
+class TpmMoveStateTests(StoreCase):
+    """What the window is told before it offers "Move your keys onto the security chip"."""
+
+    def test_states(self):
+        s = vstore.UserStore.create(UID)
+        self.assertEqual(s.tpm_move_state(), "no-tpm")
+        self.backend.tpm = True
+        self.assertEqual(s.tpm_move_state(), "available")
+        # Unlocking with a TPM present changes nothing on its own.
+        s.lock()
+        s.unlock()
+        self.assertEqual(json.loads((self.udir / "keys" / "keys.json").read_text())["sealed_with"],
+                         "host")
+        self.assertTrue(s.reseal_if_tpm_available())
+        self.assertEqual(s.tpm_move_state(), "sealed")
+
+    def test_a_pcr_public_key_blocks_the_move(self):
+        s = vstore.UserStore.create(UID)
+        with mock.patch.object(seal, "tpm_present", return_value=True), \
+                mock.patch.object(seal, "pcr_public_key_present", return_value="/run/x.pem"), \
+                mock.patch.object(seal, "get_backend", return_value=seal.SystemdCredsBackend()):
+            self.assertEqual(s.tpm_move_state(), "pcr-policy")
+
+
 class SealStateTests(StoreCase):
     tpm = True
 

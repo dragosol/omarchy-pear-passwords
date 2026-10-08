@@ -82,6 +82,10 @@ ShellRoot {
     property string lockReason: ""             // why the last unlock did not open the list
     property bool signedIn: false
     property string sealedWith: ""
+    // A usable TPM and host-sealed keys: Settings offers the one-time move onto the chip.
+    // Never automatic - it opens every entry inside the daemon - so it waits for a click.
+    property bool tpmMove: false
+    property bool tpmMoving: false
     property var settings: ({ grant_s: 120, idle_lock_s: 0, clip_timeout_s: 30 })
     // Browser autofill: off until turned on here (one .manage dialog); how many hosts are on.
     property bool autofillEnabled: false
@@ -606,6 +610,7 @@ ShellRoot {
             root.vaultState = "unlocked";
             root.syncedAt = d.synced_at || 0;
             root.needsLogin = !!d.needs_login;
+            root.tpmMove = !!d.tpm_move;
             root.syncing = true;
             root.setEntries(d.entries || []);
             // No sign-in started from here: "signin" raises its own .manage dialog, and a
@@ -652,6 +657,20 @@ ShellRoot {
             root.lockReason = "";
             root.status = "";
             v1Check.check();
+        });
+    }
+
+    // "Move your keys onto the security chip": one .manage dialog, then the daemon rotates to
+    // new keys sealed with the TPM. Only ever on this click.
+    function moveToTpm() {
+        if (root.tpmMoving) return;
+        root.tpmMoving = true;
+        root.send("tpm-move", {}, function (d) {
+            root.tpmMoving = false;
+            if (d.error) { root.showFlash(root.errorWords(d)); return; }
+            root.sealedWith = d.sealed_with || "host+tpm2";
+            root.tpmMove = false;
+            root.showFlash("your keys are now sealed to this computer and its security chip");
         });
     }
 
@@ -4206,12 +4225,25 @@ ShellRoot {
                         Layout.topMargin: 24
                         text: root.sealedWith === "host+tpm2"
                             ? "Your keys are sealed to this computer and its security chip."
-                            : "Your keys are sealed to this computer. Turning on the security chip (PTT) in the "
-                              + "BIOS also ties them to this laptop; Pear picks that up on its own."
+                            : root.tpmMove
+                              ? "Your keys are sealed to this computer. This laptop's security chip is on: moving "
+                                + "your keys onto it makes new keys sealed with the chip and re-encrypts every "
+                                + "password inside Pear's service (one dialog). A backup taken before still opens "
+                                + "the passwords as they were then."
+                              : "Your keys are sealed to this computer. Turning on the security chip (PTT) in the "
+                                + "BIOS lets Pear tie them to this laptop too; it then offers the move here."
                         color: Theme.dim
                         font.family: Theme.uiFont
                         font.pixelSize: Theme.fSmall
                         wrapMode: Text.Wrap
+                    }
+
+                    AppButton {
+                        Layout.topMargin: 8
+                        visible: root.sealedWith !== "host+tpm2" && root.tpmMove
+                        text: root.tpmMoving ? "Moving…" : "Move your keys onto the security chip"
+                        fontSize: Theme.fSmall
+                        onClicked: root.moveToTpm()
                     }
 
                     // ---- browser autofill

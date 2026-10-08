@@ -45,7 +45,7 @@ class HelloAndUnlockTests(Base):
     async def test_unlock_then_sync_event_after_the_reply(self):
         r = await self.ui.call("unlock")
         self.assertEqual([e["id"] for e in r["entries"]], ["e.0", "e.1"])
-        self.assertEqual(set(r), {"rid", "entries", "synced_at", "needs_login"})
+        self.assertEqual(set(r), {"rid", "entries", "synced_at", "needs_login", "tpm_move"})
         e = r["entries"][0]
         for key in ("password", "notes", "totp_secret", "pwmac"):
             self.assertNotIn(key, e)
@@ -482,6 +482,52 @@ class EditTests(Base):
         self.assertEqual((await self.ui.call("settings"))["error"], "bad-request")
         r = await self.ui.call("grant", id="e.0")
         self.assertEqual(r["grant_s"], 60)
+
+
+class TpmMoveTests(Base):
+    """audit: the PTT rotation opened every entry and history box under polkit #1 alone, on
+    the first unlock after a TPM appeared. It now runs only on a click, behind .manage."""
+
+    async def test_unlock_never_rotates_it_only_offers(self):
+        self.st.tpm_state = "available"
+        r = await self.ui.call("unlock")
+        self.assertIs(r["tpm_move"], True)
+        self.assertNotIn("reseal", self.st.calls)
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK])
+
+    async def test_the_move_is_its_own_manage_dialog(self):
+        self.st.tpm_state = "available"
+        await self.ui.call("unlock")
+        r = await self.ui.call("tpm-move")
+        self.assertEqual(r, {"rid": self.ui.rid, "sealed_with": "host+tpm2"})
+        self.assertEqual(self.dialogs(), [paths.ACTION_UNLOCK, paths.ACTION_MANAGE])
+        self.assertEqual(self.st.calls.count("reseal"), 1)
+
+    async def test_a_refused_dialog_moves_nothing(self):
+        self.st.tpm_state = "available"
+        await self.ui.call("unlock")
+        self.h.authority.outcome = polkit.DENIED
+        r = await self.ui.call("tpm-move")
+        self.assertEqual(r["error"], "denied")
+        self.assertNotIn("reseal", self.st.calls)
+
+    async def test_refused_before_any_dialog_when_it_cannot_run(self):
+        for state, err in (("no-tpm", "invalid"), ("sealed", "invalid"),
+                           ("pcr-policy", "seal-refused")):
+            self.st.tpm_state = state
+            if not self.h.reg.get(UID).unlocked():
+                await self.ui.call("unlock")
+            n = len(self.dialogs())
+            r = await self.ui.call("tpm-move")
+            self.assertEqual(r["error"], err, state)
+            self.assertEqual(len(self.dialogs()), n, state)
+        self.assertNotIn("reseal", self.st.calls)
+
+    async def test_needs_the_list_open(self):
+        self.st.tpm_state = "available"
+        r = await self.ui.call("tpm-move")
+        self.assertEqual(r["error"], "locked")
+        self.assertEqual(self.dialogs(), [])
 
 
 class ResetTests(Base):

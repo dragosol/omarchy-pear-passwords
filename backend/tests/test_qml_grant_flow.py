@@ -110,6 +110,19 @@ class SecretFieldTests(unittest.TestCase):
                                    r"Qt\.ImhNoPredictiveText", ident)
 
 
+class TpmMoveWindowTests(unittest.TestCase):
+    def test_the_move_onto_the_chip_is_only_ever_a_click(self):
+        # audit: the PTT rotation ran on its own at unlock. It is now a Settings button.
+        self.assertRegex(function_body("moveToTpm"), r'send\(\s*"tpm-move"')
+        self.assertIn("root.tpmMove = !!d.tpm_move", function_body("authenticate"))
+        for fn in ("authenticate", "onHello", "onEvent"):
+            self.assertNotIn("tpm-move", function_body(fn), fn)
+            self.assertNotIn("moveToTpm", function_body(fn), fn)
+        self.assertEqual(CODE.count("root.moveToTpm()"), 1)
+        button = CODE[CODE.index("root.moveToTpm()") - 400:CODE.index("root.moveToTpm()")]
+        self.assertIn("onClicked:", button[-40:])
+
+
 class MigrationScreenTests(unittest.TestCase):
     def test_a_pending_migration_is_offered_again(self):
         # function-migration-never-reoffered

@@ -236,7 +236,7 @@ lease: a locked uid does not sync.
 |---|---|---|
 | `io.github.dragosol.pearpasswords.unlock` | Unlock Pear Passwords to show your accounts | `unlock` |
 | `io.github.dragosol.pearpasswords.reveal` | Use the saved password for $(account) | `grant` |
-| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | `create`, `delete`, `signin`, `signout`, `migrate-begin`, `reset`, `purge-old-copy`, `clip-history-check` |
+| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | `create`, `delete`, `signin`, `signout`, `migrate-begin`, `reset`, `purge-old-copy`, `clip-history-check`, `autofill-enable`, `tpm-move` |
 | `io.github.dragosol.pearpasswords.autofill` | A browser extension asks to fill the password for $(account) on $(origin) | `autofill-fill` |
 
 All four: `auth_self` for active local sessions, `no` for any and inactive, no `_keep`, owner
@@ -286,7 +286,7 @@ name an `id` return `not-found` for an id with no live entry.
 Raises `.unlock` (no dialog if already unlocked on this connection). Success:
 
 ```json
-{"rid":1,"entries":[<Meta>...],"synced_at":1791450000.0,"needs_login":false}
+{"rid":1,"entries":[<Meta>...],"synced_at":1791450000.0,"needs_login":false,"tpm_move":false}
 ```
 
 then a background sync. Refusal (a reply, not an error):
@@ -297,8 +297,9 @@ then a background sync. Refusal (a reply, not an error):
 
 `reason` is `dismissed`, `denied`, `no-agent`, `busy`, `rate-limited` (with `retry_after`),
 `empty`, `tpm-missing`, `tpm-cleared` or `damaged`. The seal reasons come from unsealing after
-an approved dialog. On success with a TPM present, the keys are re-sealed to host+tpm2 before
-the reply (no user action).
+an approved dialog. Unlocking never moves the keys onto the TPM: `tpm_move` is true when a
+usable TPM2 is present, the keys are host-sealed and nothing blocks TPM sealing, and the
+window then offers the move as a button (`tpm-move`, section 6.9).
 
 ### 6.2 lock, release, cancel
 
@@ -452,6 +453,7 @@ the next grant; `idle_lock_s` restarts the idle clock.
 {"op":"purge-old-copy","rid":20}           -> {"rid":20,"ticket":"<43 chars>","ttl":10}
 {"op":"reset","rid":21}                    -> {"rid":21,"state":"empty"}
 {"op":"migrate-abandon","rid":24}          -> {"rid":24,"migration_pending":false}
+{"op":"tpm-move","rid":25}                 -> {"rid":25,"sealed_with":"host+tpm2"}
 {"op":"clip-history-check","rid":22,"items":["...","..."]}  -> {"rid":22,"matches":[0,4]}
 {"op":"autofill-enable","rid":23,"enabled":true} -> {"rid":23,"autofill":{"enabled":true,"hosts":0}}
 ```
@@ -467,6 +469,12 @@ the next grant; `idle_lock_s` restarts the idle clock.
   Raises `.manage` and issues a
   `migrate`/`purge` ticket; the importer deletes exactly the recorded files whose sha256
   still matches and reports `purge-result`. The record is cleared afterwards.
+- `tpm-move`: "Move your keys onto the security chip". Needs tier 1 and `tpm_move` (else
+  `invalid` with `field:"tpm"`, or `seal-refused` with `reason:"pcr-policy"`). Raises
+  `.manage`, then rotates to new keys sealed with host+tpm2 (security.md section 2): every
+  entry and history box is opened once inside the daemon and re-sealed to the new public
+  key. That is the only time boxes are opened outside a per-entry grant, which is why it
+  runs only on this click. `seal-unavailable` if it did not verify; nothing changed then.
 - `migrate-abandon`: no dialog. Drops a recorded `migration_pending` (and withdraws a
   running importer), so the store is an ordinary one and `signin` works again. The window
   sends it when it finds no importable 1.x vault left, or when you choose "Start fresh
@@ -777,6 +785,7 @@ traceback.
 | `purge-old-copy` | ui | `.manage` | an old_copy record | `{ticket, ttl:10}` |
 | `clip-history-check` | ui | `.manage` | tier 1 | `{matches}` |
 | `autofill-enable` | ui | `.manage` | – | `{autofill:{enabled, hosts}}` |
+| `tpm-move` | ui | `.manage` | tier 1, `tpm_move` | `{sealed_with:"host+tpm2"}` |
 | `redeem` | clip | – | ticket at hello | `{value, sensitive, timeout}` |
 | `clip-result` | clip | – | after redeem | `{ok:true}` |
 | `import-file` | migrate | – | purpose import | `{ok, size?, sha256?}` |

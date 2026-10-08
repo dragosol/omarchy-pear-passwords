@@ -126,8 +126,9 @@ WP1's and WP5's tests grep and walk the AST for it.
 
 ### 4.3 WP1 to WP2 (store)
 
-WP1 opens `UserStore.open(uid)` per uid, calls `unlock()` after an approved `.unlock`, then
-`reseal_if_tpm_available()`, and `lock()` on every lock trigger. `SealError.kind` becomes the
+WP1 opens `UserStore.open(uid)` per uid, calls `unlock()` after an approved `.unlock` (then
+only `tpm_move_state()`; `reseal_if_tpm_available()` runs on the `tpm-move` op, behind its own
+`.manage` dialog), and `lock()` on every lock trigger. `SealError.kind` becomes the
 state and the `unlock` refusal reason. `open_entry` is called once per grant and the result is
 kept only for the grant. Migration: `migrate-begin` calls `UserStore.create(uid)`; `import-key`
 uses `v1_key_opens` / `v1_key_from_passphrase`; `import-commit` calls `store.import_v1(files,

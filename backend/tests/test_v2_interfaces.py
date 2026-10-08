@@ -41,7 +41,8 @@ class VstoreShapeTests(unittest.TestCase):
         expected = {
             "open": ["uid"], "create": ["uid"], "reset": ["uid"],
             "state": [], "status": [], "unlock": [], "lock": [],
-            "reseal_if_tpm_available": [], "list_meta": [], "get_meta": ["id"],
+            "reseal_if_tpm_available": [], "tpm_move_state": [], "list_meta": [],
+            "get_meta": ["id"],
             "set_sync_status": ["synced_at", "needs_login"],
             "open_entry": ["id"], "history": ["id"], "set_secrets": ["id", "s"],
             "apply_sync": ["items", "deleted"], "pwmac_matches": ["texts"],

@@ -353,9 +353,28 @@ class UserStore:
         self._doc = self._nick = None
 
     @_serialized
+    def tpm_move_state(self) -> str:
+        """Whether reseal_if_tpm_available() can run, without touching a key: "available" (a
+        TPM2 is usable and keys.json says "host"), "sealed" (already host+tpm2), "no-tpm", or
+        "pcr-policy" (it would bind the keys to a signed PCR policy, so it is refused)."""
+        kj = self._read_keys_json() or {}
+        if kj.get("sealed_with") == "host+tpm2":
+            return "sealed"
+        backend = _seal.get_backend()
+        if not backend.tpm_present():
+            return "no-tpm"
+        return _seal.tpm_sealing_blocked(backend) or "available"
+
+    @_serialized
     def reseal_if_tpm_available(self) -> bool:
-        """After a successful unlock: if a TPM2 is present and keys.json says "host", move the
-        store to NEW keys sealed with host+tpm2. Returns True if it did.
+        """Only after the user asked for it (op tpm-move, behind its own .manage dialog): if a
+        TPM2 is present and keys.json says "host", move the store to NEW keys sealed with
+        host+tpm2. Returns True if it did.
+
+        This is the one step that opens every box with SK_secret outside a per-entry grant:
+        each entry and history box is opened inside the daemon, re-sealed to the new PK at once
+        and its plaintext dropped before the next one; nothing of it leaves the daemon, and it
+        happens once per store. That is why it is never automatic (docs/security.md 2).
 
         A re-wrap of the same RK_list and SK_secret would leave every backup or snapshot taken
         before (host-key-only blobs plus /var/lib/systemd/credential.secret) able to decrypt

@@ -102,18 +102,26 @@ Per user, in `/var/lib/pear-passwords/u<uid>/` (0700 `pear-passwords`; your uid 
   second is up (an unseal on a hung TPM, a sync), the machine sleeps with that call's keys
   in RAM, and they are wiped when the call returns after resume. Tests:
   `test_lock_never_waits.py`.
-- Moving to host+TPM2 happens at the first unlock after a TPM appears, and it is a key
-  rotation, not a re-wrap: a new `RK_list` and `SK/PK`, every file re-encrypted and every box
-  re-sealed in `u<uid>.rotate`, read back through a real unseal and compared, then swapped in
-  with one `renameat2(RENAME_EXCHANGE)`; the old tree is deleted at once and a leftover is
-  removed by the next unlock. No host-only copy of a key that opens current data survives, so
+- Moving to host+TPM2 is never automatic. With a usable TPM and host-sealed keys the unlock
+  reply says `tpm_move`, and Settings offers **Move your keys onto the security chip**, which
+  raises its own `.manage` dialog (op `tpm-move`). It is a key rotation, not a re-wrap: a new
+  `RK_list` and `SK/PK`, every file re-encrypted and every box re-sealed in `u<uid>.rotate`,
+  read back through a real unseal and compared, then swapped in with one
+  `renameat2(RENAME_EXCHANGE)`; the old tree is deleted at once and a leftover is removed by
+  the next unlock. **It is a one-time, daemon-internal step, and the only time SK_secret opens
+  boxes outside a per-entry grant**: each entry and history box is opened inside the daemon,
+  re-sealed to the new public key at once and dropped before the next one (Python cannot zero
+  it), then opened once more under the new key to verify. No plaintext leaves the daemon, and
+  the window receives nothing but `sealed_with`. That is why it waits for the user's click and
+  its own dialog instead of riding on polkit #1. No host-only copy of a key that opens current data survives, so
   a pre-PTT backup opens only the vault as it was then. A missing TPM is told apart from a
   cleared one. A cleared TPM is recognised by its storage key fingerprint where systemd-tpm2-setup
   writes one (measured, UKI boots); on other boots (Limine or GRUB without a UKI) a working
   TPM that refuses the keys is reported as `tpm-cleared` too, with "most likely" wording. A
   failure of the mechanism itself (the credentials service unreachable, a busy or locked-out
   TPM) is transient and never becomes a seal state: a non-zero exit counts as a refusal only
-  when a throwaway value still round-trips. Tests: `test_seal_reseal.py`,
+  when a throwaway value still round-trips. Tests: `test_daemon_handlers.py::TpmMoveTests`,
+  `test_seal_reseal.py::TpmMoveStateTests`, `test_seal_reseal.py`,
   `test_seal_reseal.py::CommandLineTests::test_key_type_is_an_allowlist`,
   `test_seal_service.py`.
 

@@ -192,6 +192,15 @@ def pcr_public_key_present() -> str | None:
     return None
 
 
+def tpm_sealing_blocked(backend) -> str | None:
+    """"pcr-policy" when sealing through this backend with the TPM would bind the keys to a
+    signed PCR policy (uid scope with a tpm2-pcr-public-key.pem), else None. The seal service
+    passes an empty --tpm2-public-key=, so it is never blocked."""
+    if isinstance(backend, SystemdCredsBackend) and pcr_public_key_present():
+        return "pcr-policy"
+    return None
+
+
 def credential_header(blob: bytes) -> bytes:
     """The 16-byte key type id at the start of a credential (base64 text or raw)."""
     data = bytes(blob or b"")

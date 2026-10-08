@@ -446,18 +446,49 @@ async def op_unlock(reg, conn, req):
     if s.epoch != epoch or conn.closed or s.ui is not conn:
         reg._wipe_store(s)
         raise OpError("cancelled")
+    # No automatic move onto the TPM here: that rotation opens every entry, so it waits for
+    # its own button and .manage dialog (op tpm-move). The window is only told it can.
     try:
-        if await reg.run_store(conn.uid, s.store.reseal_if_tpm_available):
-            logger.info("uid %d: keys re-sealed with the TPM", conn.uid)
+        tpm_move = await reg.run_store(conn.uid, s.store.tpm_move_state) == "available"
     except Exception:
-        logger.warning("uid %d: TPM re-seal skipped", conn.uid, exc_info=True)
+        logger.debug("uid %d: TPM state unknown", conn.uid, exc_info=True)
+        tpm_move = False
     if s.epoch != epoch or conn.closed:
         reg._wipe_store(s)
         raise OpError("cancelled")
     reg.open_tier1(s, conn, show_all)
     reply = await _unlocked_reply(reg, s)
+    reply["tpm_move"] = tpm_move
     _sync_after_reply(reg, conn.uid)
     return reply
+
+
+async def op_tpm_move(reg, conn, req):
+    """"Move your keys onto the security chip": the one-time rotation to new keys sealed with
+    host+tpm2 (UserStore.reseal_if_tpm_available), only on a click and behind .manage."""
+    s = _tier1(reg, conn)
+    state = await _store(reg, conn.uid, s.store.tpm_move_state)
+    if state == "pcr-policy":
+        raise OpError("seal-refused", reason="pcr-policy")
+    if state != "available":
+        raise OpError("invalid", field="tpm")
+    if s.busy:
+        raise OpError("busy-sync")
+    epoch = s.epoch
+    await reg.authorize(conn, paths.ACTION_MANAGE, {})
+    _still(s, conn, epoch)
+    if s.busy:
+        raise OpError("busy-sync")
+    s.busy = "edit"
+    try:
+        moved = await _store(reg, conn.uid, s.store.reseal_if_tpm_available)
+    finally:
+        s.busy = None
+    if not moved:
+        # The rotation did not verify, or the TPM refused: nothing changed (logged).
+        raise OpError("seal-unavailable")
+    logger.info("uid %d: keys moved onto the TPM", conn.uid)
+    return {"sealed_with": "host+tpm2"}
 
 
 async def _unlocked_reply(reg, s) -> dict:
@@ -1225,6 +1256,7 @@ HANDLERS = {
     "totp-preview": op_totp_preview, "signin": op_signin, "answer": op_answer,
     "signout": op_signout, "sync": op_sync, "settings": op_settings,
     "migrate-begin": op_migrate_begin, "migrate-abandon": op_migrate_abandon,
+    "tpm-move": op_tpm_move,
     "reset": op_reset, "purge-old-copy": op_purge_old_copy,
     "clip-history-check": op_clip_history_check,
     "redeem": op_redeem, "clip-result": op_clip_result,

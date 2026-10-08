@@ -118,8 +118,17 @@ class FakeStore:
         self.lock_calls += 1
         self.keys = False
 
+    tpm_state = "no-tpm"
+
+    def tpm_move_state(self):
+        return self.tpm_state
+
     def reseal_if_tpm_available(self):
-        return False
+        self.calls.append("reseal")
+        if self.tpm_state != "available" or not self.keys:
+            return False
+        self.tpm_state = "sealed"
+        return True
 
     def _need(self):
         if not self.keys:

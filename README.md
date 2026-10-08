@@ -64,7 +64,7 @@ asks for a password:
 | --- | --- | --- |
 | `io.github.dragosol.pearpasswords.unlock` | Unlock Pear Passwords to show your accounts | Each time you open Pear, and after it locks |
 | `io.github.dragosol.pearpasswords.reveal` | Use the saved password for $(account) | The first reveal, copy, code, notes, history or edit of one account |
-| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | Signing in or out, adding or deleting, moving from 1.x, starting over, deleting the old 1.x copy, checking clipboard history, turning browser autofill on |
+| `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | Signing in or out, adding or deleting, moving from 1.x, starting over, deleting the old 1.x copy, checking clipboard history, turning browser autofill on, moving your keys onto the security chip |
 | `io.github.dragosol.pearpasswords.autofill` | A browser extension asks to fill the password for $(account) on $(origin) | Every browser fill, if you set up autofill |
 
 1. **Opening Pear** asks once. Approving releases the list of accounts: names, sites and
@@ -107,7 +107,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "01a00e4e0c29d7a1f3479921300f74a018a548178797aaa8431374072c5038b5  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "0b0e4fac58c22f71759e3a37b7d3bbd9734d8306aeaecf2b9ca43ae81f9dd7be  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -319,10 +319,12 @@ down, sync says "anisette unavailable" and the list stays as it was.
 Pear seals its two keys with `systemd-creds`: today with the computer's host key, and
 automatically with the TPM as well once one is present (on Intel laptops, "PTT" in the BIOS;
 the firmware must boot in UEFI mode, which exposes the TPM to Linux).
-The next unlock after you turn PTT on moves the vault to **new** keys sealed with the TPM, with
-no action from you: everything is re-encrypted, checked to read back, swapped in at once, and
-the old keys are deleted. No PCRs and no TPM PIN are used, so firmware, bootloader and kernel
-updates never lock you out.
+After you turn PTT on, Settings offers **Move your keys onto the security chip** (one dialog;
+Pear never does it on its own). It moves the vault to **new** keys sealed with the TPM:
+everything is re-encrypted inside Pear's service, checked to read back, swapped in at once, and
+the old keys are deleted. This is the one time Pear's service opens every password at once
+without a dialog per account, which is why it waits for your click. No PCRs and no TPM PIN are
+used, so firmware, bootloader and kernel updates never lock you out.
 
 Pear checks what every new key blob is actually sealed to and accepts only the key types it
 has seen a real TPM produce (systemd 261 and 262: host key, or host key plus TPM). Anything
