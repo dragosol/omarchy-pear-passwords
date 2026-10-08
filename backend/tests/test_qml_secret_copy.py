@@ -366,5 +366,92 @@ Item {{
             self.assertIn(f"PASS   : qmltestrunner::SecretCopy::{t}()", r.stdout)
 
 
+def clip_countdown_block() -> str:
+    """shell.qml's countdown state: the properties, clipOffered/clipDone/clipTick and the Timer."""
+    start = CODE.index("property QtObject clipOwner: null")
+    end = CODE.index("\n", CODE.index("Timer { id: clipTimer;"))
+    return CODE[start:end]
+
+
+class ClipCountdownSourceTests(unittest.TestCase):
+    """The status bar's "Password on clipboard · 27 s" follows pear-clip's own lines."""
+
+    def test_offered_starts_it_and_done_or_exit_ends_it(self):
+        comp = element_of("clipComponent")
+        offered = comp[comp.index('if (m.event === "offered" && !clipProc.failed && !clipProc.offered) {'):]
+        offered = offered[:offered.index("} else if")]
+        self.assertIn("root.clipOffered(clipProc, clipProc.words);", offered)
+        self.assertIn('} else if (m.event === "done") {\n                        root.clipDone(clipProc);', comp)
+        exited = comp[comp.index("onExited: function (code) {"):]
+        self.assertLess(exited.index("root.clipDone(clipProc);"), exited.index("destroy();"))
+        self.assertEqual(CODE.count("root.clipOffered("), 2)          # the process, the preview
+
+    def test_the_item_is_plain_text_and_not_clickable(self):
+        item = element_of("clipCountdown")
+        self.assertIn("textFormat: Text.PlainText", item)
+        self.assertIn('text: root.clipLabel + " on clipboard · " + root.clipLeft + " s"', item)
+        self.assertIn("visible: root.clipLive", item)
+        self.assertNotRegex(item, r"TapHandler|MouseArea|onClicked")
+        self.assertIn("(root.settings.clip_timeout_s || 30) * 1000", function_text("clipOffered"))
+
+
+@unittest.skipUnless(QMLTESTRUNNER, "qmltestrunner (qt6-declarative) not installed")
+class ClipCountdownRuntimeTests(unittest.TestCase):
+    """The countdown's state and status-bar item from shell.qml, run under Qt itself."""
+
+    def qml(self) -> str:
+        return f"""import QtQuick
+import QtQuick.Layouts
+import QtTest
+import "."
+
+Item {{
+    id: root
+    width: 400; height: 40
+    property var settings: ({{ clip_timeout_s: 5 }})
+    {clip_countdown_block()}
+    QtObject {{ id: first }}
+    QtObject {{ id: second }}
+    RowLayout {{
+        Text {element_of("clipCountdown")}
+    }}
+    TestCase {{
+        name: "ClipCountdown"; when: windowShown
+        function test_countdown() {{
+            verify(!clipCountdown.visible);
+            root.clipOffered(first, "Password");
+            verify(clipCountdown.visible);
+            compare(clipCountdown.text, "Password on clipboard · 5 s");
+            tryCompare(clipCountdown, "text", "Password on clipboard · 4 s", 2500);
+            tryCompare(clipCountdown, "text", "Password on clipboard · 3 s", 2500);
+            // A new copy: the old offer's done (behind it) leaves the new countdown alone.
+            root.clipOffered(second, "Selection");
+            compare(clipCountdown.text, "Selection on clipboard · 5 s");
+            root.clipDone(first);
+            verify(clipCountdown.visible);
+            compare(clipCountdown.text, "Selection on clipboard · 5 s");
+            // Its own done ends it.
+            root.clipDone(second);
+            verify(!clipCountdown.visible);
+            verify(!clipTimer.running);
+            // Past the timeout without a done yet: it stays at 0 s until the outcome.
+            root.settings = {{ clip_timeout_s: 1 }};
+            root.clipOffered(first, "Code");
+            tryCompare(clipCountdown, "text", "Code on clipboard · 0 s", 2500);
+            verify(clipCountdown.visible);
+            root.clipDone(first);
+            verify(!clipCountdown.visible);
+        }}
+    }}
+}}
+"""
+
+    def test_the_countdown_runs_and_ends_with_its_own_offer(self):
+        r = run_qml({"tst_clipcountdown.qml": self.qml(), "Theme.qml": THEME,
+                     "qmldir": "singleton Theme 1.0 Theme.qml\n"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PASS   : qmltestrunner::ClipCountdown::test_countdown()", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

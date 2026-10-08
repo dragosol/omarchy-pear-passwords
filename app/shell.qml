@@ -600,9 +600,12 @@ ShellRoot {
                         root.clipFailAt = 0;
                         root.showFlash(clipProc.words + " copied — clears after one paste or "
                                        + (root.settings.clip_timeout_s || 30) + " s");
+                        root.clipOffered(clipProc, clipProc.words);
                     } else if (m.event === "error") {
                         clipProc.fail(typeof m.reason === "string" && m.reason ? m.reason
                                       : "the clipboard didn't take it");
+                    } else if (m.event === "done") {
+                        root.clipDone(clipProc);
                     }
                 }
             }
@@ -617,6 +620,7 @@ ShellRoot {
                 clipProc.fail(clipProc.refusal ? clipProc.refusal
                               : code === 77 ? "the clipboard helper was refused (pear-exec 77)"
                               : "the clipboard helper stopped (exit " + code + ")");
+                root.clipDone(clipProc);
                 destroy();
             }
         }
@@ -628,6 +632,35 @@ ShellRoot {
         root.clipFailAt = Date.now();
         root.showFlash("Couldn't copy — " + reason);
     }
+
+    // The live offer in the status bar, "Password on clipboard · 27 s", from pear-clip's
+    // "offered" until its "done" (pasted, expired, replaced, withdrawn or failed), when the
+    // outcome toast takes over. Only the clip process that offered can end it, so the previous
+    // offer's "done", arriving behind a new copy, leaves the new countdown alone. Not
+    // clickable: the window has no way to withdraw an offer early (a new copy or a lock does,
+    // through the daemon).
+    property QtObject clipOwner: null
+    readonly property bool clipLive: clipOwner !== null
+    property string clipLabel: ""
+    property double clipUntil: 0
+    property int clipLeft: 0
+    function clipOffered(owner, words) {
+        root.clipOwner = owner;
+        root.clipLabel = words;
+        root.clipUntil = Date.now() + (root.settings.clip_timeout_s || 30) * 1000;
+        root.clipTick();
+    }
+    function clipDone(owner) {
+        if (root.clipOwner !== owner) return;
+        root.clipOwner = null;
+        root.clipLabel = "";
+        root.clipUntil = 0;
+        root.clipLeft = 0;
+    }
+    function clipTick() {
+        root.clipLeft = Math.max(0, Math.ceil((root.clipUntil - Date.now()) / 1000));
+    }
+    Timer { id: clipTimer; interval: 250; repeat: true; running: root.clipLive; onTriggered: root.clipTick() }
 
     // The importer: line 1 the ticket, line 2 the options, later only an answer it asks for.
     Process {
@@ -3253,6 +3286,18 @@ ShellRoot {
                             elide: Text.ElideRight
                             opacity: root.appUnlocked || root.flash ? 1 : 0.45
                         }
+                        // The live clipboard offer and how long it stays: "Password on clipboard · 27 s".
+                        Text {
+                            id: clipCountdown
+                            textFormat: Text.PlainText
+                            visible: root.clipLive
+                            Layout.maximumWidth: 260
+                            text: root.clipLabel + " on clipboard · " + root.clipLeft + " s"
+                            color: Theme.accent
+                            font.family: Theme.uiFont
+                            font.pixelSize: Theme.fSmall
+                            elide: Text.ElideRight
+                        }
                         // The one open account and how long it stays open: "GitHub open 1:58".
                         Text {
                             textFormat: Text.PlainText
@@ -5332,6 +5377,11 @@ ShellRoot {
             }
             if (mode === "settings-checked") Qt.callLater(function () { setFlick.contentY = featHead.y - 10; });
             if (mode === "copied") root.showFlash("Password copied — clears after one paste or 30 s");
+            if (mode === "clip-countdown") {
+                root.clipOffered(root, "Password");
+                root.clipUntil -= 3000;
+                root.clipTick();
+            }
         }
         if (root.snapshotPath) snapshotTimer.start();
     }

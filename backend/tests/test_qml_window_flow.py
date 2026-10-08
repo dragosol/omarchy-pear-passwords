@@ -217,10 +217,15 @@ DRIVER = r'''
                 // "copied" only once pear-clip says the clipboard has it.
                 tc.wait(400);
                 check(root.flash.indexOf("copied") === -1, "copied before offered: " + root.flash);
+                check(!clipCountdown.visible, "a countdown before offered");
                 waitFor(function () { return root.flash === "Selection copied — clears after one paste or 30 s"; },
                         10000, "the copied toast after offered (flash: " + root.flash + ")");
+                // The status bar counts the live offer down until pear-clip's "done".
+                check(clipCountdown.visible && /^Selection on clipboard · (30|29) s$/.test(clipCountdown.text),
+                      "no countdown while offered: " + clipCountdown.visible + " " + clipCountdown.text);
                 waitFor(function () { return root.flash.indexOf("Selection pasted") === 0; }, 10000,
                         "the clip event for the selection (flash: " + root.flash + ")");
+                waitFor(function () { return !clipCountdown.visible; }, 3000, "the countdown after done");
                 // The context menu's Copy takes the same way.
                 root.flash = "";
                 edArea.select(9, 14);
