@@ -242,10 +242,29 @@ Tests for the locking rows: `test_logind_lock.py`. Tests for the network row:
 These are run in an Arch VM with swtpm and a nested Hyprland, never on the owner's laptop, and
 their results are recorded here. Each has a decided fallback.
 
-**Status: run on v2 at 380de03** (2026-10, on the build box): a podman Arch container with
+**TPM path re-gated on the current code (v2 at a1fbb64, 2026-10-08)**, in the same Arch VM
+(KVM, OVMF UEFI, swtpm), installed with the real stage and root command as an upgrade over the
+earlier gate install, with **no test patch** to the daemon (the peer fix is in the tree), and
+driven through polkit with the session text agent:
+
+| Step | Result |
+|---|---|
+| Key types, measured with real `systemd-creds` encryptions (systemd 262, and 261.2 by downgrading the VM) | uid scope: host `55b9ed1d…` (both), host+TPM2 `ef4ac136…` (261) and `2a1f877a…` (262). System scope: host `5a1c6a86…`, host+TPM2 `93a89409…` (261) / `14142588…` (262). With a `tpm2-pcr-public-key.pem`: uid scope `adbc4ca3…` (261) / `16e49294…` (262), and those blobs do not decrypt ("PCR signature required"). These are the allowlist in section 2. |
+| No TPM: the 1.x import (passphrase path), two unlocks, grants, reveal, history, code | **Passes.** `keys.json` `sealed_with: host`, both blobs `55b9ed1d…`. |
+| A TPM appears (fresh swtpm): unlock | **Passes.** The unlock reply says `tpm_move: true` and changes nothing (`sealed_with` stays `host`). |
+| **Move your keys onto the security chip** (`tpm-move`, its own `.manage` dialog) | **Passes.** The rotation, including `renameat2(RENAME_EXCHANGE)`, ran inside the hardened unit (MDWE, the syscall filter) in 1.5 s; `sealed_with: host+tpm2`, both blobs `2a1f877a…`; no `u1000.rotate` left; the next unlock, a grant, the revealed password and its history are the same as before the move. |
+| TPM removed | **Passes.** `unlock` gives `tpm-missing`. With the same TPM back, it opens again. |
+| A different (cleared) TPM, no SRK PEM (non-UKI boot) | **Passes.** `unlock` gives `tpm-cleared`; Start over moved `u1000` aside to `u1000.broken-<time>` and made a new store sealed host+TPM2 (`2a1f877a…`). |
+| A TPM and a `tpm2-pcr-public-key.pem`, new store (`migrate-begin`) | **Passes.** After the dialog: `seal-refused`, `reason: pcr-policy`; no key was written. That run also left an empty `u1000/` skeleton, which is fixed since (`test_seal_reseal.py::RefusedCreateTests`). |
+| The same PEM, an existing host-sealed store | **Passes.** The unlock reply says `tpm_move: false`; `tpm-move` answers `seal-refused` (`pcr-policy`) with no dialog; the store stays host-sealed and keeps opening. |
+
+Not run on a real TPM chip (PTT on the owner's laptop): that is the XPS step after this.
+
+**Earlier gate run, v2 at 380de03** (2026-10, on the build box): a podman Arch container with
 systemd as PID 1 for the install path, G1 host key, G2, G3, G4, G5 at `ptrace_scope` 0, G7, G8
 and `systemd-analyze`; an Arch cloud-image VM (KVM, OVMF UEFI, swtpm) for `ptrace_scope` 0, 1
-and 2, the TPM re-seal, `tpm-missing`, `tpm-cleared` and autofill. As shipped at 380de03 every
+and 2, the TPM re-seal (the automatic re-wrap of that code, since replaced by the rotation above),
+`tpm-missing`, `tpm-cleared` and autofill. As shipped at 380de03 every
 connection was refused (the peer liveness check used signal 0, which is EPERM for another
 uid's process); the gates below ran with that one line patched in the test environment, and
 the fix is now in the tree (`test_daemon_peer.py`). Real Hyprland could not run headless there
@@ -256,7 +275,7 @@ XWayland paste, the clipboard under load, G6, and a real browser extension.
 
 | Gate | What | Result | Fallback | How the fallback is switched on |
 |---|---|---|---|---|
-| G1 | `systemd-creds --user` from uid `pear-passwords` inside the hardened unit | **Passes** with the host key: round trip, wrong `--name` refused, tampered blob refused. swtpm with **UEFI** (OVMF): `has-tpm2` yes and the first unlock moved to TPM-sealed keys; under legacy BIOS (SeaBIOS) `has-tpm2` reports `-firmware` and Pear stays host-sealed, so the TPM path needs UEFI with TCG2. `tpm-missing` passes. `tpm-cleared` **failed** at 380de03 (reported `damaged`: the SRK PEM exists only on measured UKI boots); fixed since, see section 2. The fallback also passes (bonus run). | root's `pear-passwords-seal.socket` (Accept=yes) runs system-scope `systemd-creds` for the daemon, one request per connection, only for the daemon's uid and `pear.(list\|secret).u<uid>` names (`icp.vstore.seal_service`) | an active `Environment=PEAR_SEAL_BACKEND=seal-service` line in the shipped `pear-passwordsd.service`; `install-root.sh` then enables the seal socket (installed, never enabled, otherwise) |
+| G1 | `systemd-creds --user` from uid `pear-passwords` inside the hardened unit | **Passes** with the host key: round trip, wrong `--name` refused, tampered blob refused. **TPM path: passes on the current code** (the round-1 table above): the move onto the TPM behind its own dialog, `tpm-missing`, `tpm-cleared` without an SRK PEM, and the PEM refusal. It needs UEFI: under legacy BIOS (SeaBIOS) `has-tpm2` reports `-firmware` and Pear stays host-sealed. (At 380de03, `tpm-cleared` failed and the re-seal was a re-wrap; both were replaced, and this row's earlier TPM result no longer applies.) The fallback also passed (bonus run, 380de03). | root's `pear-passwords-seal.socket` (Accept=yes) runs system-scope `systemd-creds` for the daemon, one request per connection, only for the daemon's uid and `pear.(list\|secret).u<uid>` names (`icp.vstore.seal_service`) | an active `Environment=PEAR_SEAL_BACKEND=seal-service` line in the shipped `pear-passwordsd.service`; `install-root.sh` then enables the seal socket (installed, never enabled, otherwise) |
 | G2 | polkit accepts a pidfd `unix-process` subject; `$(account)` shows | **Passes** (with the liveness fix): the owner annotation is what lets uid `pear-passwords` check other users' subjects (`nobody` gets `NotAuthorized`); the dialog showed `Use the saved password for Work GitHub — dev@example.test`; grants are per entry; a seatless session and a process with no session are denied with no dialog. | `{pid, start-time, uid}`, fixed message | `Environment=PEAR_POLKIT_SUBJECT=pid-start-time` in the shipped unit |
 | G3 | Quickshell starts with egid != rgid under AT_SECURE | **Passes** (sway build): Quickshell ran with `Gid: 1000 969 969 969`, passed the daemon's peer checks, unlocked through polkit and drew the list. Labels and background did not draw in the container either with or without set-gid (no theme there); to be checked visually on the XPS. | redesign the identity step | none: no release without one of the two |
 | G4 | Quickshell with empty XDG homes and no disk cache; what it opens under `$HOME` | **Passes, with residue now documented** (section 1): QML only from `$P/app` and `/usr/share/omarchy`; under `$HOME`: `~/.drirc` (Mesa), Omarchy's theme and toggle files, and the `hyprctl`/`fc-match` children; Quickshell's runtime directory lets the same user `qs kill` the window; `qs ipc show` is empty and its log holds no account data. | allowlist the residue | docs only (and pinned by `test_qml_process_allowlist.py`) |

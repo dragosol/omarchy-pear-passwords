@@ -343,6 +343,11 @@ else is refused and nothing is saved:
 - **A key type Pear does not know** (a future systemd that changes them): the same refusal,
   with its own message, until Pear is updated.
 
+All of this was checked on the current code in a test VM with a software TPM (UEFI, systemd
+262; the key types also on 261): the move onto the chip, a removed chip ("turn it back on"),
+a cleared chip (Start over), and both PEM cases. It has not yet run on a real laptop's PTT.
+Details: [docs/security.md](docs/security.md), section 8.
+
 **What turning PTT on buys:** a copy of the whole disk, or a backup of `/`, taken after the
 switch can no longer decrypt your passwords on another machine. Without it, the host key is in
 that same image. A backup taken **before** the switch still decrypts what was in the vault at

@@ -252,6 +252,22 @@ class ReviewedResidualsInDocsTests(unittest.TestCase):
         actual = len(_read("native", "pear-exec.c").splitlines())
         self.assertLess(abs(claimed - actual) / actual, 0.1, (claimed, actual))
 
+    def test_tpm_results_are_the_current_codes(self):
+        # audit: section 8 and the README TPM section described the 380de03 run, whose
+        # re-wrap and tpm-cleared code were replaced since.
+        gates = _section(self.security, "8. Verification gates (VM, before release)")
+        self.assertIn("TPM path re-gated on the current code", gates)
+        self.assertLess(gates.index("re-gated on the current code"), gates.index("380de03"))
+        self.assertNotIn("the first unlock moved to TPM-sealed keys", gates)
+        for kid in ("55b9ed1d", "ef4ac136", "2a1f877a", "93a89409", "14142588"):
+            self.assertIn(kid, gates)
+            self.assertIn(kid, _read("backend", "icp", "vstore", "seal.py"))
+        tpm = _section(self.readme, "TPM (the security chip)")
+        self.assertIn("checked on the current code in a test VM with a software TPM", tpm)
+        self.assertIn("not yet run on a real laptop's PTT", tpm)
+        self.assertNotIn("Pear then keeps host sealing rather than risk that", self.readme)
+        self.assertNotIn("The next unlock after you turn PTT on", self.readme)
+
     def test_ptt_is_not_claimed_to_protect_old_backups(self):
         # crypto-ptt-reseal-does-not-rotate-keys
         self.assertNotIn("With PTT on they are useless without this computer's TPM", self.readme)
