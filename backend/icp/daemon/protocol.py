@@ -60,10 +60,15 @@ DAEMON_IDLE_EXIT_S = 60
 DETAIL_MAX_CHARS = 64                # polkit details values, after sanitizing
 BAD_TICKETS_PER_MIN = 5              # per uid, then that uid's clip/migrate hellos are refused
 
+# How the window opens: "floating" (960x640, centred) or "regular" (tiled like other apps).
+WINDOW_MODES = ("floating", "regular")
+WINDOW_MODE_DEFAULT = "floating"
+
 DEFAULT_SETTINGS = {
     "grant_s": GRANT_S_DEFAULT,
     "idle_lock_s": IDLE_LOCK_S_DEFAULT,
     "clip_timeout_s": CLIP_TIMEOUT_S_DEFAULT,
+    "window_mode": WINDOW_MODE_DEFAULT,
 }
 
 # --- migration -------------------------------------------------------------------------------

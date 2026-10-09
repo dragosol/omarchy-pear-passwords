@@ -708,8 +708,8 @@ def test_create_needs_a_site_or_a_name_and_a_password(edit_env):
     assert e.value.field == "password" and edit_env["opened"] == 0
 
 
-def test_delete_is_refused_before_any_network_while_unverified(edit_env):
-    assert push.RECORD_DELETE_VERIFIED is False
+def test_delete_is_refused_before_any_network_while_switched_off(monkeypatch, edit_env):
+    monkeypatch.setattr(push, "RECORD_DELETE_VERIFIED", False)
     c = _cred()
     store = FakeStore(session=JOINED, metas=[_meta_for(c)])
     with pytest.raises(push.DeleteUnavailable):

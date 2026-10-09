@@ -857,6 +857,9 @@ async def op_delete(reg, conn, req):
     # username, so a delete would remove the LIVE login. Refused before any dialog.
     if getattr(meta, "recently_deleted", False) or getattr(meta, "kind", "login") == "passkey":
         raise OpError("invalid", field="id")
+    # A Wi-Fi network lives in the WiFi zone, which delete_entry does not touch.
+    if (getattr(meta, "domain", "") or "") == "AirPort":
+        raise OpError("invalid", field="id")
     if s.busy:
         raise OpError("busy-sync")
     epoch = s.epoch

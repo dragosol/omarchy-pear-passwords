@@ -178,6 +178,8 @@ def validate_features(d) -> dict:
 
 
 def setting_ok(key: str, value) -> bool:
+    if key == "window_mode":
+        return isinstance(value, str) and value in protocol.WINDOW_MODES
     if isinstance(value, bool) or not isinstance(value, int):
         return False
     if key == "grant_s":

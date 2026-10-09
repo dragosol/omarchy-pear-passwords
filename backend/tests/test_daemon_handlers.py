@@ -37,7 +37,8 @@ class HelloAndUnlockTests(Base):
                                  "state": "locked", "signed_in": True, "sealed_with": "host",
                                  "synced_at": None, "needs_login": None,
                                  "settings": {"grant_s": 120, "idle_lock_s": 0,
-                                              "clip_timeout_s": 30},
+                                              "clip_timeout_s": 30,
+                                              "window_mode": "floating"},
                                  "migration_pending": False,
                                  "autofill": {"enabled": False, "hosts": 0},
                                  "old_copy": None})
@@ -557,10 +558,14 @@ class EditTests(Base):
 
     async def test_settings(self):
         r = await self.ui.call("settings", set={"grant_s": 60, "clip_timeout_s": 5})
-        self.assertEqual(r["settings"], {"grant_s": 60, "idle_lock_s": 0, "clip_timeout_s": 5})
+        self.assertEqual(r["settings"], {"grant_s": 60, "idle_lock_s": 0, "clip_timeout_s": 5,
+                                         "window_mode": "floating"})
+        r = await self.ui.call("settings", set={"window_mode": "regular"})
+        self.assertEqual(r["settings"]["window_mode"], "regular")
         self.assertEqual(self.st.settings["grant_s"], 60)
         for bad in ({"grant_s": 601}, {"idle_lock_s": 60}, {"clip_timeout_s": 4},
-                    {"grant_s": True}, {"sync_lease_h": 2}, {"grant_s": 10, "x": 1}):
+                    {"grant_s": True}, {"sync_lease_h": 2}, {"grant_s": 10, "x": 1},
+                    {"window_mode": "tiled"}, {"window_mode": 1}, {"window_mode": ""}):
             r = await self.ui.call("settings", set=bad)
             self.assertEqual(r["error"], "invalid", bad)
         self.assertEqual((await self.ui.call("settings", get=True))["settings"]["grant_s"], 60)
@@ -856,6 +861,18 @@ class FeatureFlagTests(Base):
         self.assertNotIn("delete", [c[0] for c in self.h.apple.calls])
         self.assertEqual(await self.ui.call("delete", id="e.1"),
                          {"rid": self.ui.rid, "deleted": True})
+
+    async def test_delete_refuses_a_wifi_network_before_any_dialog(self):
+        # Wi-Fi lives in the WiFi zone, which delete_entry never touches: refused up front.
+        from daemon_fakes import meta as make_meta, secrets as make_secrets
+        self.st.metas["wf"] = make_meta("wf", title="Home", domain="AirPort", username="Home")
+        self.st.secrets["wf"] = make_secrets()
+        await self.h.unlock(self.ui)
+        before = self.dialogs()
+        r = await self.ui.call("delete", id="wf")
+        self.assertEqual((r["error"], r["field"]), ("invalid", "id"))
+        self.assertEqual(self.dialogs(), before)
+        self.assertNotIn("delete", [c[0] for c in self.h.apple.calls])
 
     async def test_hidden_rows_are_never_offered_to_autofill(self):
         from icp.daemon import autofill

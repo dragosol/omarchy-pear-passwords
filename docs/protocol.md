@@ -87,7 +87,7 @@ Replies:
 ```json
 {"rid":0,"proto":2,"version":"2.0.0","state":"locked","signed_in":true,
  "sealed_with":"host","synced_at":null,"needs_login":null,
- "settings":{"grant_s":120,"idle_lock_s":0,"clip_timeout_s":30},
+ "settings":{"grant_s":120,"idle_lock_s":0,"clip_timeout_s":30,"window_mode":"floating"},
  "migration_pending":false,"autofill":{"enabled":false,"hosts":0},
  "old_copy":{"dir":"/home/u/.config/icp.v1-backup-20261008","migrated_at":1791450000.0}}
 ```
@@ -189,7 +189,7 @@ with `state` one of `locked`, `unlocked`, `unavailable` only. `unavailable` cove
 ### 3.2 Settings
 
 ```json
-{"grant_s":120,"idle_lock_s":0,"clip_timeout_s":30}
+{"grant_s":120,"idle_lock_s":0,"clip_timeout_s":30,"window_mode":"floating"}
 ```
 
 | key | default | allowed |
@@ -197,6 +197,7 @@ with `state` one of `locked`, `unlocked`, `unavailable` only. `unavailable` cove
 | `grant_s` | 120 | integer 0..600; 0 = a grant is used up by its first use |
 | `idle_lock_s` | 0 (off) | 0, 300, 900, 1800 |
 | `clip_timeout_s` | 30 | integer 5..60 |
+| `window_mode` | `"floating"` | `"floating"` (960x640, centred) or `"regular"` (tiled like other windows); read from the hello reply before the window maps |
 
 There is no `sync_lease_h`: 2.0 has no sync lease. A `set` naming any other key is
 `{"error":"invalid","field":"<key>"}` and nothing is changed.

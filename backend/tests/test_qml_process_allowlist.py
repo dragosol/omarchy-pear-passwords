@@ -18,6 +18,7 @@ ALLOWED = {
     '[root.pearExec, "clip"]',
     '[root.pearExec, "migrate"]',
     '["/usr/bin/hyprctl", "eval", root.windowRulesLua]',
+    '["/usr/bin/hyprctl", "eval", root.windowModeLua]',
     '["/usr/bin/hyprctl", "dispatch", root.focusLua]',
     '["/usr/bin/hyprctl", "dispatch", opener.lua]',
     '["/usr/bin/python3", "-I", root.touchWatchPath]',
@@ -78,6 +79,15 @@ class AllowlistTests(unittest.TestCase):
         # once-per-session global another program could set first.
         self.assertLess(rules.index("no_screen_share = true"), rules.index("if not _G."))
         self.assertIn(f"^{paths.WINDOW_TITLE}$", rules)
+        # "Open as": the only thing that varies is a literal true/false from a boolean, and the
+        # open handler acts on Pear's window alone.
+        for name in ("windowRulesLua", "windowModeLua"):
+            body = re.search(r"readonly property string " + name + r":(.*?)\n\s*readonly", code,
+                             re.S).group(1)
+            outside = re.sub(r'"(?:[^"\\]|\\.)*"', '""', body)
+            self.assertEqual(set(re.findall(r"root\.\w+", outside)), {"root.windowFloating"}, name)
+        self.assertIn('if w.class ~= [[org.quickshell]] or w.title ~= [[Pear Passwords]] then return end',
+                      rules.replace('" + "', "").replace('"\n        + "', ""))
         self.assertIn(f'title: "{paths.WINDOW_TITLE}"', code)
         self.assertEqual(property_value(code, "focusLua"),
                          f'hl.dsp.focus({{ window = "title:^{paths.WINDOW_TITLE}$" }})')

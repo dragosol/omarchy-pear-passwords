@@ -541,7 +541,8 @@ class SettingsTests(StoreCase):
     def test_defaults_and_overlay_work_while_locked(self):
         s = vstore.UserStore.open(UID)
         self.assertEqual(s.load_settings(),
-                         {"grant_s": 120, "idle_lock_s": 0, "clip_timeout_s": 30})
+                         {"grant_s": 120, "idle_lock_s": 0, "clip_timeout_s": 30,
+                          "window_mode": "floating"})
         s.save_settings({"grant_s": 60, "idle_lock_s": 300, "clip_timeout_s": 30})
         self.assertEqual(s.load_settings()["grant_s"], 60)
         self.assertEqual(stat.S_IMODE((self.udir / "state.json").stat().st_mode), 0o600)

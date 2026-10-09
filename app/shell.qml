@@ -51,16 +51,33 @@ ShellRoot {
     // until Pear starts again). It keeps the window out of screen sharing and most capture
     // tools; it is best effort, a revealed password can still be photographed, and a program
     // that controls Hyprland can remove it (README, "What a program running as you can do").
-    readonly property string windowRulesLua: "hl.window_rule({ match = { class = [[^org\\.quickshell$]], "
+    // Floating or regular is the "Open as" setting: a global the open handler reads, set on
+    // every launch before the window maps. The handler is registered once per Hyprland
+    // session; a regular window also undoes an older session's float rule.
+    readonly property bool windowFloating: root.settings.window_mode !== "regular"
+    readonly property string windowRulesLua: "_G.__pear_passwords_float = "
+        + (root.windowFloating ? "true " : "false ")
+        + "hl.window_rule({ match = { class = [[^org\\.quickshell$]], "
         + "title = [[^Pear Passwords$]] }, no_screen_share = true }) "
-        + "if not _G.__pear_passwords_rules_v2 then "
+        + "if not _G.__pear_passwords_rules_v3 then "
         + "local m = { class = [[^org\\.quickshell$]], title = [[^Pear Passwords$]] } "
         + "hl.window_rule({ match = m, tag = [[-default-opacity]] }) "
         + "hl.window_rule({ match = m, opacity = [[1 override 1 override]] }) "
-        + "hl.window_rule({ match = m, float = true }) "
-        + "hl.window_rule({ match = m, size = [[960 640]] }) "
-        + "hl.window_rule({ match = m, center = true }) "
-        + "_G.__pear_passwords_rules_v2 = true end"
+        + "hl.on([[window.open]], function(w) "
+        + "if w.class ~= [[org.quickshell]] or w.title ~= [[Pear Passwords]] then return end "
+        + "if _G.__pear_passwords_float == false then "
+        + "hl.dispatch(hl.dsp.window.float({ action = [[unset]], window = w })) "
+        + "else "
+        + "hl.dispatch(hl.dsp.window.float({ action = [[set]], window = w })) "
+        + "hl.dispatch(hl.dsp.window.center({ window = w })) "
+        + "end end) "
+        + "_G.__pear_passwords_rules_v3 = true end"
+    // The same choice for the window that is already open, when it changes in Settings.
+    readonly property string windowModeLua: "_G.__pear_passwords_float = "
+        + (root.windowFloating
+           ? "true hl.dispatch(hl.dsp.window.float({ action = [[set]], window = [[title:^Pear Passwords$]] })) "
+             + "hl.dispatch(hl.dsp.window.center({ window = [[title:^Pear Passwords$]] }))"
+           : "false hl.dispatch(hl.dsp.window.float({ action = [[unset]], window = [[title:^Pear Passwords$]] }))")
     readonly property string focusLua: "hl.dsp.focus({ window = \"title:^Pear Passwords$\" })"
     // What a site may look like before it is handed to Hyprland to open: a lowercase host of
     // two or more labels, an optional port and a plain path. Nothing that could end the Lua
@@ -87,7 +104,7 @@ ShellRoot {
     // Never automatic - it opens every entry inside the daemon - so it waits for a click.
     property bool tpmMove: false
     property bool tpmMoving: false
-    property var settings: ({ grant_s: 120, idle_lock_s: 0, clip_timeout_s: 30 })
+    property var settings: ({ grant_s: 120, idle_lock_s: 0, clip_timeout_s: 30, window_mode: "floating" })
     // Browser autofill: off until turned on here (one .manage dialog); how many hosts are on.
     property bool autofillEnabled: false
     property int autofillHosts: 0
@@ -166,6 +183,12 @@ ShellRoot {
     property string flash: ""
     property bool busy: false
     property bool confirming: false
+    // Delete: said in full in the window first, then the daemon's .manage dialog (fingerprint).
+    property bool deleteConfirm: false
+    property bool deleting: false
+    readonly property bool canDelete: !!root.selected && root.appUnlocked
+        && !root.selected.recently_deleted && root.selected.kind !== "passkey"
+        && !root.selected.is_wifi
     property bool generateNew: false
     property bool renaming: false
     property bool changing: false
@@ -316,6 +339,7 @@ ShellRoot {
         root.signedIn = !!m.signed_in;
         root.sealedWith = m.sealed_with || "";
         if (m.settings) root.settings = m.settings;
+        root.startWindowRules();
         root.autofillEnabled = !!(m.autofill && m.autofill.enabled);
         root.autofillHosts = (m.autofill && m.autofill.hosts) || 0;
         root.oldCopy = m.old_copy || null;
@@ -493,11 +517,27 @@ ShellRoot {
     }
 
     // ---------------------------------------------------------------- Hyprland
+    property bool rulesStarted: false
+    function startWindowRules() {
+        if (root.rulesStarted || root.previewMode) return;
+        root.rulesStarted = true;
+        rulesProc.running = true;
+    }
     Process {
         id: rulesProc
-        running: !root.previewMode
+        running: false
         command: ["/usr/bin/hyprctl", "eval", root.windowRulesLua]
         onExited: root.windowReady = true
+    }
+    Timer {
+        // No hello yet (the service is starting): open with the default rather than wait.
+        interval: 700; running: !root.rulesStarted && !root.previewMode
+        onTriggered: root.startWindowRules()
+    }
+    Process {
+        id: windowModeProc
+        running: false
+        command: ["/usr/bin/hyprctl", "eval", root.windowModeLua]
     }
     Timer {
         // Without Hyprland (or a hung hyprctl) the window must still appear.
@@ -936,6 +976,7 @@ ShellRoot {
         root.notesText = ""; root.notesLoaded = false;
         root.confirming = false; root.changing = false; root.generateNew = false;
         root.renaming = false;
+        if (!root.deleting) root.deleteConfirm = false;
         if (root.editorOpen && root.editorMode !== "create") root.editorOpen = false;
         newPw.text = "";
         root.tagEditing = false; root.tagBusy = false; root.tagDraft = []; root.tagError = "";
@@ -1125,6 +1166,29 @@ ShellRoot {
 
     // The new password is either typed here or generated by the daemon; a generated one never
     // comes to this window unless you reveal it afterwards.
+    // Deletes the selected entry from iCloud Keychain, everywhere. Only after the inline
+    // confirmation; the daemon then raises its own dialog (fingerprint or password).
+    function deleteSelected() {
+        if (!root.canDelete || !root.deleteConfirm || root.deleting) return;
+        const id = root.selectedId;
+        const name = root.selected.primary;
+        root.deleting = true;
+        root.send("delete", { id: id }, function (d) {
+            root.deleting = false;
+            if (d.error) {
+                // Dismissing the dialog keeps the question up; anything else says why.
+                if (d.error !== "dismissed" && d.error !== "cancelled") {
+                    root.deleteConfirm = false;
+                    root.showFlash(root.errorWords(d));
+                }
+                return;
+            }
+            root.deleteConfirm = false;
+            if (root.selectedId === id) root.selectedId = "";
+            root.showFlash("Deleted " + name + " from iCloud Keychain");
+        });
+    }
+
     function commitChange() {
         const pw = newPw.text;
         const gen = root.generateNew;
@@ -1359,6 +1423,7 @@ ShellRoot {
         root.send("settings", { set: s }, function (d) {
             if (d.error) { root.showFlash("Couldn't change that setting"); return; }
             root.settings = d.settings;
+            if (key === "window_mode" && !root.previewMode) windowModeProc.running = true;
         });
     }
 
@@ -3257,6 +3322,50 @@ ShellRoot {
                                 }
                             }
                             }
+
+                            // ---- delete: the whole consequence in words, then the dialog
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                Layout.topMargin: 14
+                                spacing: 10
+                                visible: root.canDelete && !root.tagEditing
+                                Text {
+                                    textFormat: Text.PlainText
+                                    visible: !root.deleteConfirm
+                                    text: "Delete…"
+                                    color: hDelete.hovered ? Theme.danger : Theme.dim
+                                    font.family: Theme.uiFont
+                                    font.pixelSize: Theme.fSmall
+                                    HoverHandler { id: hDelete; cursorShape: Qt.PointingHandCursor }
+                                    TapHandler { onTapped: root.deleteConfirm = true }
+                                }
+                                Text {
+                                    textFormat: Text.PlainText
+                                    visible: root.deleteConfirm
+                                    Layout.fillWidth: true
+                                    wrapMode: Text.WordWrap
+                                    text: "Delete " + (root.selected ? root.selected.primary : "")
+                                          + " from iCloud Keychain on all your devices? Its password history goes"
+                                          + " with it, and it won't be in Recently Deleted on your Apple devices."
+                                    color: Theme.fg
+                                    font.family: Theme.uiFont
+                                    font.pixelSize: Theme.fSmall
+                                }
+                                RowLayout {
+                                    visible: root.deleteConfirm
+                                    spacing: 8
+                                    AppButton {
+                                        text: root.deleting ? "Deleting…" : "Delete"
+                                        enabled: !root.deleting
+                                        onClicked: root.deleteSelected()
+                                    }
+                                    AppButton {
+                                        text: "Cancel"
+                                        enabled: !root.deleting
+                                        onClicked: root.deleteConfirm = false
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -4863,7 +4972,9 @@ ShellRoot {
                             { key: "idle_lock_s", label: "Lock when not used for",
                               choices: [[0, "never"], [300, "5 min"], [900, "15 min"], [1800, "30 min"]] },
                             { key: "clip_timeout_s", label: "A copied password clears after one paste or",
-                              choices: [[10, "10 s"], [15, "15 s"], [30, "30 s"], [45, "45 s"], [60, "60 s"]] }
+                              choices: [[10, "10 s"], [15, "15 s"], [30, "30 s"], [45, "45 s"], [60, "60 s"]] },
+                            { key: "window_mode", label: "Open as",
+                              choices: [["floating", "floating window"], ["regular", "regular window"]] }
                         ]
                         delegate: ColumnLayout {
                             required property var modelData

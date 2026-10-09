@@ -132,7 +132,8 @@ def test_rename_goes_to_the_metadata_record_or_reports_it_cannot(zone):
     assert md.title(md.parse(plist["v_Data"])) == "Work"
 
 
-def test_delete_sends_nothing_while_unverified(zone):
+def test_delete_sends_nothing_while_switched_off(monkeypatch, zone):
+    monkeypatch.setattr(push, "RECORD_DELETE_VERIFIED", False)
     with pytest.raises(push.DeleteUnavailable):
         push.delete_entry(zone, "has-meta.example", "alex")
     assert zone.client.transport.performed == [] and zone.saved == []

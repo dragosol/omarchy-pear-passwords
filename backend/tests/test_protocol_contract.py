@@ -144,7 +144,9 @@ class ProtocolValueTests(unittest.TestCase):
         self.assertEqual(protocol.IDLE_LOCK_S_DEFAULT, 0)
         self.assertEqual(protocol.TICKET_TTL_S, 10)
         self.assertEqual(protocol.DEFAULT_SETTINGS,
-                         {"grant_s": 120, "idle_lock_s": 0, "clip_timeout_s": 30})
+                         {"grant_s": 120, "idle_lock_s": 0, "clip_timeout_s": 30,
+                          "window_mode": "floating"})
+        self.assertEqual(protocol.WINDOW_MODES, ("floating", "regular"))
         lo, hi = protocol.CLIP_TIMEOUT_S_RANGE
         self.assertTrue(lo <= protocol.CLIP_TIMEOUT_S_DEFAULT <= hi)
         lo, hi = protocol.GRANT_S_RANGE
