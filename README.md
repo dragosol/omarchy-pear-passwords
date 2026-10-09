@@ -27,7 +27,8 @@ Omarchy's own shell components.
 - **Add passwords.** **+ New** saves a login to iCloud, with a generated password if you want
   one, and optional notes and verification code.
 - **Edit what Apple stores.** Extra websites, notes and verification codes. Set up a code by
-  pasting the setup key or link, and see the live code before you save.
+  pasting the setup key or link, or scan the QR code straight off your screen, and see the
+  live code before you save.
 - **Password history.** Changes seen during sync are kept, alongside the history Apple stores.
 - **Change a password, one at a time.** Writes back to iCloud, so your other devices get it.
   Each change is written and read back on its own; nothing rewrites your passwords in bulk.
@@ -116,7 +117,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "ad120d5f8b24f7fb9e025f73dee49249a03d0b8454a3c969fdb5da9310bfadc0  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "c9933a29524e90155caa7864391f680f340b31589dbcd7af6bfe4d89326715c4  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -154,7 +155,8 @@ policy declaring Pear's actions, a `pear-client` group with members) it changes 
 lists what to move. It removes the 1.x polkit action only if it is byte-for-byte a copy 1.x
 handed out. It never runs pacman; it needs `gcc` to compile `pear-exec`.
 
-Requires `python3`, `podman`, `quickshell`, `gcc` and Omarchy's shell. After
+Requires `python3`, `podman`, `quickshell`, `gcc` and Omarchy's shell; scanning a QR code also
+uses `grim`, `slurp` and `zbar` (Omarchy has them). After
 `omarchy plugin update`, run `./install.sh` again and then the command it prints. The same
 command upgrades in place and never touches your vault. A Python minor upgrade (3.14 to 3.15)
 makes the service stop with a message in the window: re-run the same two steps.

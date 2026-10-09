@@ -51,9 +51,14 @@ a locked computer does not sync.
   neither the primary selection nor a text-input protocol (`QT_WAYLAND_DISABLED_INTERFACES`
   from pear-exec, so there is no input method for CJK text either), keeps every field that
   holds a secret (notes, setup keys, typed and new passwords, the 1.x passphrase, the Apple
-  password, the verification code) off the clipboard (Ctrl+C, Ctrl+X and the context menu do
-  nothing there; a copy goes only through pear-clip), and starts only a fixed list of
-  programs. **It is not on the accessibility bus.** Qt starts its AT-SPI bridge from the
+  password, the verification code) off the regular clipboard (Ctrl+C and the context menu's
+  Copy go through pear-clip, one paste or 30 s; Ctrl+X does nothing; the Apple password, the
+  2FA code and the 1.x passphrase copy nothing at all), and starts only a fixed list of
+  programs. One of them is the QR scanner (app/qr_scan.py, root-owned): only when you press
+  Scan QR code, it runs slurp for the area you drag, grim for just that area into an anonymous
+  memory file (never a file on disk) and zbarimg on it, and hands back only what the code
+  holds, into the setup-key field. Tests: `test_qr_scan.py`,
+  `test_qml_process_allowlist.py`. **It is not on the accessibility bus.** Qt starts its AT-SPI bridge from the
   session bus, and any program of yours can switch `org.a11y.Status IsEnabled` on there (no
   privilege needed, even after the window has started); every field and label of the window,
   revealed passwords included, could then be read over AT-SPI and its buttons pressed through

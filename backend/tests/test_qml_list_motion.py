@@ -40,7 +40,7 @@ class ListMotionTests(unittest.TestCase):
 class TypeToSearchTests(unittest.TestCase):
     def test_it_is_the_windows_last_key_branch(self):
         self.assertIn("} else if (root.typeToSearch(ev)) {", CODE)
-        self.assertIn("HoverHandler { id: listHover }", CODE)
+        self.assertIn("id: listHover", CODE)
 
     def test_only_over_the_list_and_never_over_an_open_editor(self):
         body = function_text("typeToSearch")
@@ -53,3 +53,14 @@ class TypeToSearchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchFollowsPointerTests(unittest.TestCase):
+    def test_the_pointer_over_the_list_hands_the_keyboard_to_search(self):
+        self.assertIn("onHoveredChanged: if (hovered) root.searchFollowsPointer()", CODE)
+        self.assertIn("onPointChanged: root.searchFollowsPointer()", CODE)
+        body = function_text("searchFollowsPointer")
+        for guard in ("!listHover.hovered", "search.activeFocus", "root.editorOpen",
+                      "root.settingsOpen", "root.tagEditing", "root.deleteConfirm"):
+            self.assertIn(guard, body)
+        self.assertLess(body.index("return;"), body.index("search.forceActiveFocus();"))

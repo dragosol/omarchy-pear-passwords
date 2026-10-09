@@ -39,6 +39,8 @@ ShellRoot {
     readonly property string pearExec: "/usr/local/lib/pear-passwords/libexec/pear-exec"
     readonly property string touchWatchPath: decodeURIComponent(
         Qt.resolvedUrl("touch_watch.py").toString().replace(/^file:\/\//, ""))
+    readonly property string qrScanPath: decodeURIComponent(
+        Qt.resolvedUrl("qr_scan.py").toString().replace(/^file:\/\//, ""))
     readonly property string home: Quickshell.env("HOME")
     // pear-exec points XDG_CONFIG_HOME and XDG_STATE_HOME at an empty directory, so the two
     // files of yours this window looks at are named from HOME, exactly where 1.x and Omarchy
@@ -556,6 +558,37 @@ ShellRoot {
         property string lua: ""
         running: false
         command: ["/usr/bin/hyprctl", "dispatch", opener.lua]
+    }
+
+    // ---------------------------------------------------------------- QR scan
+    // "Scan QR code" next to a setup-key field: you drag over the code, qr_scan.py reads it
+    // (slurp, grim into memory, zbarimg) and only what the code holds comes back, into the
+    // field you would otherwise paste into.
+    property bool qrScanning: false
+    property var qrTarget: null
+    function scanQr(field) {
+        if (root.qrScanning || !field) return;
+        root.qrTarget = field;
+        root.qrScanning = true;
+        qrProc.running = true;
+    }
+    Process {
+        id: qrProc
+        running: false
+        command: ["/usr/bin/python3", "-I", root.qrScanPath]
+        stdout: SplitParser {
+            onRead: function (line) {
+                let m = null;
+                try { m = JSON.parse(line); } catch (e) { return; }
+                if (m && m.ok === true && typeof m.text === "string" && root.qrTarget)
+                    root.qrTarget.text = m.text;
+                else if (m && m.reason === "no-code")
+                    root.showFlash("No QR code in that area — try again, around the whole code");
+                else if (m && m.reason === "failed")
+                    root.showFlash("Couldn't read the screen for a QR code");
+            }
+        }
+        onExited: { root.qrScanning = false; root.qrTarget = null; }
     }
 
     // ---------------------------------------------------------------- clocks
@@ -2014,6 +2047,14 @@ ShellRoot {
         root.detailIndex = at === undefined ? 0 : Math.max(0, Math.min(at, root.panelStops() - 1));
         detailKeys.forceActiveFocus();
     }
+    function searchFollowsPointer() {
+        if (!listHover.hovered || search.activeFocus || !root.appUnlocked) return;
+        if (root.editorOpen || root.settingsOpen || root.tagEditing || root.renaming
+                || root.confirming || root.deleteConfirm) return;
+        root.panelFocus = false;
+        search.forceActiveFocus();
+    }
+
     // A key nobody else took, with the pointer over the search field or the list: it continues
     // the search. Only printable text and Backspace, never with Ctrl/Alt/Super, and never while
     // an editor, Settings or a question is open.
@@ -2218,7 +2259,13 @@ ShellRoot {
                         spacing: 0
                         // Typing while the pointer is over the search field or the list goes into
                         // the search field, wherever the keyboard focus was (the window's Keys).
-                        HoverHandler { id: listHover }
+                        HoverHandler {
+                            id: listHover
+                            // The pointer moving over the search field or the list hands the keyboard
+                            // to the search field, so whatever had it before, typing lands there.
+                            onHoveredChanged: if (hovered) root.searchFollowsPointer()
+                            onPointChanged: root.searchFollowsPointer()
+                        }
 
                         Rectangle {
                             Layout.fillWidth: true
@@ -3664,7 +3711,7 @@ ShellRoot {
                         Layout.topMargin: 6
                         visible: text !== ""
                         text: root.editorMode === "create" ? "Saved to your iCloud Keychain, so it reaches your other devices."
-                            : root.editorMode === "totp" ? "Paste the setup key or otpauth:// link from the site's two-factor settings."
+                            : root.editorMode === "totp" ? "Paste the setup key or otpauth:// link from the site's two-factor settings, or scan its QR code."
                             : root.selected ? root.selected.primary : ""
                         color: Theme.dim
                         font.family: Theme.uiFont
@@ -3771,6 +3818,11 @@ ShellRoot {
                                 placeholderText: "Setup key or otpauth:// link"
                                 onTextChanged: { previewDebounce.text = text; previewDebounce.restart(); }
                                 onAccepted: root.editorSave()
+                            }
+                            AppButton {
+                                text: root.qrScanning ? "Drag over the code…" : "Scan QR code"
+                                enabled: !root.qrScanning
+                                onClicked: root.scanQr(edSetup)
                             }
                         }
                         // What the code will be, before anything is saved: type it into the
@@ -3959,6 +4011,12 @@ ShellRoot {
                                 font.family: Theme.uiFont; font.pixelSize: Theme.fBody; verticalPadding: 9
                                 placeholderText: "Setup key or link (optional)"
                                 onTextChanged: { previewDebounce.text = text; previewDebounce.restart(); }
+                            }
+                            AppButton {
+                                text: root.qrScanning ? "Drag over the code…" : "Scan QR code"
+                                enabled: !root.qrScanning
+                                fontSize: Theme.fSmall
+                                onClicked: root.scanQr(crSetup)
                             }
                         }
                         Text {
