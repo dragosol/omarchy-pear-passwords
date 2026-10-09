@@ -15,7 +15,9 @@ import Quickshell.Io
 // What this does is tell you when that step is missing or out of date. pear-exec must exist,
 // be owned by root, belong to group pear-client and carry the set-gid bit (2755); without that
 // the window cannot reach its service. If the installed snapshot ($P/VERSION) is not this
-// checkout's, an update is waiting for the same step.
+// checkout's, an update is waiting for the same step. A 1.x vault still in ~/.config/icp means
+// this is an upgrade, and the notice says how to move it. It is shown once per state and
+// version (a stamp in $XDG_STATE_HOME/pear-passwords), not at every login.
 QtObject {
   id: root
 
@@ -27,7 +29,13 @@ QtObject {
   // "missing", "broken" (exists but not root:pear-client 2755), "outdated" or "ok";
   // "" until the checks have run.
   property string systemState: ""
-  readonly property string hint: systemState === "missing"
+  property bool hasV1: false                 // a 1.x vault waits in ~/.config/icp
+  readonly property string hint: systemState === "missing" && hasV1
+      ? "Pear Passwords 2.0 is ready to install; your 1.x passwords stay where they are until "
+        + "you move them. Open and unlock Pear Passwords 1.x once, close it, then run "
+        + "./install.sh in " + checkout + " and paste the command it prints. Opening Pear "
+        + "Passwords afterwards moves your passwords."
+      : systemState === "missing"
       ? "Pear Passwords needs its one-time system step. Run ./install.sh in " + checkout
         + ", then paste the command it prints."
       : systemState === "broken"
@@ -44,7 +52,7 @@ QtObject {
     stdout: StdioCollector {
       onStreamFinished: {
         const t = this.text.trim();
-        if (t === "") { root.systemState = "missing"; root.tell(); return; }
+        if (t === "") { root.systemState = "missing"; root.legacy.running = true; return; }
         if (t !== "0 pear-client 2755") { root.systemState = "broken"; root.tell(); return; }
         root.compare.running = true;
       }
@@ -68,10 +76,38 @@ QtObject {
     }
   }
 
+  // Is this an upgrade from 1.x? Only whether its vault file exists; nothing is read.
+  property Process legacy: Process {
+    command: ["sh", "-c", 'test -e "${XDG_CONFIG_HOME:-$HOME/.config}/icp/vault.enc"']
+    running: false
+    onExited: function (code) {
+      root.hasV1 = code === 0;
+      root.tell();
+    }
+  }
+
+  // Once per state and version: the stamp holds "<state>:<sha256 of SHA256SUMS>", and only a
+  // new one is announced, so a pending step is a single notification, not one per login.
+  property Process once: Process {
+    command: ["sh", "-c",
+      'f="${XDG_STATE_HOME:-$HOME/.local/state}/pear-passwords/notified"; '
+      + 'k="$1:$(sha256sum < "$2/SHA256SUMS" | cut -c1-64)"; '
+      + '[ "$(cat "$f" 2>/dev/null)" = "$k" ] && exit 1; '
+      + 'mkdir -p "${f%/*}" && printf %s "$k" > "$f"',
+      "pear-notify-once", root.systemState, root.checkout]
+    running: false
+    onExited: function (code) {
+      if (code !== 0) return;
+      Quickshell.execDetached(["notify-send", "-a", "Pear Passwords",
+        root.systemState === "outdated" ? "Pear Passwords update ready"
+          : root.hasV1 && root.systemState === "missing" ? "Pear Passwords 2.0 is ready"
+          : "Pear Passwords isn't set up yet",
+        root.hint]);
+    }
+  }
+
   function tell() {
     if (hint === "") return;
-    Quickshell.execDetached(["notify-send", "-a", "Pear Passwords",
-      systemState === "outdated" ? "Pear Passwords update ready" : "Pear Passwords isn't set up yet",
-      hint]);
+    once.running = true;
   }
 }

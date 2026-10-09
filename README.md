@@ -116,7 +116,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "afdb22190a65ede5bb1a336e121765810a79527fab492d58390a1ee3b936594d  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "3caeb0034690fcd36d0170076be1542916be36c1d41986272d247814e3aa6874  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -210,8 +210,17 @@ history and nicknames, and it does not sign this computer in again.
 > **For the smoothest move, open and unlock Pear Passwords 1.3.2 within 15 minutes before this
 > step.** 2.0 then asks 1.3.2's background agent for the key, and you type nothing.
 
-1. Unlock 1.3.2, then run `./install.sh` and the root command it prints. The install never
-   touches `~/.config/icp`, and 1.3.2's background agent keeps running.
+1. Update and install 2.0. Open Pear Passwords (1.3.2) and unlock it, close its window, then:
+
+   ```bash
+   omarchy plugin update io.github.dragosol.pear-passwords
+   cd ~/.config/omarchy/plugins/io.github.dragosol.pear-passwords
+   ./install.sh
+   ```
+
+   and run the root command it prints (see [Install](#install)). After the plugin update,
+   the shell also reminds you with one notification. The install never touches
+   `~/.config/icp`, and 1.3.2's background agent keeps running.
 2. Open Pear Passwords 2. It shows **Move your passwords into Pear Passwords 2**, says what
    will change, and lists the 1.x background services it will stop.
 3. Click **Continue**. One dialog. For a passphrase vault, if 1.3.2 was not unlocked recently

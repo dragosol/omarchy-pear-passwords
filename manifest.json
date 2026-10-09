@@ -6,7 +6,7 @@
   "author": "dragosol",
   "license": "MIT",
   "homepage": "https://github.com/dragosol/omarchy-pear-passwords",
-  "description": "Your passwords on iCloud, in a native Omarchy window. Sign in with your Apple Account, approve this computer once, and your passwords and verification codes stay in sync while Pear is open. A small system service holds the keys under its own user, so nothing in your home can decrypt them: one fingerprint or password dialog shows your accounts, and each account asks again before it reveals, copies or changes its password. Copies clear after one paste. Add entries, see password history, generate strong passwords, keep notes and extra websites. Browser autofill is opt-in, with your own extension. Not affiliated with Apple.",
+  "description": "Your passwords on iCloud, in a native Omarchy window. Sign in with your Apple Account and approve this computer once; passwords and verification codes sync while Pear is open. A small system service holds the keys under its own user: one fingerprint or password dialog shows your accounts, and each account asks again before it reveals or copies a password. Copies clear after one paste. Tags, category search, password history, a generator and opt-in browser autofill. Not affiliated with Apple.",
   "kinds": [
     "service"
   ],
