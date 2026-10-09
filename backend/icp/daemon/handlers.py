@@ -219,8 +219,20 @@ async def _wire_list(reg, s) -> tuple[list, dict]:
     return wire.entries(metas, s.show_all, s.features), st
 
 
-def _notify_list_after(reg, s) -> None:
-    """After an edit: send the fresh list as a `synced` event once the reply has gone."""
+def _where_is(metas, entries, id: str) -> str:
+    """Where one entry stands, for the journal: booleans and an id prefix, never a value."""
+    m = next((m for m in metas if m.id == id), None)
+    listed = any(e.get("id") == id for e in entries)
+    if m is None:
+        return f"{id[:12]}…: not in the store"
+    w = wire.meta_to_wire(m, None)
+    return (f"{id[:12]}…: in the store, listed={listed}, deleted={bool(getattr(m, 'deleted', False))}, "
+            f"visible={wire.visible(m, None)}, internal={wire.is_internal(w)}")
+
+
+def _notify_list_after(reg, s, watch: str | None = None) -> None:
+    """After an edit: send the fresh list as a `synced` event once the reply has gone. `watch`
+    is an entry the edit created; where it stands goes to the journal."""
     epoch = s.epoch
 
     async def send():
@@ -230,6 +242,10 @@ def _notify_list_after(reg, s) -> None:
             entries, st = await _wire_list(reg, s)
         except OpError:
             return
+        if watch:
+            metas = await _store(reg, s.uid, s.store.list_meta)
+            logger.info("uid %d: after create, %d listed; %s", s.uid, len(entries),
+                        _where_is(metas, entries, watch))
         if s.epoch == epoch and s.unlocked():
             reg.notify_ui(s.uid, {"event": "synced", "entries": entries,
                                   "synced_at": st.get("synced_at"),
@@ -415,6 +431,7 @@ async def background_sync(reg, uid: int) -> str:
             reason = err.code if err.code in SYNC_FAILED_REASONS else "apple"
             if reason == "needs-login":
                 await _mark_needs_login(reg, s)
+            logger.info("uid %d: sync failed: %s", uid, reason)
             event = {"event": "sync-failed", "reason": reason}
             if err.extra.get("detail"):
                 event["detail"] = err.extra["detail"]
@@ -428,8 +445,18 @@ async def background_sync(reg, uid: int) -> str:
         st = await reg.run_store(uid, s.store.status)
         if s.epoch != epoch or not s.unlocked():
             return "locked"
+        listed = wire.entries(metas, s.show_all, s.features)
+        hidden_flag = sum(1 for m in metas if not wire.visible(m, s.features))
+        hidden_internal = sum(1 for m in metas if wire.visible(m, s.features)
+                              and wire.is_internal(wire.meta_to_wire(m, s.features)))
+        logger.info("uid %d: sync: added %d, changed %d, deleted %d, unchanged %d; %d in the store, "
+                    "%d listed (%d waiting for a feature flag, %d Apple-internal)", uid,
+                    *(int(counts.get(k, 0) or 0) for k in ("added", "changed", "deleted", "unchanged")),
+                    len(metas), len(listed), hidden_flag, hidden_internal)
+        for cid in getattr(s, "created_ids", None) or ():
+            logger.info("uid %d: created this run: %s", uid, _where_is(metas, listed, cid))
         reg.notify_ui(uid, {
-            "event": "synced", "entries": wire.entries(metas, s.show_all, s.features),
+            "event": "synced", "entries": listed,
             "synced_at": counts.get("synced_at", st.get("synced_at")),
             "counts": {k: int(counts.get(k, 0) or 0)
                        for k in ("added", "changed", "deleted", "unchanged")},
@@ -801,7 +828,12 @@ async def op_create(reg, conn, req):
         new_id = await _apple_call(reg, s, reg.apple.create, ctx, clean)
     finally:
         s.busy = None
-    _notify_list_after(reg, s)
+    if isinstance(new_id, str):
+        created = getattr(s, "created_ids", None)
+        if created is None:
+            created = s.created_ids = []
+        created.append(new_id)
+    _notify_list_after(reg, s, watch=new_id if isinstance(new_id, str) else None)
     return {"id": new_id}
 
 
