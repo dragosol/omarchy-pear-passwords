@@ -166,6 +166,26 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(classify(None, error="org.freedesktop.PolicyKit1.Error.Cancelled",
                                   elapsed=1, cancelled=False), polkit.BUSY)
 
+    def test_only_a_method_return_can_authorize(self):
+        # #10755: a signal carrying an "authorized" body must never be read as polkitd's answer,
+        # even if a transport hands one over.
+        class Hands:
+            def __init__(self, mtype):
+                self.mtype = mtype
+
+            def call(self, msg, timeout=None):
+                reply = new_method_return(msg, "(bba{ss})", ((True, False, {}),))
+                reply.header.message_type = self.mtype
+                return reply
+        for mtype in (MessageType.signal, MessageType.method_call):
+            auth = Authority(bus=Hands(mtype), clock=self.clock)
+            with self.assertLogs("icp.daemon.polkit", "ERROR"):
+                self.assertEqual(auth.check(self.subject, paths.ACTION_AUTOFILL, {}, "x"),
+                                 polkit.INTERNAL, mtype)
+        auth = Authority(bus=Hands(MessageType.method_return), clock=self.clock)
+        self.assertEqual(auth.check(self.subject, paths.ACTION_AUTOFILL, {}, "x"),
+                         polkit.AUTHORIZED)
+
     def test_a_denial_without_a_challenge_is_unanswered(self):
         self.assertEqual(classify((False, False, {}), error=None, elapsed=0.2, cancelled=False),
                          polkit.DENIED_UNANSWERED)

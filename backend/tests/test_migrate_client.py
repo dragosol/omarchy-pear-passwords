@@ -7,6 +7,7 @@ bus address is pointed at nothing for good measure).
 
 import base64
 import datetime
+import itertools
 import hashlib
 import io
 import json
@@ -430,7 +431,44 @@ class KeyringVaultTests(unittest.TestCase):
             self.assertIsNone(migrate.decode_v1_key(bad))
 
 
-class FakeSecretsBus:
+class BlockingConn:
+    """A jeepney blocking connection's send/receive/outgoing_serial over a fake's
+    send_and_get_reply, with replies stamped as a real bus stamps them: the owner lookup
+    answered by the driver (sender org.freedesktop.DBus), every other reply sent by that
+    owner. dbus_safe.call_blocking accepts nothing else."""
+
+    OWNER = ":1.42"
+
+    @property
+    def outgoing_serial(self):
+        if "_bc_serial" not in self.__dict__:
+            self.__dict__["_bc_serial"] = itertools.count(1)
+        return self.__dict__["_bc_serial"]
+
+    def send(self, msg, serial=None):
+        from jeepney import HeaderFields, MessageType
+        f = msg.header.fields
+        driver = f.get(HeaderFields.destination) == "org.freedesktop.DBus"
+        if driver and f.get(HeaderFields.member) == "GetNameOwner":
+            reply = mock.Mock()
+            reply.header.message_type = MessageType.method_return
+            reply.body = (self.OWNER,)
+        else:
+            reply = self.send_and_get_reply(msg)
+        sender = "org.freedesktop.DBus" if driver else self.OWNER
+        fields = reply.header.fields if isinstance(reply.header.fields, dict) else {}
+        reply.header.fields = {**fields, HeaderFields.reply_serial: serial,
+                               HeaderFields.sender: sender}
+        self.__dict__.setdefault("_bc_queue", []).append(reply)
+
+    def receive(self, timeout=None):
+        q = self.__dict__.setdefault("_bc_queue", [])
+        if not q:
+            raise TimeoutError
+        return q.pop(0)
+
+
+class FakeSecretsBus(BlockingConn):
     """Just enough of a jeepney blocking connection for SecretServiceKeyring."""
 
     def __init__(self, running=True, unlocked=(), locked=(), secrets=None, prompt="/",
@@ -684,7 +722,7 @@ class PurgeTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(b, "keepme")))
 
 
-class FakeBus:
+class FakeBus(BlockingConn):
     """The systemd user manager on the session bus, as far as stop_legacy_units uses it."""
 
     def __init__(self, files=(), fail=()):

@@ -39,7 +39,7 @@ MAX_PENDING = 8                      # requests awaiting the daemon, per host pr
 ORIGIN_MAX = 2048
 ID_MAX = 128
 RECONNECT_GAP_S = 1.0
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 EXT_OPS = {"status": None, "query": "autofill-query", "fill": "autofill-fill"}
 # Errors the host itself answers with; everything else is the daemon's code passed through.

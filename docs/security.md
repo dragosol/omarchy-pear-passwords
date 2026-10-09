@@ -217,6 +217,28 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
   most 16384 characters, no NUL, 10 per minute per user, and a new one withdraws the last
   offer. The text lives only in the ticket (the same Python-string residue as `copy`).
   Tests: `test_daemon_handlers.py::CopyTextTests`, `test_protocol_contract.py`.
+- **Only polkitd's own reply is an answer.** Every D-Bus call the daemon and the importer make
+  goes through `icp/dbus_safe.py`: a message answers a call only if it is a method return or an
+  error, carries the call's reply serial, and was sent by the unique name that owned the
+  destination when the call went out (asked of the bus driver under the same rule; the bus
+  stamps the sender and no client can set it). The polkit check then reads only a method return
+  as a result. jeepney 0.9 matches replies on the serial alone, so in 2.0.0 a program running
+  as you could send the daemon directed signals with guessed serials and an "authorized" body
+  and be taken for polkitd (HANCORE-linux, omacom/omarchy-plugin-marketplace#10755); fixed in
+  2.0.1. Signals from logind count only from logind's own unique name, and they can only lock
+  Pear. Tests: `test_dbus_forged_reply.py` (that attack on a real dbus-daemon: jeepney's router
+  takes the forgery, Pear's returns polkitd's denial), `test_dbus_safe.py`,
+  `test_daemon_polkit.py::AuthorityTests::test_only_a_method_return_can_authorize`.
+- **A malformed message cannot stop the daemon listening.** Any local user can send the
+  daemon's bus connections a signal, and dbus-broker passes on header fields it does not know.
+  jeepney 0.9 raises on those, and in 2.0.0 that ended the thread that receives: until the
+  daemon restarted, sleep, a session ending and logind's `Lock` (from lockers that send it)
+  no longer wiped keys. Closing the window still did, and so did the idle lock if it was on.
+  Since 2.0.1 a message that cannot be parsed is dropped (its file descriptors
+  closed) and the connection carries on, and a message that breaks its handler is logged and
+  skipped. Tests: `test_dbus_malformed_message.py` (on a real dbus-broker: jeepney's router
+  dies, Pear's drops the message and still receives and calls),
+  `test_dbus_safe.py::TolerantParserTests`, `test_dbus_safe.py::RouterReceiverTests`.
 - The scheduler and the Apple pipeline never import or name the polkit module, and no
   `AllowUserInteraction` appears in them. Tests: `test_scheduler_no_prompt.py`,
   `test_repo_guards.py::BackgroundNeverPromptsTests`.

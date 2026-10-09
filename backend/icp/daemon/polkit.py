@@ -67,6 +67,8 @@ _TRANSPORT_ERRORS = ("transport", "org.freedesktop.DBus.Error.ServiceUnknown",
                      "org.freedesktop.DBus.Error.Disconnected",
                      "org.freedesktop.DBus.Error.NoServer",
                      "org.freedesktop.DBus.Error.Spawn.ChildExited")
+# What _unwrap calls a message that is neither a method return nor an error: an INTERNAL fault.
+NOT_A_REPLY = "io.github.dragosol.pearpasswords.Error.NotAReply"
 
 # Characters a details value may not carry into the dialog: controls, format characters (which
 # include every bidi override and zero-width joiner), surrogates, private use, unassigned, and
@@ -142,7 +144,10 @@ def classify(result: tuple | None, *, error: str | None, elapsed: float,
 
 class SystemBus:
     """A lazily opened system-bus connection with fd passing, shared by every check so a
-    cancel comes from the same bus name as the check it cancels (polkit requires that)."""
+    cancel comes from the same bus name as the check it cancels (polkit requires that).
+    Replies go through dbus_safe.Router: only a method return or error from polkitd's own
+    connection answers a check - jeepney's router took a directed signal with a matching
+    serial from any client as the reply, which forged "authorized" (#10755)."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -152,16 +157,17 @@ class SystemBus:
     def _router_or_open(self):
         with self._lock:
             if self._router is None:
-                from jeepney.io.threading import DBusRouter, open_dbus_connection
+                from jeepney.io.threading import open_dbus_connection
+                from ..dbus_safe import Router
                 self._conn = open_dbus_connection("SYSTEM", enable_fds=True)
-                self._router = DBusRouter(self._conn)
+                self._router = Router(self._conn)
             return self._router
 
     def call(self, msg, timeout: float | None = None):
         """Send a method call and return the reply Message (error replies included)."""
         router = self._router_or_open()
         try:
-            return router.send_and_get_reply(msg, timeout=timeout)
+            return router.call(msg, timeout=timeout)
         except Exception:
             self.close()
             raise
@@ -255,8 +261,11 @@ _ACTIONS = frozenset(protocol.PROMPT_ACTION.values())
 
 
 def _unwrap(reply) -> tuple[str | None, tuple]:
-    """(error name or None, body) of a reply Message."""
+    """(error name or None, body) of a reply Message. Only a METHOD_RETURN is an answer: a
+    signal or anything else that reached here is NOT_A_REPLY, never a success (#10755)."""
     from jeepney import HeaderFields, MessageType
     if reply.header.message_type == MessageType.error:
         return str(reply.header.fields.get(HeaderFields.error_name, "error")), reply.body
+    if reply.header.message_type != MessageType.method_return:
+        return NOT_A_REPLY, ()
     return None, reply.body

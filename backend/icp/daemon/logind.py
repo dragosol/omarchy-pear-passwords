@@ -169,9 +169,12 @@ class LogindWatcher:
         try:
             from jeepney import DBusAddress, MatchRule, new_method_call
             from jeepney.bus_messages import message_bus
-            from jeepney.io.threading import DBusRouter, open_dbus_connection
+            from jeepney.io.threading import open_dbus_connection
+            from ..dbus_safe import Router
             self._conn = open_dbus_connection("SYSTEM", enable_fds=True)
-            self._router = DBusRouter(self._conn)
+            # Replies only from the sender that owns the destination (dbus_safe): logind's own
+            # identity, which handle() checks signals against, comes from such a reply.
+            self._router = Router(self._conn)
             owner = self._call(message_bus.GetNameOwner(LOGIN1))[0]
             self.set_owner(owner)
             rules = [

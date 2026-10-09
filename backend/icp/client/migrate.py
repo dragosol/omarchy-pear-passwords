@@ -52,6 +52,7 @@ import struct
 import sys
 
 from ..daemon import paths, protocol
+from ..dbus_safe import call_blocking
 from .channel import Channel, ChannelError, runtime_dir, stdin_line
 
 TICKET_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
@@ -278,7 +279,7 @@ class SecretServiceKeyring:
         from jeepney import DBusAddress, HeaderFields, MessageType, new_method_call
         bus = "org.freedesktop.DBus" if iface == "org.freedesktop.DBus" else SECRETS_BUS
         addr = DBusAddress(path, bus_name=bus, interface=iface)
-        reply = conn.send_and_get_reply(new_method_call(addr, method, sig, body),
+        reply = call_blocking(conn, new_method_call(addr, method, sig, body),
                                         timeout=timeout)
         if reply.header.message_type == MessageType.error:
             raise RuntimeError(str(reply.header.fields.get(HeaderFields.error_name, "error")))
@@ -395,14 +396,14 @@ def purge_secret_service() -> int:
     try:
         bus = DBusAddress("/org/freedesktop/DBus", bus_name="org.freedesktop.DBus",
                           interface="org.freedesktop.DBus")
-        has = conn.send_and_get_reply(new_method_call(bus, "NameHasOwner", "s",
+        has = call_blocking(conn, new_method_call(bus, "NameHasOwner", "s",
                                                       ("org.freedesktop.secrets",)), timeout=5)
         if not has.body or not has.body[0]:
             return 0                       # not running; do not activate it
         service = DBusAddress("/org/freedesktop/secrets", bus_name="org.freedesktop.secrets",
                               interface="org.freedesktop.Secret.Service")
         for attrs in SECRET_SERVICE_ITEMS:
-            reply = conn.send_and_get_reply(new_method_call(service, "SearchItems", "a{ss}",
+            reply = call_blocking(conn, new_method_call(service, "SearchItems", "a{ss}",
                                                             (attrs,)), timeout=5)
             if len(reply.body) != 2:
                 continue
@@ -410,7 +411,7 @@ def purge_secret_service() -> int:
             for path in unlocked:
                 item = DBusAddress(path, bus_name="org.freedesktop.secrets",
                                    interface="org.freedesktop.Secret.Item")
-                r = conn.send_and_get_reply(new_method_call(item, "Delete"), timeout=5)
+                r = call_blocking(conn, new_method_call(item, "Delete"), timeout=5)
                 # A returned prompt path other than "/" means the keyring wants to ask; we
                 # never complete it, so that item simply stays.
                 if r.body and r.body[0] == "/":
@@ -441,7 +442,7 @@ def stop_legacy_units(open_bus=None) -> tuple[list[str], list[str]]:
                       interface="org.freedesktop.systemd1.Manager")
 
     def call(conn, method, sig=None, body=()):
-        reply = conn.send_and_get_reply(new_method_call(mgr, method, sig, body), timeout=30)
+        reply = call_blocking(conn, new_method_call(mgr, method, sig, body), timeout=30)
         if reply.header.message_type == MessageType.error:
             raise RuntimeError(str(reply.header.fields.get(HeaderFields.error_name, "error")))
         return reply.body
