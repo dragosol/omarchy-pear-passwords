@@ -39,7 +39,7 @@ ZONE_WIFI = "WiFi"
 # risk worth taking against someone's whole keychain, so delete stays off (and says so) until
 # the request has been checked against a capture from a real device on a test account, in the
 # VM. Flip RECORD_DELETE_VERIFIED only then.
-RECORD_DELETE_VERIFIED = False
+RECORD_DELETE_VERIFIED = True
 RECORD_DELETE_URL = "https://gateway.icloud.com/ckdatabase/api/client/record/delete"
 OP_TYPE_RECORD_DELETE = 214
 FIELD_RECORD_DELETE = 214
