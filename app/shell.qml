@@ -1,6 +1,7 @@
 //@ pragma UseQApplication
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Effects
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -187,6 +188,12 @@ ShellRoot {
     property bool confirming: false
     // Delete: said in full in the window first, then the daemon's .manage dialog (fingerprint).
     property bool deleteConfirm: false
+    // A dialog over the main view (an editor, Settings, sign-in over an unlocked vault): the view
+    // behind it darkens and blurs, easing in and out together.
+    readonly property bool dialogOpen: root.editorOpen || root.settingsOpen
+                                       || (root.signinOpen && root.signedIn)
+    property real dialogT: root.dialogOpen ? 1 : 0
+    Behavior on dialogT { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
     property bool deleting: false
     readonly property bool canDelete: !!root.selected && root.appUnlocked
         && !root.selected.recently_deleted && root.selected.kind !== "passkey"
@@ -571,6 +578,7 @@ ShellRoot {
         root.qrTarget = field;
         root.qrScanning = true;
         qrProc.running = true;
+        root.showFlash("Draw a box around the QR code — Esc cancels");
     }
     Process {
         id: qrProc
@@ -2184,8 +2192,19 @@ ShellRoot {
             }
 
             ColumnLayout {
+                id: mainColumn
                 anchors.fill: parent
                 spacing: 0
+                // Blurred behind a dialog; rendered to a layer only while it is. The software
+                // renderer has no shader effects (the layer would draw nothing), so there it
+                // stays plainly dimmed.
+                layer.enabled: root.dialogT > 0.001 && GraphicsInfo.api !== GraphicsInfo.Software
+                layer.effect: MultiEffect {
+                    blurEnabled: true
+                    blur: root.dialogT
+                    blurMax: 40
+                    autoPaddingEnabled: false
+                }
 
                 // Any program of yours can run the autofill role once autofill is on, so the
                 // window says when one is connected: a dialog for a fill you did not ask your
@@ -3658,6 +3677,16 @@ ShellRoot {
             onClicked: root.authenticate()
         }
 
+        // ---------------------------------------------------------------- dialog backdrop
+        // Shared by the sheets below (they are transparent now): it darkens as the view blurs.
+        Rectangle {
+            parent: scope
+            z: 87
+            anchors.fill: parent
+            visible: root.dialogT > 0.001
+            color: Qt.rgba(0, 0, 0, 0.55 * root.dialogT)
+        }
+
         // ---------------------------------------------------------------- editor sheet
         // Websites, notes, verification code and new entries: one card in the sign-in sheet's
         // style. Every save goes to iCloud and is read back before the sheet closes.
@@ -3666,7 +3695,7 @@ ShellRoot {
             z: 90
             anchors.fill: parent
             visible: root.editorOpen
-            color: Qt.rgba(0, 0, 0, 0.55)
+            color: "transparent"
             MouseArea { anchors.fill: parent; onClicked: root.closeEditor() }
 
             Rectangle {
@@ -3820,7 +3849,7 @@ ShellRoot {
                                 onAccepted: root.editorSave()
                             }
                             AppButton {
-                                text: root.qrScanning ? "Drag over the code…" : "Scan QR code"
+                                text: root.qrScanning ? "Scanning…" : "Scan QR code"
                                 enabled: !root.qrScanning
                                 onClicked: root.scanQr(edSetup)
                             }
@@ -4013,7 +4042,7 @@ ShellRoot {
                                 onTextChanged: { previewDebounce.text = text; previewDebounce.restart(); }
                             }
                             AppButton {
-                                text: root.qrScanning ? "Drag over the code…" : "Scan QR code"
+                                text: root.qrScanning ? "Scanning…" : "Scan QR code"
                                 enabled: !root.qrScanning
                                 fontSize: Theme.fSmall
                                 onClicked: root.scanQr(crSetup)
@@ -4118,7 +4147,7 @@ ShellRoot {
             z: 100
             anchors.fill: parent
             visible: root.signinOpen
-            color: root.signedIn ? Qt.rgba(0, 0, 0, 0.55) : Theme.bg
+            color: root.signedIn ? "transparent" : Theme.bg
             MouseArea { anchors.fill: parent }   // swallow clicks to the list behind
 
             Rectangle {
@@ -5036,7 +5065,7 @@ ShellRoot {
             z: 88
             anchors.fill: parent
             visible: root.settingsOpen
-            color: Qt.rgba(0, 0, 0, 0.55)
+            color: "transparent"
             MouseArea { anchors.fill: parent; onClicked: root.settingsOpen = false }
 
             Rectangle {

@@ -46,6 +46,9 @@ class ScanTests(unittest.TestCase):
             self.assertTrue(all(isinstance(x, str) for x in a))
             self.assertNotIn("/tmp", " ".join(a))
         self.assertTrue(all(c[1].get("env") is not None for c in calls))
+        # slurp reads preset boxes from a non-terminal stdin before it shows anything; the
+        # window's pipe never closes, so without /dev/null it waited for ever (seen live).
+        self.assertTrue(all(c[1].get("stdin") is subprocess.DEVNULL for c in calls))
 
     def test_cancelled_selection(self):
         run, calls = fake(slurp=(1, b""))

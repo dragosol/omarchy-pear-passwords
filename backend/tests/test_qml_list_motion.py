@@ -64,3 +64,20 @@ class SearchFollowsPointerTests(unittest.TestCase):
                       "root.settingsOpen", "root.tagEditing", "root.deleteConfirm"):
             self.assertIn(guard, body)
         self.assertLess(body.index("return;"), body.index("search.forceActiveFocus();"))
+
+
+class DialogBackdropTests(unittest.TestCase):
+    """Behind an editor, Settings or sign-in over an unlocked vault, the view darkens and blurs
+    together, easing in and out; without shader effects it stays plainly dimmed."""
+
+    def test_the_view_blurs_and_darkens_with_one_eased_value(self):
+        self.assertIn("import QtQuick.Effects", CODE)
+        self.assertIn("readonly property bool dialogOpen: root.editorOpen || root.settingsOpen", CODE)
+        self.assertIn("Behavior on dialogT { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }", CODE)
+        self.assertIn("blur: root.dialogT", CODE)
+        self.assertIn("color: Qt.rgba(0, 0, 0, 0.55 * root.dialogT)", CODE)
+        self.assertIn("layer.enabled: root.dialogT > 0.001 && GraphicsInfo.api !== GraphicsInfo.Software",
+                      CODE)
+
+    def test_the_sheets_no_longer_paint_their_own_darkness(self):
+        self.assertNotIn("color: Qt.rgba(0, 0, 0, 0.55)\n", CODE)

@@ -51,8 +51,11 @@ def _write_all(fd: int, data: bytes) -> None:
 
 def scan(run=subprocess.run) -> dict:
     env = {k: v for k, v in os.environ.items() if k in ENV_KEYS}
+    # stdin is /dev/null for every tool: slurp reads a list of preset boxes from stdin when it
+    # is not a terminal, and the window's pipe never closes, so it waited for ever, overlay unshown.
     try:
-        sel = run([SLURP], capture_output=True, timeout=SELECT_TIMEOUT_S, env=env)
+        sel = run([SLURP], capture_output=True, stdin=subprocess.DEVNULL,
+                  timeout=SELECT_TIMEOUT_S, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return {"ok": False, "reason": "failed"}
     if sel.returncode != 0:
@@ -61,8 +64,8 @@ def scan(run=subprocess.run) -> dict:
     if not GEOMETRY.fullmatch(geometry):
         return {"ok": False, "reason": "failed"}
     try:
-        shot = run([GRIM, "-g", geometry, "-"], capture_output=True, timeout=TOOL_TIMEOUT_S,
-                   env=env)
+        shot = run([GRIM, "-g", geometry, "-"], capture_output=True, stdin=subprocess.DEVNULL,
+                   timeout=TOOL_TIMEOUT_S, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return {"ok": False, "reason": "failed"}
     if shot.returncode != 0 or not shot.stdout or len(shot.stdout) > MAX_PNG:
@@ -74,7 +77,7 @@ def scan(run=subprocess.run) -> dict:
         _write_all(fd, shot.stdout)
         os.lseek(fd, 0, os.SEEK_SET)
         res = run([ZBARIMG, "--raw", "-q", f"/proc/self/fd/{fd}"], capture_output=True,
-                  timeout=TOOL_TIMEOUT_S, env=env, pass_fds=(fd,))
+                  stdin=subprocess.DEVNULL, timeout=TOOL_TIMEOUT_S, env=env, pass_fds=(fd,))
     except (OSError, subprocess.TimeoutExpired):
         return {"ok": False, "reason": "failed"}
     finally:
