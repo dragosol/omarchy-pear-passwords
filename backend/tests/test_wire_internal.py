@@ -1,6 +1,6 @@
 """Which keychain items the list hides as Apple's own (daemon/wire.py internal_reason).
 
-A real entry was hidden: "omamail gmail", no website, a Google API client id as the username
+A real entry was hidden: a named entry with no website and a Google API client id as the username
 (`<digits>-<hash>.apps.googleusercontent.com`, about 72 characters) and its secret as the
 password. The long-username rule, meant for Apple's key-like records, took it. Anything a
 person named is theirs, and the shape rules only apply to an item with no real website.
@@ -31,10 +31,10 @@ class OwnersEntriesAreListedTests(unittest.TestCase):
         # As create writes it: a UUID server, label "<uuid> (<user>)", the name as Apple's title,
         # and a tag from the notes.
         m = meta(domain=UUID_SITE, username=CLIENT_ID, title=f"{UUID_SITE} ({CLIENT_ID})",
-                 apple_title="omamail gmail", tags=["omamail"])
+                 apple_title="Mail API", tags=["mail"])
         self.assertGreater(len(CLIENT_ID), 60)
         self.assertTrue(listed(m))
-        self.assertEqual(wire.entries([m], features={})[0]["primary"], "omamail gmail")
+        self.assertEqual(wire.entries([m], features={})[0]["primary"], "Mail API")
 
     def test_named_untagged_and_nicknamed_entries_are_listed(self):
         for extra in ({"apple_title": "My API"}, {"nickname": "api"}, {"tags": ["work"]}):

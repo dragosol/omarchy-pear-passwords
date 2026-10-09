@@ -67,7 +67,7 @@ def internal_reason(e: dict) -> str | None:
 
     Anything a person named is theirs: an entry with a Passwords-app title, a Pear nickname or
     tags is never internal, whatever its username or site look like (an app password saved as
-    "omamail gmail" with an unusual username was hidden by the username rules below)."""
+    "Mail API" with an API client id as its username was hidden by the username rules below)."""
     if (e.get("apple_title") or "").strip() or (e.get("nickname") or "").strip() or e.get("tags"):
         return None
     user, domain = e["username"] or "", e["domain"] or ""
