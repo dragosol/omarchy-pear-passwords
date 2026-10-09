@@ -184,3 +184,27 @@ class FramingTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OutcomeLogTests(unittest.IsolatedAsyncioTestCase):
+    """Ops that reach Apple or change the vault, and every op that ends in an error, leave one
+    journal line: the op, its outcome code and how long it took. A create that failed while the
+    owner was looking elsewhere left nothing to go on before this. Never a value."""
+
+    async def asyncSetUp(self):
+        self.h = await Harness().start()
+
+    async def asyncTearDown(self):
+        await self.h.stop()
+
+    async def test_an_error_is_logged_with_its_code_and_never_a_value(self):
+        c = await self.h.connect()
+        await c.call("hello", rid=0, role="ui", proto=2)
+        canary = "canary-value-that-must-not-be-logged"
+        with self.assertLogs("icp.daemon.server", level="INFO") as logs:
+            reply = await c.call("create", rid=1, fields={"title": canary, "password": canary})
+        self.assertIn("error", reply)
+        lines = [r.getMessage() for r in logs.records]
+        self.assertTrue(any(l.startswith(f"op create: {reply['error']}") and l.endswith("s")
+                            for l in lines), lines)
+        self.assertFalse(any(canary in l for l in lines), lines)

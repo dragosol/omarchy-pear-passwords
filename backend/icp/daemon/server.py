@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Callable
 
 from . import handlers as _handlers
@@ -274,18 +275,37 @@ class Server:
     async def _run(self, conn: Conn, req: dict, rid: int, op: str) -> None:
         request = Request(conn, rid)
         set_request(request)
+        started = time.monotonic()
         try:
             payload = await self.handlers[op](self.reg, conn, req)
             out = {"rid": rid, **_without_rid(payload or {})}
+            if op in LOGGED_OPS:
+                log_outcome(op, "ok", started)
         except OpError as e:
             out = e.reply(rid)
+            field = e.extra.get("field")
+            log_outcome(op, e.code + (f" ({field})" if isinstance(field, str) else ""), started)
         except asyncio.CancelledError:
+            if op in LOGGED_OPS:
+                log_outcome(op, "cancelled (the window went away)", started)
             raise
         except Exception:
             logger.exception("op %s failed for %r", op, conn)
             out = {"rid": rid, "error": "internal"}
         conn.send(out)
         _run_after(request)
+
+
+# Ops whose outcome and duration always go to the journal: the ones that reach Apple or change
+# the vault, where a failure the window showed for a moment is otherwise gone. Any op that ends
+# in an error is logged too. Only the op, the error code and the field name are written - never
+# a value, and never an error's `detail` (Apple's text can name the account).
+LOGGED_OPS = frozenset({"create", "set", "delete", "sync", "signin", "migrate-begin", "reset",
+                        "tpm-move"})
+
+
+def log_outcome(op: str, outcome: str, started: float) -> None:
+    logger.info("op %s: %s in %.1fs", op, outcome, time.monotonic() - started)
 
 
 def _without_rid(d: dict) -> dict:
