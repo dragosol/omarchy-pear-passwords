@@ -33,12 +33,16 @@ AGRP_METADATA = "com.apple.password-manager"
 ZONE_PASSWORDS = "Passwords"
 ZONE_WIFI = "WiFi"
 
-# Deleting an entry needs CloudKit's RecordDelete operation, which nothing in this project has
-# exercised against Apple yet. The numbers below are this project's reading of the CloudKit
-# protocol and are UNVERIFIED. A wrong operation number sent with a record identifier is not a
-# risk worth taking against someone's whole keychain, so delete stays off (and says so) until
-# the request has been checked against a capture from a real device on a test account, in the
-# VM. Flip RECORD_DELETE_VERIFIED only then.
+# Deleting an entry is CloudKit's RecordDelete operation. The request was checked against an
+# independent client that sends it to Apple, OpenBubbles/rustpush (cloudkit-proto/src/
+# cloudkit.proto and src/icloud/cloudkit.rs, DeleteRecordOperation): RecordDeleteRequest
+# { RecordIdentifier record = 1 } as request field 214, operation type RECORD_DELETE_TYPE =
+# 214, POSTed to .../ckdatabase/api/client/record/delete - the message, numbers and endpoint
+# below. It names exactly one record, so a mistake could only fail, never remove another
+# entry; delete_entry re-fetches the zone afterwards and reports an entry still there. First
+# used on a throwaway entry on the owner's account (2026-10-09). It removes the item from
+# iCloud Keychain everywhere, and Apple's devices do not keep it in Recently Deleted. The
+# switch stays so a build can turn deleting off again.
 RECORD_DELETE_VERIFIED = True
 RECORD_DELETE_URL = "https://gateway.icloud.com/ckdatabase/api/client/record/delete"
 OP_TYPE_RECORD_DELETE = 214
