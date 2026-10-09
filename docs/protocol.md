@@ -5,14 +5,11 @@ four kinds of client: the Pear window (`ui`), the clipboard writer (`clip`), the
 (`migrate`) and the browser autofill host (`autofill`). The same values in code are in
 `backend/icp/daemon/protocol.py` and `backend/icp/daemon/paths.py`;
 `backend/tests/test_protocol_contract.py` fails if this document and that module disagree on
-an op, an event or an error code. A change to anything here lands on the `v2-base` branch
-first and every work package merges it; no work package edits this file on its own branch.
-The integration of the work packages (branch `v2`) amended it where they met: `reset`,
-`migrate-begin` retries, `seal-unavailable`, `sync` while `needs-login` is latched,
-`set{nickname}`, the `clip-history-check` line cap and the importer's cancel status.
+an op, an event or an error code. The daemon and every client change together with this
+document.
 
 The browser-facing side of autofill (native messaging between an extension and
-`pear-autofill-host`) is specified separately in `docs/autofill-protocol.md` (WP6). This file
+`pear-autofill-host`) is specified separately in `docs/autofill-protocol.md`. This file
 covers only what that host says to the daemon.
 
 ---

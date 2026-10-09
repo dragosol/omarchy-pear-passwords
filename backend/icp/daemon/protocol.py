@@ -1,13 +1,12 @@
 """The frozen numbers, names and internal interfaces of the daemon protocol.
 
-docs/protocol.md is the specification; this module is the same contract in code, so the daemon
-(WP1), the clients (WP4) and the autofill host (WP6) import one set of values instead of each
-copying them. backend/tests/test_protocol_contract.py checks the two against each other.
+docs/protocol.md is the specification; this module is the same contract in code, so the daemon,
+the clients and the autofill host import one set of values instead of each copying them.
+backend/tests/test_protocol_contract.py checks the two against each other.
 
 Nothing in here talks to a socket or to polkit. The `Connection`, `Session` and
-`SessionRegistry` protocols describe what WP1's server hands to an op handler written by
-another work package (today: daemon/autofill.py), so that handler can be written and tested
-against fakes before the server exists.
+`SessionRegistry` protocols describe what the daemon's server hands to an op handler kept in
+its own module (daemon/autofill.py), so that handler can be tested against fakes.
 """
 
 from __future__ import annotations
@@ -228,11 +227,11 @@ class OpError(Exception):
         return {"rid": rid, "error": self.code, **self.extra}
 
 
-# --- what WP1's server hands to a handler ----------------------------------------------------
+# --- what the daemon's server hands to a handler ----------------------------------------------------
 
 @runtime_checkable
 class Connection(Protocol):
-    """One verified client connection (WP1 daemon/server.py builds it after peer checks)."""
+    """One verified client connection (daemon/server.py builds it after peer checks)."""
 
     uid: int                 # SO_PEERCRED uid, verified against /proc
     pid: int
@@ -249,7 +248,7 @@ class Connection(Protocol):
 
 @runtime_checkable
 class Session(Protocol):
-    """The per-uid state machine (WP1 daemon/sessions.py)."""
+    """The per-uid state machine (daemon/sessions.py)."""
 
     uid: int
     store: "UserStore"
@@ -264,7 +263,7 @@ class Session(Protocol):
 
 @runtime_checkable
 class SessionRegistry(Protocol):
-    """All sessions plus the shared services an op handler may use (WP1)."""
+    """All sessions plus the shared services an op handler may use."""
 
     def get(self, uid: int) -> Session | None:
         """The session for `uid`, or None if this uid has never connected since start."""

@@ -1,4 +1,4 @@
-"""Shared test fixtures (owned by WP2). Fake data only - nothing here was ever a real vault.
+"""Shared test fixtures (owned by the store). Fake data only - nothing here was ever a real vault.
 
 - `FakeSealBackend`: a stand-in for `systemd-creds --user` with a switchable TPM, so tests can
   seal, re-seal, pull the TPM and clear it without root or hardware.

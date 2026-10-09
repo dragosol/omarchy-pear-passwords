@@ -7,7 +7,7 @@ the actual scripts in their test mode (PP_TEST_ROOT): every system path is taken
 directory, nothing is chowned, and commands that would change the running system (systemctl,
 systemd-sysusers, userdel, ...) are written to commands.log instead. The stage is synthetic
 but has the real shape: the real paths.env, files.sh and both scripts, plus stand-ins for the
-files other work packages own.
+the files the rest of the repository provides.
 """
 
 import hashlib

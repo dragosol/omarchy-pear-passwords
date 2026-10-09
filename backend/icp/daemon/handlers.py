@@ -2,7 +2,7 @@
 the background sync, and the dispatch table the server calls.
 
 Each handler is `await handler(registry, conn, req)` and returns the reply payload without its
-rid, or raises OpError. The two autofill ops are WP6's (daemon/autofill.py); they are reached
+rid, or raises OpError. The two autofill ops are the autofill host's (daemon/autofill.py); they are reached
 through thin wrappers here so that module is imported only when a browser first asks.
 
 Rules every handler keeps:
@@ -1437,7 +1437,7 @@ async def op_purge_result(reg, conn, req):
     return {"ok": True}
 
 
-# --- autofill (WP6), imported on first use ----------------------------------------------------
+# --- autofill, imported on first use -----------------------------------------------------------
 
 async def op_autofill_query(reg, conn, req):
     from . import autofill

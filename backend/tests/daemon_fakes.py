@@ -1,4 +1,4 @@
-"""Fakes for the WP1 daemon tests: an in-memory UserStore, a polkit authority, an Apple
+"""Fakes for the daemon tests: an in-memory UserStore, a polkit authority, an Apple
 pipeline, and a harness that runs the real Server and Registry on a scratch unix socket.
 
 Not a test module (no test_ prefix). Every value here is made up; nothing reads a real vault.

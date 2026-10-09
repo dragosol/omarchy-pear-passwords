@@ -3,7 +3,7 @@
 The installer (system/install-root.sh), pear-exec (native/pear-exec.c) and the daemon must agree
 on all of these. The shell side reads system/paths.env; this module is the Python side, and
 backend/tests/test_paths_agree.py fails if the two ever differ. pear-exec.c hard-codes its
-values and is checked against paths.env by WP4's test.
+values and is checked against paths.env by the clients' test.
 
 Nothing here touches the filesystem. Per-user paths in $HOME (browser manifests, the v1 vault)
 are deliberately not here: they belong to the code that runs as that user.

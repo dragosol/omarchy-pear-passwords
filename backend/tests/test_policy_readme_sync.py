@@ -2,7 +2,7 @@
 
 What a user is told a dialog says, and when, must be what the policy file makes the dialog
 say and what the daemon raises it for. All four actions, including `.autofill`, are checked.
-The policy file is WP1's; until it is on the branch, only the README and protocol.md are
+The policy file is the daemon's; until it is on the branch, only the README and protocol.md are
 compared, and the policy half is reported as skipped.
 """
 

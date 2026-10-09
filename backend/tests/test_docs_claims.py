@@ -3,9 +3,8 @@
 README "Security" bullets carry `<!-- tests: ... -->`; docs/security.md bullets and
 paragraphs carry `Tests: ...`. Each id is `test_file.py`, `test_file.py::Class` or
 `test_file.py::Class::method`, and must exist (the class and method are found with the AST).
-A file another work package adds in 2.0 and that is not on this branch yet is reported, not
-failed, but only if the spec assigns it (PLANNED); once the file exists, every id in it is
-checked.
+A test file listed in PLANNED that does not exist is reported, not failed; once the file exists,
+every id in it is checked.
 
 It also holds the README to the owner's decisions: 120 s per account, 30 s on the clipboard,
 idle lock off, no sync lease, autofill opt-in with no bundled extension, and none of 1.x's
@@ -22,20 +21,20 @@ from icp.daemon import protocol
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TESTS = os.path.join(ROOT, "backend", "tests")
 
-# Test files the 2.0 spec assigns to the other work packages.
+# Test files the 2.0 security model relies on, by component.
 PLANNED = {
-    # WP1
+    # The daemon
     "test_daemon_peer.py", "test_daemon_polkit.py", "test_grants.py", "test_tickets.py",
     "test_logind_lock.py", "test_scheduler_no_prompt.py", "test_protocol_limits.py",
     "test_policy_file.py", "test_unit_hardening.py",
-    # WP2
+    # The store
     "test_store_v2.py", "test_seal_reseal.py", "test_pwmac_sync_diff.py", "test_migration_v1.py",
-    # WP3
+    # The Apple pipeline
     "test_apple_ctx.py",
-    # WP4
+    # The clients
     "test_pear_exec_env.py", "test_clip_policy.py", "test_qml_text_plain.py", "test_qml_no_ipc.py",
     "test_qml_process_allowlist.py", "test_qml_no_console_log.py",
-    # WP6
+    # The autofill host
     "test_autofill_origin.py", "test_autofill_handlers.py", "test_autofill_host_framing.py",
     "test_autofill_register.py",
 }

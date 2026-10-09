@@ -1,8 +1,8 @@
 """The v2 per-user store: /var/lib/pear-passwords/u<uid>/, read and written only by the daemon.
 
-This file is the frozen interface between WP2 (which implements it, in this package) and its
-callers: WP1's handlers and WP3's Apple pipeline. Signatures, field names and exception kinds
-here do not change without a foundation amendment on v2-base; the bodies are WP2's.
+This file is the interface between the store (implemented in this package) and its callers:
+the daemon's handlers and the Apple pipeline. Signatures, field names and exception kinds are
+shared by both sides; change them together.
 
 Key hierarchy (spec section 3): RK_list unlocks meta, session, aliases and nicknames through
 HKDF subkeys; SK_secret opens one entry box at a time and is wiped at once. Writes only ever

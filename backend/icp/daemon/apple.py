@@ -1,6 +1,6 @@
-"""The Apple pipeline as the daemon calls it. Owned by WP3; these signatures are frozen.
+"""The Apple pipeline as the daemon calls it. These signatures are part of the daemon's contract.
 
-Every function is blocking (network-bound) and is run by WP1 in a worker thread under the
+Every function is blocking (network-bound) and is run by the daemon in a worker thread under the
 uid's store lock. Each takes a UserContext whose store is unlocked, reads and writes the
 iCloud session only through ctx.store, and asks questions only through ctx.ui - so a
 background call (ctx.frontend is None) that needs a person raises NeedsLogin.
@@ -10,7 +10,7 @@ comment), and a sync must never unseal SK_secret: tests grep, walk the AST and c
 
 Errors: NeedsLogin (context), Cancelled (context), icp.auth.anisette.AnisetteError for an
 unreachable anisette server, and icp.errors.AppleError subclasses for everything iCloud
-refuses. WP1 maps them to the error codes in docs/protocol.md. Two more are defined here:
+refuses. The daemon maps them to the error codes in docs/protocol.md. Two more are defined here:
 NotSignedIn (no iCloud session, or one that never joined the keychain: `not-signed-in`) and
 FieldError (a value that failed validation: `invalid` with `field`). Network failures surface
 as requests.RequestException (`network`).

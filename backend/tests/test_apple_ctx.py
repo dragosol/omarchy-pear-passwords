@@ -32,7 +32,7 @@ from icp.octagon import client as octagon, items
 from icp.vault.host import Credential, CredentialStore
 from icp.vstore import Meta
 
-from wp3_fakes import FakeStore, ScriptedFrontend
+from apple_fakes import FakeStore, ScriptedFrontend
 
 BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ICP = os.path.join(BACKEND, "icp")
@@ -195,7 +195,7 @@ def _wp3_sources():
     for sub in ("auth", "cli", "octagon"):
         d = os.path.join(ICP, sub)
         paths += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".py")]
-    # Two files in auth/ are WP2's to delete; they are not part of the pipeline.
+    # Two files in auth/ are the store's to delete; they are not part of the pipeline.
     return [p for p in paths if os.path.basename(p) not in ("lockbox.py", "held_key.py")]
 
 

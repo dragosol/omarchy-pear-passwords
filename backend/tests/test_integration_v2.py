@@ -1,6 +1,5 @@
-"""The packages together: the real daemon server and registry (WP1) over the real per-user
-store (WP2), the real Apple pipeline module (WP3) with only the network replaced, and the
-autofill handlers (WP6) - driven over a unix socket the way the window, the importer and the
+"""The parts together: the real daemon server and registry over the real per-user store, the
+real Apple pipeline module with only the network replaced, and the autofill handlers - driven over a unix socket the way the window, the importer and the
 browser host drive them.
 
 Only polkit (a fake authority that approves), the seal backend (FakeSealBackend) and the

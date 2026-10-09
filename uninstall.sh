@@ -27,7 +27,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/system/lib/user-files.sh"
 
 # Browser registrations first: only manifests the register command wrote and still match its
-# receipt are removed (WP6's command decides; this only asks it to).
+# receipt are removed (the autofill host's command decides; this only asks it to).
 if [ -x "$AUTOFILL_REGISTER_BIN" ]; then
   "$AUTOFILL_REGISTER_BIN" unregister --all || echo "warning: could not unregister autofill" >&2
 fi

@@ -1,6 +1,6 @@
 """The sign-in frontend that draws in the Pear window: context.Frontend over the socket.
 
-WP3's login and relogin run in a worker thread and call emit / stage / ask / secret /
+The Apple pipeline's login and relogin run in a worker thread and call emit / stage / ask / secret /
 confirm_yn / choose exactly as they call cli/jsonui.py during development. Each call here becomes
 an event carrying the signin request's rid (docs/protocol.md 9.2); a question blocks the worker
 until the window's `answer` op arrives on the event loop. Cancelling - an `answer` with cancel,

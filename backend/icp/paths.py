@@ -88,7 +88,7 @@ def legacy_file(name: str) -> Path:
 def config_dir() -> Path:
     """The 1.x directory, created 0700 if missing.
 
-    Kept for the 1.x Apple pipeline until it moves into the daemon (WP3); 2.0 code must use
+    Kept for the 1.x Apple pipeline's development commands; 2.0 code must use
     legacy_dir(), which never creates anything."""
     d = legacy_dir()
     d.mkdir(parents=True, exist_ok=True)

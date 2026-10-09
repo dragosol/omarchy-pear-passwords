@@ -12,10 +12,9 @@ So a guard cannot pass because one matcher's idea of "code" has a hole, and a wo
 explanatory comment ("never wl-copy, which stages to /tmp") does not count as a use. A
 self-test plants a known number of hits and both matchers must find exactly that many.
 
-Files that another work package deletes or rewrites in 2.0 are listed in PENDING with their
-sha256 on the v2-base branch. While a file still has exactly that content its hits are
-reported as a skip; the moment its owner changes it, it is checked like every other file, and
-a deleted file has nothing to check. Nothing here needs updating after the merge.
+Files that 2.0 deletes or rewrites are listed in PENDING with their pre-2.0 sha256. While a
+file still has exactly that content its hits are reported as a skip; once it changes it is
+checked like every other file, and a deleted file has nothing to check.
 """
 
 import ast
@@ -32,21 +31,21 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 CODE_DIRS = ("backend/icp", "app", "plugin", "native", "system")
 SKIP_EXT = {".png", ".svg", ".pem", ".md", ".pyc", ".lock", ".env"}
 
-# v2-base content of files other packages delete (D) or rewrite (R).
+# Pre-2.0 content of files 2.0 deletes (D) or rewrites (R).
 PENDING = {
-    "backend/icp/auth/prompt.py": "8347f301a587760ad2bfdc18be40d6f6cb815be7020380472edb63ddc2537af8",  # D WP3
-    "backend/icp/auth/agent.py": "11d38d7c25ff230401c27f9f1c852fa6be25b4eceb9d902e9d765514083222ac",   # D WP3
-    "backend/icp/auth/session.py": "abdb56640ceecdfe4cf9d1310d8474963229de4b2b2b57b7cdfa537c22f31b53",  # R WP3
-    "backend/icp/auth/lockbox.py": "a91a4f251acc1a050f79ca1078cabe3b6b5fcf643ade1d1316c031c4f087c826",  # D WP2
-    "backend/icp/auth/held_key.py": "fd05329f3d3071987a4414e3cd7e645acf88df97eb212ac5ff60ed2747648afd",  # D WP2
-    "backend/icp/cli/app.py": "30bd142a08cdfd95b6c9fcbaaa4ed0bc0608d8da859f2cd65eb8693e253d3ea5",      # R WP3
-    "backend/icp/cli/ui.py": "d4be21be6e7eb7f14fad980f371642ce2a639d0d546b4a94d920c7e3f39a0a52",       # R WP3
-    "backend/icp/cli/appapi.py": "798ef2ade4fe76a6043df0ad9607cc6e8bf36bfa69368bbd7bf59229b53e0c2f",   # D WP3
-    "backend/icp/ui/reauth.py": "cddf3ebd826126ca35e9c744d19e1f0bc924903fa570fc5ebe341b2e32b5aa9a",    # D WP3
-    "backend/icp/ui/polkit_gate.py": "270c500187004791a250f2420e79ede614aae4037a6e38911e2febffd271e174",  # D WP3
-    "app/shell.qml": "63e18b1cf41cae607d6bfc9316d73af6e91e2cddf585f2f6b0f7ec69780cba98",               # R WP4
-    "app/launch.sh": "c596d900ac0560c3aa316d51a32c671783262541083cccda217ff70ae00da961",               # D WP4
-    "plugin/Service.qml": "16729c443268c6b1a7f6bd75b6e06a6b513e405422954dddf08127ff6eafead2",          # R WP4
+    "backend/icp/auth/prompt.py": "8347f301a587760ad2bfdc18be40d6f6cb815be7020380472edb63ddc2537af8",  # D the Apple pipeline
+    "backend/icp/auth/agent.py": "11d38d7c25ff230401c27f9f1c852fa6be25b4eceb9d902e9d765514083222ac",   # D the Apple pipeline
+    "backend/icp/auth/session.py": "abdb56640ceecdfe4cf9d1310d8474963229de4b2b2b57b7cdfa537c22f31b53",  # R the Apple pipeline
+    "backend/icp/auth/lockbox.py": "a91a4f251acc1a050f79ca1078cabe3b6b5fcf643ade1d1316c031c4f087c826",  # D the store
+    "backend/icp/auth/held_key.py": "fd05329f3d3071987a4414e3cd7e645acf88df97eb212ac5ff60ed2747648afd",  # D the store
+    "backend/icp/cli/app.py": "30bd142a08cdfd95b6c9fcbaaa4ed0bc0608d8da859f2cd65eb8693e253d3ea5",      # R the Apple pipeline
+    "backend/icp/cli/ui.py": "d4be21be6e7eb7f14fad980f371642ce2a639d0d546b4a94d920c7e3f39a0a52",       # R the Apple pipeline
+    "backend/icp/cli/appapi.py": "798ef2ade4fe76a6043df0ad9607cc6e8bf36bfa69368bbd7bf59229b53e0c2f",   # D the Apple pipeline
+    "backend/icp/ui/reauth.py": "cddf3ebd826126ca35e9c744d19e1f0bc924903fa570fc5ebe341b2e32b5aa9a",    # D the Apple pipeline
+    "backend/icp/ui/polkit_gate.py": "270c500187004791a250f2420e79ede614aae4037a6e38911e2febffd271e174",  # D the Apple pipeline
+    "app/shell.qml": "63e18b1cf41cae607d6bfc9316d73af6e91e2cddf585f2f6b0f7ec69780cba98",               # R the clients
+    "app/launch.sh": "c596d900ac0560c3aa316d51a32c671783262541083cccda217ff70ae00da961",               # D the clients
+    "plugin/Service.qml": "16729c443268c6b1a7f6bd75b6e06a6b513e405422954dddf08127ff6eafead2",          # R the clients
 }
 
 

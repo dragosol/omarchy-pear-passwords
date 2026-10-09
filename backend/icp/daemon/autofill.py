@@ -1,6 +1,6 @@
 """Browser autofill, daemon side: the two ops an `autofill` connection may send.
 
-Owned by WP6; WP1's dispatch table calls the two handlers for role "autofill" and nothing else
+The daemon's dispatch table calls the two handlers for role "autofill" and nothing else
 does. The browser extension is not part of this repository - anyone can write one against
 docs/autofill-protocol.md - so the daemon trusts nothing the extension says except the origin,
 and treats that only as being as trustworthy as the browser that reported it.

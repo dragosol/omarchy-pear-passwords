@@ -1,7 +1,7 @@
 """What the Apple pipeline runs with inside the daemon: one user's store and, sometimes, a
 person to ask.
 
-WP1 builds a UserContext for every Apple call; WP3's daemon/apple.py consumes it. The Frontend
+The daemon builds a UserContext for every Apple call; daemon/apple.py consumes it. The Frontend
 is the interface cli/jsonui.py already implements (emit, stage, ask, secret, confirm_yn,
 choose), so every prompt the sign-in flow has today - and any Apple adds later - reaches the
 Pear window over the socket without the flow knowing where it is drawn.
@@ -36,7 +36,7 @@ class Cancelled(KeyboardInterrupt):
 
 @runtime_checkable
 class Frontend(Protocol):
-    """A place to show sign-in progress and ask questions. Implemented by WP1's socket
+    """A place to show sign-in progress and ask questions. Implemented by the daemon's socket
     frontend (daemon/frontend.py) and, for development only, by cli/jsonui.JsonFrontend.
 
     Every asking method blocks the calling worker thread until the answer arrives, and raises

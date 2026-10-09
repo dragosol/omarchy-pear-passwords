@@ -6,7 +6,7 @@ from icp.auth import signin
 from icp.auth.icloud import ICloudError
 from icp.daemon.context import BackgroundFrontend, NeedsLogin
 
-from wp3_fakes import ScriptedFrontend
+from apple_fakes import ScriptedFrontend
 
 
 def test_fresh_token_no_reauth(monkeypatch):

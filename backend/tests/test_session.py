@@ -11,7 +11,7 @@ import unittest
 from icp.auth import session
 from icp.vstore import StoreLocked
 
-from wp3_fakes import FakeStore
+from apple_fakes import FakeStore
 
 ICP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icp")
 

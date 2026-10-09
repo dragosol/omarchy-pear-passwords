@@ -12,7 +12,7 @@ from icp.daemon import apple
 from icp.daemon.context import BackgroundFrontend, UserContext
 from icp.hme.client import HmeAlias
 
-from wp3_fakes import FakeStore, ScriptedFrontend
+from apple_fakes import FakeStore, ScriptedFrontend
 
 
 class _FakeSession:

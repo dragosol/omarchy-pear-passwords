@@ -7,7 +7,7 @@ import pytest
 from icp.cli import jsonui
 from icp.octagon import bottles
 
-from wp3_fakes import ScriptedFrontend
+from apple_fakes import ScriptedFrontend
 
 BOTTLES = [
     {"id": "a", "meta": {"serial": "S1", "ClientMetadata": {"device_model": "MacBook Pro"}}},

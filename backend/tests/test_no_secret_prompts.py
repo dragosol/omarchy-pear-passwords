@@ -118,7 +118,7 @@ class NoSecretPromptTests(GuardCase):
             self.skipTest("left for the package that rewrites them: " + "; ".join(pending))
 
     def test_pending_files_are_the_known_ones(self):
-        # A file can only be excused by its exact v2-base content.
+        # A file can only be excused by its exact pre-2.0 content.
         for rel, digest in PENDING.items():
             self.assertRegex(digest, r"^[0-9a-f]{64}$", rel)
         self.assertTrue(all(not r.startswith(("backend/icp/daemon", "backend/icp/client",

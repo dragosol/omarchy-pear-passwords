@@ -1,9 +1,8 @@
 """The frozen 2.0 interfaces keep their shape.
 
-Work packages fill in the bodies of vstore, daemon/apple.py and daemon/autofill.py on their own
-branches; these tests only pin names, parameters and the few behaviours the foundation itself
-implements (UserContext and the background frontend). They pass before and after the bodies
-exist.
+These tests pin the names and parameters of vstore, daemon/apple.py and daemon/autofill.py,
+and the few behaviours the shared modules implement themselves (UserContext and the background
+frontend).
 """
 
 import ast

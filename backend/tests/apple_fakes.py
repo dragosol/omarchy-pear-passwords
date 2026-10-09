@@ -1,4 +1,4 @@
-"""Fakes for the Apple pipeline tests (WP3): an in-memory UserStore stand-in that records what
+"""Fakes for the Apple pipeline tests: an in-memory UserStore stand-in that records what
 the pipeline asked of it, and a scripted frontend. Not a test module itself."""
 
 from __future__ import annotations
