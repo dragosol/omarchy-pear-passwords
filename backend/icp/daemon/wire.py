@@ -61,19 +61,40 @@ def meta_to_wire(m, features: dict | None = None) -> dict:
     }
 
 
-def is_internal(e: dict) -> bool:
-    """Keychain items that exist for Apple's own services, not for a person to log in with."""
+def internal_reason(e: dict) -> str | None:
+    """Why an item counts as one of Apple's own records (a short rule name, for the journal),
+    or None for an entry a person logs in with.
+
+    Anything a person named is theirs: an entry with a Passwords-app title, a Pear nickname or
+    tags is never internal, whatever its username or site look like (an app password saved as
+    "omamail gmail" with an unusual username was hidden by the username rules below)."""
+    if (e.get("apple_title") or "").strip() or (e.get("nickname") or "").strip() or e.get("tags"):
+        return None
     user, domain = e["username"] or "", e["domain"] or ""
     title = e.get("_real_title") or ""
-    if len(user) > 60 or user.startswith("PCSBoundaryKey") or user.startswith("com.apple."):
-        return True
-    if re.fullmatch(r"[0-9]{6,}", user) or re.fullmatch(r"[0-9]{6,}", title):
-        return True
+    # Apple's own markers, wherever they appear.
+    if user.startswith("PCSBoundaryKey") or user.startswith("com.apple."):
+        return "apple-service-account"
     if "CHIPPlugin" in user or "CHIPPlugin" in title:
-        return True
+        return "chip-plugin"
     if user.startswith("_Apple") or title.startswith("_Apple"):
-        return True
-    return not domain and not (e["primary"] or "")
+        return "apple-private"
+    # Shape rules, only for an item with no real website: a login at a site may well have a
+    # 70-character API client id or a numeric customer number as its username.
+    real_site = domain == "AirPort" or ("." in domain and not _UUIDISH.match(domain))
+    if not real_site:
+        if len(user) > 60:
+            return "long-username"
+        if re.fullmatch(r"[0-9]{6,}", user) or re.fullmatch(r"[0-9]{6,}", title):
+            return "numeric-id"
+        if not domain and not (e["primary"] or ""):
+            return "no-site-no-name"
+    return None
+
+
+def is_internal(e: dict) -> bool:
+    """Keychain items that exist for Apple's own services, not for a person to log in with."""
+    return internal_reason(e) is not None
 
 
 def entries(metas, show_all: bool = False, features: dict | None = None) -> list[dict]:

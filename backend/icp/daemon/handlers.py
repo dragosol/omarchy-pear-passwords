@@ -22,6 +22,7 @@ import binascii
 import functools
 import hashlib
 import logging
+import time
 import math
 import re
 import unicodedata
@@ -455,6 +456,17 @@ async def background_sync(reg, uid: int) -> str:
                     len(metas), len(listed), hidden_flag, hidden_internal)
         for cid in getattr(s, "created_ids", None) or ():
             logger.info("uid %d: created this run: %s", uid, _where_is(metas, listed, cid))
+        # Entries changed in the last 3 days that the list hides, and which rule hides them:
+        # an id prefix, the rule and the time only.
+        recent = time.time() - 3 * 86400
+        shown = {e.get("id") for e in listed}
+        for m in metas:
+            if m.id in shown or float(m.mdat or 0) < recent:
+                continue
+            why = ("feature flag" if not wire.visible(m, s.features)
+                   else wire.internal_reason(wire.meta_to_wire(m, s.features)) or "?")
+            logger.info("uid %d: hidden %s… (%s), changed %s", uid, m.id[:12], why,
+                        time.strftime("%Y-%m-%d %H:%M", time.localtime(float(m.mdat))))
         reg.notify_ui(uid, {
             "event": "synced", "entries": listed,
             "synced_at": counts.get("synced_at", st.get("synced_at")),
