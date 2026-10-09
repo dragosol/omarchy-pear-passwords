@@ -7,16 +7,25 @@ nothing and do not count as the one paste; any other identified reader does. A r
 cannot be found at all (gone, or non-dumpable like Pear's own window) also gets nothing and
 does not count; that rule lives in clip.py.
 
-The list is deliberately short and matched on the whole command line:
+Two kinds are known. wl-paste watchers, matched on the whole command line:
 
   wl-paste [--type T] --watch /usr/share/omarchy/shell/plugins/clipboard/capture.sh ...
       Omarchy's clipboard history (its text and image watchers), started by the shell
   wl-paste [--type T] --watch cliphist store
       the usual cliphist setup
+  wl-paste [--type T] --watch clipman store [--option ...]
+      clipman
 
-plus every process descended from one of those (capture.sh runs `wl-paste --list-types` and
-perl with the pipe as stdin). Pretending to be a watcher only gets the pretender nothing, so
-matching generously here can cost a paste, never a password.
+and programs that read every new clipboard entry themselves (CLIPBOARD_READERS, matched on
+the program name): clipboard histories (fcitx5's clipboard addon - it read a live Pear copy on
+the owner's XPS within 50 ms and took the one paste - CopyQ, clipse, GPaste, Walker's
+elephant, ...), wl-clip-persist (it keeps a copy after the source is gone, which would undo
+the clearing), and clipboard sync (KDE Connect, Barrier/Input Leap/Synergy), which would carry
+the value to another device the moment it is copied. None of them is where a person pastes.
+
+Every process descended from one of those counts too (capture.sh runs `wl-paste --list-types`
+and perl with the pipe as stdin). Pretending to be a watcher only gets the pretender nothing,
+so matching generously here can cost a paste, never a password.
 """
 
 from __future__ import annotations
@@ -26,6 +35,17 @@ from dataclasses import dataclass
 from typing import Callable, Iterable
 
 OMARCHY_CAPTURE = "/usr/share/omarchy/shell/plugins/clipboard/capture.sh"
+# Programs that read the clipboard on every change, never as the place a person pastes into.
+CLIPBOARD_READERS = frozenset({
+    # clipboard histories
+    "fcitx5", "copyq", "clipse", "gpaste-daemon", "elephant", "klipper", "diodon",
+    "parcellite", "clipit", "greenclip", "xfce4-clipman", "clipcatd", "cliphist", "clipman",
+    # clipboard keepers (a copy outlives its source, undoing the clear)
+    "wl-clip-persist",
+    # clipboard sync to other devices
+    "kdeconnectd", "barrier", "barriers", "input-leap", "input-leaps", "synergy-core",
+    "synergys",
+})
 MAX_ANCESTRY = 4                  # wl-paste -> capture.sh -> $(...) subshell -> perl
 
 
@@ -39,6 +59,8 @@ class ProcInfo:
 def is_watcher_argv(argv: Iterable[str]) -> bool:
     """True for the command line of a known clipboard-history watcher itself."""
     argv = list(argv)
+    if argv and os.path.basename(argv[0]) in CLIPBOARD_READERS:
+        return True
     if not argv or os.path.basename(argv[0]) != "wl-paste":
         return False
     for flag in ("--watch", "-w"):
@@ -61,6 +83,9 @@ def is_watcher_argv(argv: Iterable[str]) -> bool:
     if cmd[:1] == [OMARCHY_CAPTURE]:
         return True
     if len(cmd) == 2 and os.path.basename(cmd[0]) == "cliphist" and cmd[1] == "store":
+        return True
+    if (len(cmd) >= 2 and os.path.basename(cmd[0]) == "clipman" and cmd[1] == "store"
+            and all(a.startswith("--") for a in cmd[2:])):
         return True
     return False
 

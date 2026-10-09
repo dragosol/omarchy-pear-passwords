@@ -581,13 +581,47 @@ class ManagerChoiceTests(unittest.TestCase):
         self.assertEqual(clip.serve(dc, offer, None), "failed")
 
 
+class InputMethodHistoryTests(unittest.TestCase):
+    """On the owner's XPS, fcitx5 (its clipboard addon keeps a history) read a Pear copy 50 ms
+    after the offer went up and was served as the one paste, so the user's own paste got
+    nothing and the toast said "pasted" at once. It must get nothing and not count."""
+
+    def test_fcitx5_gets_nothing_and_the_user_still_pastes_once(self):
+        infos = {
+            4001: watchers.ProcInfo(4001, 1321, ("/usr/bin/fcitx5", "--disable", "notificationitem")),
+            4002: watchers.ProcInfo(4002, 1321, ("foot",)),
+        }
+        holder = {"pid": 4001}
+        offer = clip.Offer(bytearray(b"dummy-value"), True, 30.0,
+                           lambda fd: clip.Readers(frozenset({holder["pid"]}),
+                                                   frozenset(p for p in {holder["pid"]}
+                                                             if watchers.is_watcher(p, infos.get))))
+        offer.start()
+        r, w = os.pipe()
+        offer.on_send("text/plain;charset=utf-8", w)
+        self.assertEqual(offer.log[-1][1], "watcher")
+        self.assertIsNone(offer.pasted_at)
+        self.assertEqual(read_all(r), b"")
+        holder["pid"] = 4002                    # then the user pastes into a terminal
+        r2, w2 = os.pipe()
+        offer.on_send("text/plain;charset=utf-8", w2)
+        self.assertEqual(offer.log[-1][1], "pasted")
+        self.assertEqual(read_all(r2), b"dummy-value")
+
+
 class WatcherListTests(unittest.TestCase):
     def test_known_watchers(self):
         cap = watchers.OMARCHY_CAPTURE
         for argv in (["wl-paste", "--type", "text", "--watch", cap, "text"],
                      ["/usr/bin/wl-paste", "--type", "image/png", "--watch", cap, "image/png"],
                      ["wl-paste", "--watch", "cliphist", "store"],
-                     ["wl-paste", "-t", "text", "-w", "/usr/bin/cliphist", "store"]):
+                     ["wl-paste", "-t", "text", "-w", "/usr/bin/cliphist", "store"],
+                     ["wl-paste", "-t", "text", "--watch", "clipman", "store", "--no-persist"],
+                     # Programs that read every new entry themselves. fcitx5's clipboard addon
+                     # read a live copy on the owner's XPS and took the one paste.
+                     ["/usr/bin/fcitx5", "--disable", "notificationitem"], ["fcitx5"],
+                     ["copyq"], ["/usr/bin/clipse", "-listen"], ["wl-clip-persist",
+                     "--clipboard", "regular"], ["/usr/lib/kdeconnectd"], ["elephant"]):
             self.assertTrue(watchers.is_watcher_argv(argv), argv)
 
     def test_not_watchers(self):
@@ -596,7 +630,9 @@ class WatcherListTests(unittest.TestCase):
                      ["wl-paste", "--primary", "--watch", cap, "text"],
                      ["wl-paste", "--watch", "sh", "-c", "cat > /tmp/x"],
                      ["wl-pastex", "--watch", cap], ["bash", cap, "text"],
-                     ["wl-paste", "--watch", "cliphist", "store", "--extra"], []):
+                     ["wl-paste", "--watch", "cliphist", "store", "--extra"],
+                     ["wl-paste", "--watch", "clipman", "store", "evil"],
+                     ["foot"], ["/usr/bin/zen-browser"], ["fcitx5-config-qt-x"], []):
             self.assertFalse(watchers.is_watcher_argv(argv), argv)
 
     def test_descendants_of_a_watcher_count(self):
