@@ -2014,6 +2014,24 @@ ShellRoot {
         root.detailIndex = at === undefined ? 0 : Math.max(0, Math.min(at, root.panelStops() - 1));
         detailKeys.forceActiveFocus();
     }
+    // A key nobody else took, with the pointer over the search field or the list: it continues
+    // the search. Only printable text and Backspace, never with Ctrl/Alt/Super, and never while
+    // an editor, Settings or a question is open.
+    function typeToSearch(ev) {
+        if (!listHover.hovered || search.activeFocus || !root.appUnlocked) return false;
+        if (root.editorOpen || root.settingsOpen || root.tagEditing || root.renaming
+                || root.confirming || root.deleteConfirm) return false;
+        if (ev.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) return false;
+        const backspace = ev.key === Qt.Key_Backspace;
+        if (!backspace && !(ev.text.length === 1 && ev.text.charCodeAt(0) >= 32
+                            && ev.text.charCodeAt(0) !== 127)) return false;
+        root.leavePanel();
+        search.cursorPosition = search.text.length;
+        if (backspace) search.remove(Math.max(0, search.text.length - 1), search.text.length);
+        else search.insert(search.cursorPosition, ev.text);
+        return true;
+    }
+
     function leavePanel() {
         root.panelFocus = false;
         search.forceActiveFocus();
@@ -2119,6 +2137,8 @@ ShellRoot {
                     root.doReveal(); ev.accepted = true;
                 } else if (ev.key === Qt.Key_L && ev.modifiers & Qt.ControlModifier) {
                     root.lockNow(); ev.accepted = true;
+                } else if (root.typeToSearch(ev)) {
+                    ev.accepted = true;
                 }
             }
 
@@ -2187,6 +2207,7 @@ ShellRoot {
 
                     // ------------------------------------------------ list
                     ColumnLayout {
+                        id: listColumn
                         Layout.fillWidth: false
                         // 380, not 340: at 340 7% of usernames elided; at 380 none do. The list
                         // is where the time goes - the panel mostly confirms what was picked.
@@ -2195,6 +2216,9 @@ ShellRoot {
                         Layout.maximumWidth: 380
                         Layout.fillHeight: true
                         spacing: 0
+                        // Typing while the pointer is over the search field or the list goes into
+                        // the search field, wherever the keyboard focus was (the window's Keys).
+                        HoverHandler { id: listHover }
 
                         Rectangle {
                             Layout.fillWidth: true
@@ -2343,8 +2367,16 @@ ShellRoot {
                             // Integrated per frame, not fitted to an easing curve: exact at any refresh rate.
                             FrameAnimation {
                                 running: list.mode === "coast" || list.mode === "bounce"
-                                onTriggered: list.step(Math.min(frameTime * 1000, 34))
+                                onRunningChanged: list.movingFor = 0
+                                onTriggered: {
+                                    const dt = Math.min(frameTime * 1000, 34);
+                                    list.movingFor += dt;
+                                    // Momentum is a flick's tail, never a state: after 3 s, settle in bounds.
+                                    if (list.movingFor > 3000) { list.settle(); return; }
+                                    list.step(dt);
+                                }
                             }
+                            property real movingFor: 0
 
                             function pushBy(dy) {
                                 const now = Date.now();
@@ -2402,6 +2434,17 @@ ShellRoot {
                                     return;
                                 }
                                 if (list.mode === "bounce") {
+                                    // ListView only estimates contentHeight for a long list and corrects it
+                                    // as rows are made, so the ends move: aim at where they are now, and
+                                    // stop once back inside (a stale target was chased for ever).
+                                    if (list.contentY >= list.minY && list.contentY <= list.maxY
+                                            && Math.abs(list.vel) < 0.05) {
+                                        list.vel = 0;
+                                        list.mode = "idle";
+                                        return;
+                                    }
+                                    list.bounceTarget = list.contentY < list.minY ? list.minY
+                                                      : list.contentY > list.maxY ? list.maxY : list.bounceTarget;
                                     // exact critically damped step: x(t) = (x0 + (v0 + w*x0) t) e^(-wt)
                                     const w = list.springOmega;
                                     const x0 = list.contentY - list.bounceTarget, v0 = list.vel;
@@ -2433,6 +2476,14 @@ ShellRoot {
                                 list.vel = 0;
                                 list.mode = "idle";
                             }
+                            // Stop and put the view inside its bounds as they are now.
+                            function settle() {
+                                list.stopPhysics();
+                                list.contentY = Math.max(list.minY, Math.min(list.maxY, list.contentY));
+                            }
+                            // New rows (a sync, a delete, a filter): whatever was moving was moving over
+                            // the old list, so it stops here.
+                            onModelChanged: list.settle()
                             model: root.filtered
                             currentIndex: root.cursor
                             ScrollBar.vertical: AppScrollBar {}
