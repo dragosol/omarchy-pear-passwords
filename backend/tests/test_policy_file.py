@@ -1,4 +1,4 @@
-"""polkit/io.github.dragosol.pearpasswords.policy declares exactly the four actions the daemon
+"""polkit/io.github.dragosol.pearpasswords.policy declares exactly the five actions the daemon
 raises, each auth_self for active sessions only, never retained, owned by pear-passwords.
 
 Each rule is checked twice: on the parsed XML and with a plain-text matcher, so a policy that
@@ -26,9 +26,9 @@ class PolicyFileTests(unittest.TestCase):
         cls.root = ET.fromstring(cls.text.encode("utf-8"))
         cls.actions = {a.get("id"): a for a in cls.root.iter("action")}
 
-    def test_exactly_the_four_actions(self):
+    def test_exactly_the_five_actions(self):
         self.assertEqual(set(self.actions), set(paths.ACTIONS))
-        self.assertEqual(len(re.findall(r"<action\s+id=", self.text)), 4)
+        self.assertEqual(len(re.findall(r"<action\s+id=", self.text)), 5)
         self.assertEqual(set(protocol.PROMPT_ACTION.values()), set(paths.ACTIONS))
 
     def test_defaults(self):
@@ -39,10 +39,10 @@ class PolicyFileTests(unittest.TestCase):
                 aid)
 
     def test_defaults_text(self):
-        self.assertEqual(len(re.findall(r"<allow_any>no</allow_any>", self.text)), 4)
-        self.assertEqual(len(re.findall(r"<allow_inactive>no</allow_inactive>", self.text)), 4)
-        self.assertEqual(len(re.findall(r"<allow_active>auth_self</allow_active>", self.text)), 4)
-        self.assertEqual(len(re.findall(r"<allow_\w+>", self.text)), 12)
+        self.assertEqual(len(re.findall(r"<allow_any>no</allow_any>", self.text)), 5)
+        self.assertEqual(len(re.findall(r"<allow_inactive>no</allow_inactive>", self.text)), 5)
+        self.assertEqual(len(re.findall(r"<allow_active>auth_self</allow_active>", self.text)), 5)
+        self.assertEqual(len(re.findall(r"<allow_\w+>", self.text)), 15)
 
     def test_never_retained(self):
         self.assertNotIn("_keep", self.text)
@@ -56,7 +56,7 @@ class PolicyFileTests(unittest.TestCase):
         for aid, a in self.actions.items():
             ann = {x.get("key"): x.text for x in a.findall("annotate")}
             self.assertEqual(ann, {"org.freedesktop.policykit.owner": OWNER}, aid)
-        self.assertEqual(self.text.count(f'"org.freedesktop.policykit.owner">{OWNER}<'), 4)
+        self.assertEqual(self.text.count(f'"org.freedesktop.policykit.owner">{OWNER}<'), 5)
 
     def test_no_exec_path_and_no_implicit_auth(self):
         self.assertNotIn("exec.path", self.text)
@@ -66,7 +66,7 @@ class PolicyFileTests(unittest.TestCase):
         with open(PROTOCOL_DOC, encoding="utf-8") as f:
             doc = f.read()
         section = doc[doc.index("## 5. Prompts"):doc.index("## 6.")]
-        rows = re.findall(r"^\| `([a-z.]+)` \| ([^|]+?) \|", section, re.M)
+        rows = re.findall(r"^\| `([a-z.-]+)` \| ([^|]+?) \|", section, re.M)
         expected = {aid: msg.strip() for aid, msg in rows}
         self.assertEqual(set(expected), set(paths.ACTIONS))
         for aid, a in self.actions.items():

@@ -252,8 +252,9 @@ lease: a locked uid does not sync.
 | `io.github.dragosol.pearpasswords.reveal` | Use the saved password for $(account) | `grant` |
 | `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | `create`, `delete`, `signin`, `signout`, `migrate-begin`, `reset`, `purge-old-copy`, `clip-history-check`, `autofill-enable`, `tpm-move`, `features` (a change), `diag-items` |
 | `io.github.dragosol.pearpasswords.autofill` | A browser extension asks to fill the password for $(account) on $(origin) | `autofill-fill` |
+| `io.github.dragosol.pearpasswords.autofill-names` | A browser extension asks to see which accounts you have saved for $(origin) | `autofill-names` (only for a site not yet named) |
 
-All four: `auth_self` for active local sessions, `no` for any and inactive, no `_keep`, owner
+All five: `auth_self` for active local sessions, `no` for any and inactive, no `_keep`, owner
 annotation `unix-user:pear-passwords`. No other op ever raises a dialog.
 
 - Subject: `unix-process` with the connection's `pidfd` (and `uid`); fallback
@@ -755,8 +756,13 @@ start `pear-exec autofill`, so once autofill is on, any such program can ask for
 fill is still its own dialog, which says a browser extension is asking, and the window shows
 when an autofill host is connected.
 
-**A locked Pear reveals nothing.** Both ops work only while the uid's tier 1 is unlocked in the
-Pear window. Otherwise they say nothing about any site.
+**A locked Pear reveals nothing.** `autofill-query` and `autofill-fill` work only while the
+uid's tier 1 is unlocked in the Pear window, or the store is open for that very connection.
+Otherwise they say nothing about any site. The store is opened for one autofill connection
+only by `autofill-names`: with tier 1 closed, its approved `.autofill-names` dialog unlocks the
+store for that connection (no tier 1, no grant, no sync). It locks again `AUTOFILL_OPEN_S`
+(120 s) after that connection's last request, when the connection closes, or on any lock
+trigger; if the window has tier 1 open by then, only the connection's access ends.
 
 ### 11.1 Origin
 
@@ -785,6 +791,11 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
   -> {"rid":1,"state":"unlocked","host":"github.com",        (after an approved fill)
       "accounts":[{"id":"<id>","username":"me","label":"GitHub — me","match":"exact"}]}
 
+{"op":"autofill-names","rid":3,"origin":"https://github.com"}
+  -> {"rid":3,"state":"unlocked","host":"github.com",
+      "accounts":[{"id":"<id>","username":"me","label":"GitHub — me","match":"exact"}]}
+  |  {"rid":3,"state":"locked"}  |  {"rid":3,"error":"dismissed"|"denied"|...}
+
 {"op":"autofill-fill","rid":2,"origin":"https://github.com","id":"<id>"}
   -> {"rid":2,"id":"<id>","username":"me","password":"..."}
   |  {"rid":2,"error":"locked"|"no-match"|"dismissed"|"denied"|"no-agent"|"busy"|
@@ -804,7 +815,15 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
   same); empty or a seal state: only `{"state":"unavailable"}`. Unlocked: up to
   20 accounts ranked by match, then newest change, then label. `username` and `label` are
   included only once a fill on this connection has been approved since the uid last
-  unlocked; before that a query gives handles and match kinds only. Never a secret.
+  unlocked, or for a host whose names `autofill-names` released to this connection since
+  then; before that a query gives handles and match kinds only. Never a secret.
+- `autofill-names` is `autofill-query` with that host's accounts named. Unavailable: the
+  query's answer and no dialog. Locked: the dialog below also unlocks the store for this
+  connection (above). Already named: the query's answer and no
+  dialog. Otherwise it raises `.autofill-names` with `origin` (the host), in the `autofill`
+  bucket; once approved, and the uid is still unlocked and the connection still open, that
+  host's names go to this connection until the uid locks. No password and no other host's
+  names are released.
 - `autofill-fill` raises `.autofill` every time with `account` and `origin` (the host), in the
   `autofill` rate-limit bucket (one outstanding, 3 refused per minute per uid). An unknown
   handle and a non-matching one both give `no-match`. After approval the daemon re-checks that the
@@ -904,4 +923,5 @@ traceback.
 | `import-commit` | migrate | – | files + key | `{counts, digest}` |
 | `purge-result` | migrate | – | purpose purge | `{ok:true}` |
 | `autofill-query` | autofill | – | – | `{state, host?, accounts?}` |
+| `autofill-names` | autofill | `.autofill-names` | tier 1 (a site not yet named) | `{state, host?, accounts?}` |
 | `autofill-fill` | autofill | `.autofill` | tier 1 | `{id, username, password}` |

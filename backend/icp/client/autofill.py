@@ -8,7 +8,7 @@ pear-client. Only then can it connect to the daemon.
 This process is a translator and nothing else. It holds no key, no list and no state beyond
 the daemon's last locked/unlocked word, and it trusts the extension with nothing: every
 request is rebuilt from scratch with the two fields the daemon needs (origin, id), so an
-extension cannot reach a daemon op other than autofill-query and autofill-fill or smuggle
+extension cannot reach a daemon op other than autofill-query, -names and -fill or smuggle
 extra fields into them. Whether a fill happens is decided by the daemon and the polkit dialog
 it raises for every fill; whether the origin is well-formed is decided by the daemon too, so
 there is one parser, not two that could disagree.
@@ -39,9 +39,10 @@ MAX_PENDING = 8                      # requests awaiting the daemon, per host pr
 ORIGIN_MAX = 2048
 ID_MAX = 128
 RECONNECT_GAP_S = 1.0
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 
-EXT_OPS = {"status": None, "query": "autofill-query", "fill": "autofill-fill"}
+EXT_OPS = {"status": None, "query": "autofill-query", "names": "autofill-names",
+           "fill": "autofill-fill"}
 # Errors the host itself answers with; everything else is the daemon's code passed through.
 HOST_ERRORS = ("bad-request", "unknown-op", "too-large", "too-many", "no-daemon", "disabled")
 

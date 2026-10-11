@@ -134,6 +134,11 @@ class Session:
         self.item_shape: dict | None = None
         self.copy_texts: deque = deque()  # when each copy-text ticket was issued (clock)
         self.autofill_key: bytes | None = None   # keys autofill handles; only while unlocked
+        # The autofill connection a browser-made unlock (autofill-names) is open for, and when
+        # it ends; None when the store is open only for the window, or not at all.
+        self.autofill_conn = None
+        self.autofill_until = 0.0
+        self.autofill_timer = None
         self.last_ui_request = 0.0
         self.next_sync_at: float | None = None
         self.store_lock = asyncio.Lock()
@@ -418,6 +423,8 @@ class Registry:
         s = self.sessions.get(conn.uid)
         if s is None:
             return
+        if conn.role == "autofill" and s.autofill_conn is conn:
+            self.close_autofill(s)                  # the browser's unlock ends with its host
         if conn.role == "ui" and s.ui is conn:
             # EOF on the window locks the uid; there is nobody to tell.
             self.lock(conn.uid, None, notify=False)
@@ -442,12 +449,62 @@ class Registry:
         s.last_ui_request = self.clock()
         self.notify_autofill(s.uid)
 
+    # --- the browser's own unlock (autofill-names while tier 1 is closed) -----------------------
+    def open_autofill(self, s: Session, conn) -> None:
+        """The store was unlocked for this autofill connection (an approved .autofill-names
+        dialog). It serves that connection only, and locks again AUTOFILL_OPEN_S after the
+        connection's last request, when it disconnects, or on any other lock trigger."""
+        s.autofill_conn = conn
+        if s.autofill_key is None:
+            s.autofill_key = secrets.token_bytes(32)
+        self.touch_autofill(s, conn)
+        self.notify_autofill(s.uid)
+
+    def autofill_open(self, s: Session | None, conn) -> bool:
+        return (s is not None and conn is not None and s.autofill_conn is conn
+                and not conn.closed and self.clock() < s.autofill_until)
+
+    def touch_autofill(self, s: Session, conn) -> None:
+        if s.autofill_conn is not conn:
+            return
+        s.autofill_until = self.clock() + protocol.AUTOFILL_OPEN_S
+        if s.autofill_timer is not None:
+            s.autofill_timer.cancel()
+        s.autofill_timer = asyncio.get_running_loop().call_later(
+            protocol.AUTOFILL_OPEN_S, self._autofill_timeout, s.uid, conn)
+
+    def _autofill_timeout(self, uid: int, conn) -> None:
+        s = self.sessions.get(uid)
+        if s is None or s.autofill_conn is not conn:
+            return
+        if self.clock() < s.autofill_until:          # touched since this timer was set
+            return
+        self.close_autofill(s)
+
+    def close_autofill(self, s: Session) -> None:
+        """End the browser's unlock: a full lock unless the window has tier 1 open."""
+        if s.autofill_conn is None:
+            return
+        if s.unlocked():
+            self._clear_autofill(s)
+        else:
+            self.lock(s.uid, "autofill-timeout", notify=False)
+
+    def _clear_autofill(self, s: Session) -> None:
+        s.autofill_conn = None
+        s.autofill_until = 0.0
+        if s.autofill_timer is not None:
+            s.autofill_timer.cancel()
+            s.autofill_timer = None
+
     def lock(self, uid: int, reason: str | None, *, notify: bool = True) -> bool:
         """Every lock trigger. Returns whether tier 1 was open."""
         s = self.sessions.get(uid)
         if s is None:
             return False
         was = s.tier1 is not None
+        was_autofill = s.autofill_conn is not None
+        self._clear_autofill(s)
         s.tier1 = None
         s.show_all = False
         s.autofill_key = None                       # every handle handed out is void
@@ -463,7 +520,7 @@ class Registry:
         self._wipe_store(s)
         if notify and reason and (was or reason == "user"):
             self.notify_ui(uid, {"event": "locked", "reason": reason})
-        if was:
+        if was or was_autofill:
             self.notify_autofill(uid)
             logger.info("uid %d locked (%s)", uid, reason or "window closed")
         return was

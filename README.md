@@ -67,7 +67,7 @@ autofill hosts once you turn autofill on in the window. While autofill is on, an
 running as you can connect the way a browser does; it still gets a password only if you approve
 that fill's dialog (see [Autofill](#autofill-bring-your-own-extension)).
 
-You see two kinds of dialog, both drawn by Omarchy's own polkit agent, and nothing else ever
+You see these dialogs, both drawn by Omarchy's own polkit agent, and nothing else ever
 asks for a password:
 
 | Action | The dialog says | When |
@@ -76,6 +76,7 @@ asks for a password:
 | `io.github.dragosol.pearpasswords.reveal` | Use the saved password for $(account) | The first reveal, copy, code, notes, history or edit of one account |
 | `io.github.dragosol.pearpasswords.manage` | Change Pear Passwords on this computer | Signing in or out, adding or deleting, moving from 1.x, starting over, deleting the old 1.x copy, checking clipboard history, turning browser autofill on, moving your keys onto the security chip, turning a category that waits for a check (Passkeys, Recently Deleted) on or off, reading the keychain diagnostic |
 | `io.github.dragosol.pearpasswords.autofill` | A browser extension asks to fill the password for $(account) on $(origin) | Every browser fill, if you set up autofill |
+| `io.github.dragosol.pearpasswords.autofill-names` | A browser extension asks to see which accounts you have saved for $(origin) | When the browser's picker asks to name a site's accounts before any fill (once per site until Pear locks) |
 
 1. **Opening Pear** asks once. Approving releases the list of accounts: names, sites and
    usernames, never a password. The list shows straight away from the last sync, with "synced
@@ -117,7 +118,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "1ce465244184562de0c7ad0a1a7a7020d83d566d86aa47044dd89e6b85c24a5b  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "7412c073776ca08d53c9c8369c26cd0ff61d7eeaa8cbf286a488f2db62380886  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -144,7 +145,7 @@ The system step installs, and records in a receipt (`/var/lib/pear-passwords-ins
 | The rule that creates the vault directory | `/etc/tmpfiles.d/pear-passwords.conf` |
 | The installed version and the hash of its `SHA256SUMS` | `/usr/local/lib/pear-passwords/VERSION` |
 | The window's system-only font configuration and the root uninstaller | `/usr/local/lib/pear-passwords/etc/fonts.conf`, `/usr/local/lib/pear-passwords/libexec/uninstall-root` |
-| The four polkit actions | `/usr/share/polkit-1/actions/io.github.dragosol.pearpasswords.policy` |
+| The five polkit actions | `/usr/share/polkit-1/actions/io.github.dragosol.pearpasswords.policy` |
 | The `pear-passwords` user and the empty `pear-client` group | `/etc/sysusers.d/pear-passwords.conf` |
 | Your vault, readable only by `pear-passwords` | `/var/lib/pear-passwords/u<uid>/` |
 | The launcher | `/usr/local/share/applications/io.github.dragosol.PearPasswords.desktop` |
@@ -279,7 +280,11 @@ whose hash still matches, and `./uninstall.sh` runs `unregister --all` for you.
 
 How a fill works:
 
-- It works only while the Pear window is open and unlocked. While Pear is locked the host
+- It works with the Pear window closed too. While Pear is locked, a browser asking to see a
+  site's accounts gets one dialog, "A browser extension asks to see which accounts you have
+  saved for github.com". Approving it unlocks Pear for that browser connection only, and
+  shows that site's accounts by name. It locks again 2 minutes after the browser's last
+  request, when the browser disconnects, or with any other lock. Until then a locked Pear
   answers only "locked", and says nothing about which sites have accounts.
 - **Every fill shows its own dialog**: "A browser extension asks to fill the password for
   GitHub — me on github.com". No approval carries over to the next fill, and the browser never
@@ -503,8 +508,9 @@ the design and the gates still to be verified in a VM).
   any program of yours) can kill the window.
   <!-- tests: test_qml_no_ipc.py test_qml_process_allowlist.py test_qml_no_console_log.py test_pear_exec_env.py -->
 - **Autofill is opt-in and asks every time.** No installer registers a browser. A locked Pear
-  tells the browser nothing, and each fill shows its own dialog for one matching account.
-  <!-- tests: test_autofill_handlers.py test_autofill_origin.py test_autofill_register.py test_repo_guards.py::InstallerWritesNoManifestTests -->
+  tells the browser nothing until you approve its dialog to see one site's accounts, and each
+  fill shows its own dialog for one matching account.
+  <!-- tests: test_autofill_handlers.py test_autofill_browser_unlock.py test_autofill_origin.py test_autofill_register.py test_repo_guards.py::InstallerWritesNoManifestTests -->
 - **Every connection to Apple is verified.** All of them check the certificate and the
   hostname. `gsa.apple.com` is served from Apple's own private authority, so the one extra
   root is added, checked against its published SHA-256 on every load. Every credential-bearing

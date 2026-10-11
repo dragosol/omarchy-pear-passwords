@@ -1,6 +1,6 @@
-"""Browser autofill, daemon side: the two ops an `autofill` connection may send.
+"""Browser autofill, daemon side: the three ops an `autofill` connection may send.
 
-The daemon's dispatch table calls the two handlers for role "autofill" and nothing else
+The daemon's dispatch table calls the three handlers for role "autofill" and nothing else
 does. The browser extension is not part of this repository - anyone can write one against
 docs/autofill-protocol.md - so the daemon trusts nothing the extension says except the origin,
 and treats that only as being as trustworthy as the browser that reported it.
@@ -11,7 +11,9 @@ The rules these handlers implement (docs/protocol.md 'Autofill' is the normative
   refuses the role, and both ops refuse with "forbidden" once it is turned off again. pear-exec
   runs the autofill role for any program of yours, so the browser manifest alone is no opt-in.
 - A query names accounts (username, label) only to a connection that has had a fill approved
-  since the last unlock; before that it gives handles and match kinds only. Any program of
+  since the last unlock, or for a site whose names it was shown by an approved
+  `.autofill-names` dialog (autofill-names) since then; before that it gives handles and match
+  kinds only. Any program of
   yours that gets one fill dialog approved receives that one password - the dialog says a
   browser extension is asking, and the window shows whether an autofill host is connected.
 - An autofill client never sees an entry id. Entry ids are an unkeyed hash of (domain,
@@ -21,10 +23,13 @@ The rules these handlers implement (docs/protocol.md 'Autofill' is the normative
   nothing after a lock and cannot be computed from a guess. A real entry id sent to fill is
   just an unknown handle (no-match).
 
-- A locked Pear reveals nothing. Unless the uid's tier-1 UI session is unlocked, both ops
-  answer as if no account exists for any site: autofill-query returns {"state": "locked"} with
-  no other field, autofill-fill raises OpError("locked"). Neither ever unseals a key, raises a
-  dialog, or touches the store while locked.
+- A locked Pear reveals nothing. Unless the uid's tier-1 UI session is unlocked, or the store
+  is open for this connection, query and fill answer as if no account exists for any site:
+  autofill-query returns {"state": "locked"} with no other field, autofill-fill raises
+  OpError("locked"). Neither unseals a key, raises a dialog, or touches the store then. The
+  one way in is autofill-names, whose approved `.autofill-names` dialog unlocks the store for
+  that connection only (SessionRegistry.open_autofill), until AUTOFILL_OPEN_S after its last
+  request, its disconnect, or any lock.
 - The autofill role never gets a tier-1 or tier-2 grant and never uses the UI's grants. Every
   fill raises its own `.autofill` polkit dialog against the autofill process's pidfd.
 - Matching is by site, never by name: the origin host must be the entry's `domain` or one of
@@ -262,12 +267,20 @@ def _field(req: dict, name: str) -> str:
     return v
 
 
-def _open_session(reg: SessionRegistry, uid: int):
-    """The uid's session if tier 1 is open right now, else None."""
+def _open_session(reg: SessionRegistry, uid: int, conn=None):
+    """The uid's session if tier 1 is open right now, or the store is open for this autofill
+    connection (an unlock made by autofill-names); else None. A request on the connection the
+    browser's unlock serves keeps it open for another AUTOFILL_OPEN_S."""
     session = reg.get(uid)
-    if session is None or not session.unlocked():
+    if session is None:
         return None
-    return session
+    if session.unlocked():
+        return session
+    autofill_open = getattr(reg, "autofill_open", None)
+    if autofill_open is not None and autofill_open(session, conn):
+        reg.touch_autofill(session, conn)
+        return session
+    return None
 
 
 def _require_enabled(reg: SessionRegistry, uid: int) -> None:
@@ -275,6 +288,13 @@ def _require_enabled(reg: SessionRegistry, uid: int) -> None:
     session = reg.get(uid)
     if session is not None and not getattr(session, "autofill_enabled", False):
         raise OpError("forbidden")
+
+
+def _names_approved(conn, session, host: str) -> bool:
+    """Were this site's account names approved for this connection (autofill-names) since the
+    uid last unlocked? The approval names that one host, as its dialog says."""
+    epoch, hosts = getattr(conn, "autofill_names", (None, frozenset()))
+    return epoch == getattr(session, "epoch", 0) and host in hosts
 
 
 def _approved(conn, session) -> bool:
@@ -370,7 +390,7 @@ async def handle_autofill_query(session_registry: SessionRegistry, conn: Connect
     reg, uid = session_registry, conn.uid
     _require_enabled(reg, uid)
     host = parse_origin(_field(req, "origin"))
-    session = _open_session(reg, uid)
+    session = _open_session(reg, uid, conn)
     if session is None:
         return {"state": _closed_state(reg, uid)}
     try:
@@ -379,7 +399,7 @@ async def handle_autofill_query(session_registry: SessionRegistry, conn: Connect
         return {"state": _closed_state(reg, uid)}
     # A lock that landed while the list was being read wins: nothing read under the old
     # session leaves the daemon.
-    if _open_session(reg, uid) is not session:
+    if _open_session(reg, uid, conn) is not session:
         return {"state": _closed_state(reg, uid)}
     ranked = []
     for meta in metas:
@@ -387,7 +407,7 @@ async def handle_autofill_query(session_registry: SessionRegistry, conn: Connect
         if rank is not None:
             ranked.append((rank, -float(meta.mdat or 0), account_label(meta).casefold(), meta))
     ranked.sort(key=lambda r: r[:3])
-    named = _approved(conn, session)
+    named = _approved(conn, session) or _names_approved(conn, session, host)
     key = _handle_key(session)
     if key is None:
         return {"state": _closed_state(reg, uid)}
@@ -398,6 +418,67 @@ async def handle_autofill_query(session_registry: SessionRegistry, conn: Connect
             a["username"], a["label"] = m.username or "", account_label(m)
         accounts.append(a)
     return {"state": "unlocked", "host": host, "accounts": accounts}
+
+
+async def _unlock_for_names(reg: SessionRegistry, conn: Connection, uid: int, host: str,
+                            req: dict) -> dict:
+    """autofill-names while tier 1 is closed: the one `.autofill-names` dialog also unlocks
+    the store, for this autofill connection only (SessionRegistry.open_autofill), so the
+    browser needs no Pear window. Unavailable (empty, seal states) or no session: the query
+    answer and no dialog. The unlock ends AUTOFILL_OPEN_S after the connection's last request,
+    when it disconnects, or on any lock trigger; every fill still raises its own dialog."""
+    s = reg.get(uid)
+    state = _closed_state(reg, uid)
+    if s is None or state != "locked" or getattr(s, "wipe_after", False):
+        return {"state": state}
+    await reg.authorize(conn, paths.ACTION_AUTOFILL_NAMES, {"origin": host})
+    if conn.closed:
+        raise OpError("cancelled")
+    if s.unlocked():                        # the window unlocked while the dialog was up
+        conn.autofill_names = (s.epoch, frozenset({host}))
+        return await handle_autofill_query(reg, conn, req)
+    epoch = s.epoch
+    try:
+        await reg.run_store(uid, s.store.unlock)
+    except (StoreLocked, SealError):
+        return {"state": _closed_state(reg, uid)}
+    if s.epoch != epoch or conn.closed:
+        reg._wipe_store(s)
+        raise OpError("cancelled")
+    reg.open_autofill(s, conn)
+    conn.autofill_names = (s.epoch, frozenset({host}))
+    return await handle_autofill_query(reg, conn, req)
+
+
+async def handle_autofill_names(session_registry: SessionRegistry, conn: Connection,
+                                req: dict) -> dict:
+    """op "autofill-names" {origin}: autofill-query, with this site's accounts named.
+
+    The browser's picker otherwise shows "Account 1, 2, ..." until a fill is approved. Locked
+    or unavailable: the same answer as autofill-query, and no dialog. Already named (a fill or
+    an earlier autofill-names since the last unlock): the query answer, no dialog. Otherwise
+    one `.autofill-names` dialog naming the site; once approved, and the session and the
+    connection are still there, that host's names are given to this connection until Pear
+    locks, and the reply is autofill-query's. Raises OpError for every refusal authorize()
+    raises, plus cancelled and the query's own errors."""
+    reg, uid = session_registry, conn.uid
+    _require_enabled(reg, uid)
+    host = parse_origin(_field(req, "origin"))
+    session = _open_session(reg, uid, conn)
+    if session is None:
+        return await _unlock_for_names(reg, conn, uid, host, req)
+    if not (_approved(conn, session) or _names_approved(conn, session, host)):
+        await reg.authorize(conn, paths.ACTION_AUTOFILL_NAMES, {"origin": host})
+        if conn.closed:
+            raise OpError("cancelled")
+        approved_in = _open_session(reg, uid, conn)
+        if approved_in is not session:
+            return {"state": _closed_state(reg, uid)}
+        epoch, hosts = getattr(conn, "autofill_names", (None, frozenset()))
+        if epoch != getattr(session, "epoch", 0):
+            hosts = frozenset()
+        conn.autofill_names = (getattr(session, "epoch", 0), hosts | {host})
+    return await handle_autofill_query(reg, conn, req)
 
 
 async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connection,
@@ -428,7 +509,7 @@ async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connecti
     origin = _field(req, "origin")
     handle = _field(req, "id")
     host = parse_origin(origin)
-    session = _open_session(reg, uid)
+    session = _open_session(reg, uid, conn)
     if session is None:
         raise OpError("locked")
     entry_id = await _resolve(reg, session, uid, handle)
@@ -447,7 +528,7 @@ async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connecti
     try:
         if conn.closed:
             raise OpError("cancelled")
-        session = _open_session(reg, uid)
+        session = _open_session(reg, uid, conn)
         if session is None:
             raise OpError("locked")
         meta = await _matching_meta(reg, session, uid, entry_id, host)
@@ -457,7 +538,7 @@ async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connecti
             raise OpError("no-match") from None
         except (StoreLocked, SealError):
             raise OpError("locked") from None
-        if _open_session(reg, uid) is not session:
+        if _open_session(reg, uid, conn) is not session:
             secrets = None
             raise OpError("locked")
         reply = {"id": handle, "username": meta.username or "",

@@ -42,6 +42,9 @@ AUTOFILL_STATES = ("locked", "unlocked", "unavailable")
 TICKET_TTL_S = 10
 TICKET_BYTES = 32                    # base64url without padding on the wire: 43 characters
 GRANT_S_DEFAULT = 120
+# An unlock made from the browser (autofill-names while the window is closed or locked) lasts
+# this long after the browser's last request, and ends at once when that host disconnects.
+AUTOFILL_OPEN_S = 120
 GRANT_S_RANGE = (0, 600)             # 0 = single use
 CLIP_TIMEOUT_S_DEFAULT = 30
 CLIP_TIMEOUT_S_RANGE = (5, 60)
@@ -93,7 +96,7 @@ ROLE_OPS: dict[str, frozenset[str]] = {
     }),
     "clip": frozenset({"redeem", "clip-result"}),
     "migrate": frozenset({"import-file", "import-key", "import-commit", "purge-result"}),
-    "autofill": frozenset({"autofill-query", "autofill-fill"}),
+    "autofill": frozenset({"autofill-query", "autofill-names", "autofill-fill"}),
 }
 ALL_OPS = frozenset({"hello"}).union(*ROLE_OPS.values())
 
@@ -114,6 +117,7 @@ PROMPT_ACTION: dict[str, str] = {
     "features": paths.ACTION_MANAGE,             # changing a flag only; reading never asks
     "diag-items": paths.ACTION_MANAGE,
     "autofill-fill": paths.ACTION_AUTOFILL,
+    "autofill-names": paths.ACTION_AUTOFILL_NAMES,   # only when this site is not yet named
 }
 # Rate-limit bucket per role: the UI and the browser never starve each other.
 PROMPT_BUCKET = {"ui": "ui", "autofill": "autofill"}

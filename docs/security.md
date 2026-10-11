@@ -262,19 +262,29 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
   its receipt recorded. Tests: `test_daemon_handlers.py::AutofillOptInTests`,
   `test_autofill_register.py`, `test_repo_guards.py::InstallerWritesNoManifestTests`.
 - While autofill is on, any same-uid program can connect as an autofill host. A query gives it
-  handles only, no usernames or labels, until a fill on that connection is approved; every fill is
-  its own `.autofill` dialog, which says a browser extension is asking, and the window shows
+  handles only, no usernames or labels, until a fill on that connection is approved or, for one
+  site, an `autofill-names` request's `.autofill-names` dialog ("A browser extension asks to see
+  which accounts you have saved for *site*") is approved; those names last until Pear locks and
+  never include a password. Every fill is its own `.autofill` dialog, which says a browser extension is asking, and the window shows
   when a host is connected. Residual: a program that gets the user to approve one fill dialog
   receives that password. A handle is HMAC-SHA256 of the entry id under a key that exists only
   while the uid is unlocked, never the entry id itself (an unkeyed hash of domain and username,
   which would let a program confirm a guessed username offline). Tests:
   `test_autofill_handlers.py::HandleTests`, `test_autofill_handlers.py`,
+  `test_autofill_handlers.py::QueryTests::test_names_for_one_site_cost_one_dialog_and_no_secret`,
   `test_autofill_host_framing.py`.
 - While the uid is locked, `autofill-query` answers only `locked` (or `unavailable`), and
   `autofill-fill` answers `locked`: nothing reveals which sites have accounts. Every fill
   raises `.autofill` with the account and the origin's host, and is re-checked after approval.
   An unknown id and a non-matching id give the same `no-match`. Tests:
   `test_autofill_handlers.py`.
+- **The browser can unlock Pear for itself, briefly, behind one dialog.** With the window
+  closed or locked, an approved `.autofill-names` dialog unlocks the store for that one autofill
+  connection: no tier 1, no grant, no sync, and other connections still get `locked`. It locks
+  again 120 s after that connection's last request, when it disconnects, or on any lock
+  trigger (sleep, logind, the window's own lock). Every fill still raises `.autofill`. Residual:
+  a program that gets that dialog approved learns one site's account names and can then ask
+  for fill dialogs without the window open. Tests: `test_autofill_browser_unlock.py`.
 - Origins must be `https` with an ASCII host; matching is exact host or a dot-boundary
   sub/parent domain that is not a public suffix. Tests: `test_autofill_origin.py`,
   `test_autofill_host_framing.py`.
@@ -314,7 +324,7 @@ check other users' subjects. The subject is the caller's pidfd. Tests: `test_pol
 | Attacker | Outcome | Notes |
 |---|---|---|
 | A copy of `~/.config/icp` or all of `/home` | Holds | After the move nothing in `/home` decrypts anything; the renamed v1 backup is sealed by the old passphrase only. |
-| A program running as you, any `ptrace_scope` | Mostly holds | No socket access except the autofill role while autofill is on, no state access, no unseal, no ptrace or `/proc` reads of Pear's processes, no injection. Residual: clipboard during an offer, screen capture of a revealed value, starting Pear to show a dialog, an autofill fill dialog approved by mistake (that one password), a rival polkit agent phishing the login password, denial of service, and control of the compositor (below). |
+| A program running as you, any `ptrace_scope` | Mostly holds | No socket access except the autofill role while autofill is on, no state access, no unseal, no ptrace or `/proc` reads of Pear's processes, no injection. Residual: clipboard during an offer, screen capture of a revealed value, starting Pear to show a dialog, an autofill fill dialog approved by mistake (that one password), an autofill names dialog approved by mistake (one site's account names, and 2 minutes of fill dialogs it can raise), a rival polkit agent phishing the login password, denial of service, and control of the compositor (below). |
 | Another local user | Holds | Per-uid state; the subject's uid must match; `auth_self`. |
 | Remote login as you | Holds | `allow_any=no`, `allow_inactive=no`; pear-exec needs a local compositor. |
 | Network | Holds | TLS verified, `trust_env=False`, no redirects, `icloud.com` endpoint check. |
@@ -399,7 +409,7 @@ Each of these was considered and rejected because it leaves a hole:
 | A user-level agent behind polkit (1.3.x) | Any process running as you skips the gate and talks to the agent or reads its files; the verdict is an exit code your own code reads. |
 | `systemd-creds --user` alone | Any process of your uid decrypts it with no prompt (tested). |
 | App-side system-scope `systemd-creds decrypt` | `auth_admin_keep`: one approval lasts about 5 minutes, per-account prompts stop working, the message cannot be branded, and the plaintext lands in a process running as you. |
-| A daemon that serves any same-uid caller after polkit | An impostor can trigger a genuine-looking dialog and receive the result. The autofill role is the one accepted exception, off until turned on in the window, with a dialog that names a browser extension and no account names before an approved fill. |
+| A daemon that serves any same-uid caller after polkit | An impostor can trigger a genuine-looking dialog and receive the result. The autofill role is the one accepted exception, off until turned on in the window, with a dialog that names a browser extension and no account names before an approved fill or an approved request to see one site's names. |
 | `wl-copy` for secrets | wl-clipboard 2.3.0 stages its input in a `/tmp` file. |
 | A timing grace window for clipboard readers | It hands the value to whoever reads first; reader identification replaces it. |
 | A user sync timer or a sync lease | Background activity that could prompt, or hold Apple tokens while the window is closed. |

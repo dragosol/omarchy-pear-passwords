@@ -296,6 +296,82 @@ class QueryTests(Base):
         self.unlock()
         self.assertNotIn("username", self.query()["accounts"][0])   # a new unlock, again
 
+    def names(self, origin="https://github.com", conn=None):
+        return run(autofill.handle_autofill_names(self.reg, conn or self.conn,
+                                                  {"op": "autofill-names", "origin": origin}))
+
+    def test_names_for_one_site_cost_one_dialog_and_no_secret(self):
+        self.unlock()
+        r = self.names()
+        self.assertEqual(self.reg.dialogs, [(self.conn, paths.ACTION_AUTOFILL_NAMES,
+                                             {"origin": "github.com"})])
+        self.assertEqual([a["username"] for a in r["accounts"]], ["bob", "alice", "erin", "carol"])
+        self.assertEqual(r["accounts"][0]["label"], "github.com — bob")
+        self.assertEqual(self.store.unseal_count, 0)
+        self.assertNotIn(FAKE_PW, repr(r))
+        # this site stays named on this connection, with no second dialog...
+        self.assertIn("username", self.query()["accounts"][0])
+        self.names()
+        self.assertEqual(len(self.reg.dialogs), 1)
+        # ...but not another site, nor another connection
+        self.assertNotIn("username", self.query("https://example.net")["accounts"][0])
+        self.assertNotIn("username", self.query(conn=FakeConn())["accounts"][0])
+
+    def test_names_end_with_the_unlock(self):
+        self.unlock()
+        self.names()
+        self.session.lock()
+        self.unlock()
+        self.assertNotIn("username", self.query()["accounts"][0])
+        self.names()
+        self.assertEqual(len(self.reg.dialogs), 2)
+
+    def test_a_refused_names_dialog_names_nothing(self):
+        self.unlock()
+        for answer in ("dismissed", "denied"):
+            self.reg.answers = [answer]
+            with self.assertRaises(OpError) as cm:
+                self.names()
+            self.assertEqual(cm.exception.code, answer)
+            self.assertNotIn("username", self.query()["accounts"][0])
+
+    def test_a_lock_while_the_names_dialog_is_up_reveals_nothing(self):
+        # (names while locked unlocks for the browser: test_autofill_browser_unlock.py)
+        self.unlock()
+        self.reg.during = self.session.lock
+        self.assertEqual(self.names(), {"state": "locked"})
+        self.reg.during = None
+        self.unlock()
+        self.assertNotIn("username", self.query()["accounts"][0])
+
+    def test_a_connection_gone_during_the_names_dialog_gets_nothing(self):
+        self.unlock()
+        self.reg.during = lambda: setattr(self.conn, "closed", True)
+        with self.assertRaises(OpError) as cm:
+            self.names()
+        self.assertEqual(cm.exception.code, "cancelled")
+
+    def test_a_connection_gone_just_after_approval_gets_nothing(self):
+        # The registry cancels a dialog whose connection closes while it is up; the handler
+        # also refuses one that closed in the moment after the approval.
+        self.unlock()
+        approve = self.reg.authorize
+
+        async def approve_then_close(conn, action, details):
+            await approve(conn, action, details)
+            conn.closed = True
+        self.reg.authorize = approve_then_close
+        with self.assertRaises(OpError) as cm:
+            self.names()
+        self.assertEqual(cm.exception.code, "cancelled")
+        self.assertNotIn("username", self.query(conn=self.conn)["accounts"][0])
+
+    def test_an_approved_fill_already_names_so_names_asks_nothing(self):
+        self.unlock()
+        self.fill("gh1")
+        self.names("https://github.com")
+        self.assertEqual([d[1] for d in self.reg.dialogs], [paths.ACTION_AUTOFILL])
+
     def test_switched_off_in_the_window_serves_nothing(self):
         self.unlock()
         self.session.autofill_enabled = False

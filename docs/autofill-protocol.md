@@ -26,12 +26,18 @@ The code is `backend/icp/client/autofill.py` (the host),
   without your approval of that fill's dialog, but if you approve a dialog you did not trigger
   from your browser, that program gets that password. The Pear window shows when an autofill
   host is connected.
-- Autofill works only while the Pear Passwords window is open and unlocked. While Pear is
-  locked, closed, or not set up, the host says only `locked` or `unavailable`. It does not say
-  whether the site has any accounts, and it never raises a dialog.
+- The Pear window does not have to be open. While Pear is locked or closed, `query` and
+  `fill` say only `locked` (or `unavailable` when it is not set up), without a dialog and
+  without saying whether the site has accounts. `names` (4.3) is the one way in: its dialog
+  unlocks Pear for your host process only, until 2 minutes after its last request, until it
+  disconnects, or until any other lock.
 - After an approved fill, **the browser and the extension hold that one password.** Whatever
   can read the extension's memory or the page's form can read it. The origin is only as
   trustworthy as the browser that reported it.
+- Your picker can show which account is which before any fill: `names` (4.3) raises one Pear
+  dialog, "A browser extension asks to see which accounts you have saved for *site*", and once
+  approved that site's names and usernames are yours until Pear locks. Without it, or a fill,
+  a query gives only opaque handles, so a program you did not approve learns nothing.
 - One autofill dialog open at a time, and after 3 dismissed or denied ones in a minute no more
   for the rest of it (approvals are not counted). The window has its own separate allowance,
   so a page cannot use autofill to block it.
@@ -126,12 +132,36 @@ request for the daemon from `origin` and `id` only.
   valid until Pear next locks (then query again: an old handle is `no-match`), it is the same
   for every host process during one unlock, and it is not derived from the username in any
   way you could check. `username` and
-  `label` (what the Pear dialog shows) are included only after a fill through this host
+  `label` (what the Pear dialog shows) are included only after a fill (or `names` for this site) through this host
   process was approved since Pear was last unlocked; before that, show "Account 1, 2, ..."
-  and let the Pear dialog name the account.
+  with a way to ask `names` (4.3), and let the Pear dialog name the account.
 - An empty list means no account for this site.
 
-### 4.3 fill
+### 4.3 names
+
+```json
+{"op":"names","rid":4,"origin":"https://github.com"}
+-> {"rid":4,"state":"unlocked","host":"github.com",
+    "accounts":[{"id":"<opaque>","username":"me@example.com","label":"GitHub — me@example.com",
+                 "match":"exact"}]}
+-> {"rid":4,"state":"locked"}
+-> {"rid":4,"error":"dismissed"}
+```
+
+- A `query` whose accounts carry `username` and `label` for this site. If the site is not
+  named yet (no approved fill or `names` for it on this host process since Pear last
+  unlocked), Pear first shows its `.autofill-names` dialog naming the site. Approved: the site
+  stays named for every later `query` and `names` on this host process until Pear locks, with
+  no further dialog. Other sites are not named by it.
+- Never returns a secret. Unavailable: the `query` answer, and no dialog. Locked (the window
+  closed or locked): the same one dialog also unlocks Pear for this host process, until 2
+  minutes after its last request, until it disconnects, or until any other lock. Other host
+  processes still get `locked`.
+- Errors are the ones a fill's dialog can give (4.5), plus `bad-origin`/`insecure-origin`.
+- Keep the host process alive between popups (a long-lived `connectNative` port) or the names
+  are asked for again; `sendNativeMessage` starts a new host process each time.
+
+### 4.4 fill
 
 ```json
 {"op":"fill","rid":3,"origin":"https://github.com","id":"<opaque>"}
@@ -145,7 +175,7 @@ the daemon checks again that Pear is still unlocked and that the account still m
 origin; if either changed during the dialog, the fill fails. Only the username and password
 are returned: never notes, a one-time code or a code seed.
 
-### 4.4 Errors
+### 4.5 Errors
 
 `{"rid":n,"error":"<code>"}`, sometimes with `field` or `retry_after`:
 
@@ -257,7 +287,8 @@ not part of Pear Passwords.
   is trusted. A compromised browser can claim any origin and so obtain the password for any
   account whose fill you approve. The dialog names both the account and the site; read it.
 - A locked Pear reveals nothing to autofill: not the account list, not whether a site has
-  accounts, and not which of the `unavailable` cases applies. Saying so needs no dialog.
+  accounts, and not which of the `unavailable` cases applies. Saying so needs no dialog. Only
+  an approved `names` dialog unlocks it, for that one host process, briefly.
 - Every fill is checked against the autofill process's own pidfd. It never uses a grant the
   window holds, and the window's grants never apply to it.
 - The window gets an `autofill` event (filled, dismissed, denied or failed) for each answered

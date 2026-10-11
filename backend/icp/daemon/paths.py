@@ -110,7 +110,8 @@ ACTION_UNLOCK = f"{POLKIT_ACTION_PREFIX}.unlock"        # tier 1: the account li
 ACTION_REVEAL = f"{POLKIT_ACTION_PREFIX}.reveal"        # tier 2: one account, grant_s seconds
 ACTION_MANAGE = f"{POLKIT_ACTION_PREFIX}.manage"        # sign-in, create, delete, migrate, ...
 ACTION_AUTOFILL = f"{POLKIT_ACTION_PREFIX}.autofill"    # one browser fill, every time
-ACTIONS = (ACTION_UNLOCK, ACTION_REVEAL, ACTION_MANAGE, ACTION_AUTOFILL)
+ACTION_AUTOFILL_NAMES = f"{POLKIT_ACTION_PREFIX}.autofill-names"  # one site's account names
+ACTIONS = (ACTION_UNLOCK, ACTION_REVEAL, ACTION_MANAGE, ACTION_AUTOFILL, ACTION_AUTOFILL_NAMES)
 
 POLICY_FILE = f"/usr/share/polkit-1/actions/{POLKIT_ACTION_PREFIX}.policy"
 LEGACY_POLICY_FILE = "/usr/share/polkit-1/actions/org.icp.unlock.policy"

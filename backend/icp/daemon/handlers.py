@@ -39,7 +39,7 @@ from .tickets import TicketError
 
 logger = logging.getLogger(__name__)
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 
 _HOST_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
                       r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
@@ -1491,6 +1491,11 @@ async def op_autofill_query(reg, conn, req):
     return await autofill.handle_autofill_query(reg, conn, req)
 
 
+async def op_autofill_names(reg, conn, req):
+    from . import autofill
+    return await autofill.handle_autofill_names(reg, conn, req)
+
+
 async def op_autofill_fill(reg, conn, req):
     from . import autofill
     return await autofill.handle_autofill_fill(reg, conn, req)
@@ -1509,7 +1514,8 @@ HANDLERS = {
     "redeem": op_redeem, "clip-result": op_clip_result,
     "import-file": op_import_file, "import-key": op_import_key,
     "import-commit": op_import_commit, "purge-result": op_purge_result,
-    "autofill-query": op_autofill_query, "autofill-fill": op_autofill_fill,
+    "autofill-query": op_autofill_query, "autofill-names": op_autofill_names,
+    "autofill-fill": op_autofill_fill,
     "autofill-enable": op_autofill_enable,
     "copy-text": op_copy_text, "features": op_features, "diag-items": op_diag_items,
 }

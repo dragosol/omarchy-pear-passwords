@@ -156,10 +156,11 @@ class ProtocolValueTests(unittest.TestCase):
     def test_roles_and_prompts(self):
         self.assertEqual(set(protocol.ROLE_OPS), set(paths.ROLES))
         self.assertEqual(set(protocol.PROMPT_ACTION.values()), set(paths.ACTIONS))
-        # The autofill role can raise only its own dialog, and the UI never raises it.
+        # The autofill role can raise only its own two dialogs, and the UI never raises them.
         for op, action in protocol.PROMPT_ACTION.items():
             is_autofill = op in protocol.ROLE_OPS["autofill"]
-            self.assertEqual(action == paths.ACTION_AUTOFILL, is_autofill, op)
+            self.assertEqual(action in (paths.ACTION_AUTOFILL, paths.ACTION_AUTOFILL_NAMES),
+                             is_autofill, op)
         # clip and migrate never raise a dialog: their authority is the ticket.
         for role in protocol.TICKET_ROLES:
             self.assertFalse(protocol.ROLE_OPS[role] & set(protocol.PROMPT_ACTION), role)

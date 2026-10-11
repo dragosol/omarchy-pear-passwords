@@ -163,6 +163,16 @@ class TranslationTests(HostHarness):
         self.assertEqual(self.recv(), {"rid": 7, "state": "unlocked", "host": "github.com",
                                        "accounts": []})
 
+    def test_names_carries_the_origin_only(self):
+        self.send({"op": "names", "rid": 4, "origin": "https://github.com", "id": "gh1",
+                   "all": True})
+        self.recv()                                              # state event
+        req = self.daemon_recv()
+        self.assertEqual({k: v for k, v in req.items() if k != "rid"},
+                         {"op": "autofill-names", "origin": "https://github.com"})
+        self.daemon_send({"rid": req["rid"], "error": "dismissed"})
+        self.assertEqual(self.recv(), {"rid": 4, "error": "dismissed"})
+
     def test_fill_carries_origin_and_id_only(self):
         self.send({"op": "fill", "rid": 3, "origin": "https://github.com", "id": "gh1",
                    "password": "x", "op2": "unlock"})
@@ -175,7 +185,7 @@ class TranslationTests(HostHarness):
 
     def test_no_other_daemon_op_is_reachable(self):
         for op in ("unlock", "grant", "reveal", "copy", "autofill-fill", "autofill-query",
-                   "hello", "redeem", "import-key", None, 5):
+                   "autofill-names", "hello", "redeem", "import-key", None, 5):
             self.send({"op": op, "rid": 1, "origin": "https://github.com", "id": "gh1"})
             self.assertEqual(self.recv(), {"rid": 1, "error": "unknown-op"}, op)
         self.assertIsNone(self.daemon)                           # never even connected
