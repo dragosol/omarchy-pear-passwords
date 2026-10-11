@@ -15,7 +15,7 @@ PP_UNITS="$HOME/.config/systemd/user"
 PP_LAUNCHER_1X="$HOME/.local/share/applications/pear-passwords.desktop"
 PP_STAGE_CACHE="$HOME/.cache/pear-passwords"
 
-# sha256 of every released copy, by file name. Frozen: collected from every 1.x commit.
+# sha256 of every released copy, by file name: every 1.x commit, and each 2.x change since.
 RELEASED_USER="
 168fb5f9f75df0b5489bf548f76131ef44af07c7efe4d2cc5b877985d2c09355 pear-passwords-sync.service
 262574cf2494701fafd6a19d042cc3eccd320259b03c54b1aba02aa5b10a72a4 pear-passwords-sync.service
@@ -26,6 +26,7 @@ RELEASED_USER="
 d06ba8e79d61ce49831c425cb01a2dd4b0c80d1980a25f9ee2f5748a2bafba11 pear-passwords-sync.timer
 17c95a02b27af6ae8a245f94c302422f3104537b9a0cd9cc221c18e8b4f5d916 pear-passwords-anisette.service
 c6d76ad886446638daee70ac8140ceaa8139d028b0550053364e12b6c4735447 pear-passwords-anisette.service
+1af21f03ad889d583db7c5af22bdaa62f83743f38eb50a18d27cd74fc16838e6 pear-passwords-anisette.service
 720986736414f5ffc6ae8119650ce72bb85ebdba0c0814ed07514d92952cac53 pear-passwords.desktop
 500f1ad818d777801e2d7929dc8aa90d454fd1faf835ebee5788b36c3554ac70 pear-passwords.desktop
 9fea786026bfbfa8c9cc3146bd93d8ddb31fcc9e73b88e26c3865fd4442d9c1a pear-passwords.desktop

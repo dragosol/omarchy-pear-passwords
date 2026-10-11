@@ -18,14 +18,24 @@ if [[ ! "$REV" =~ ^[0-9a-f]{40}$ ]]; then
     exit 1
 fi
 
-IMAGE="localhost/pear-passwords-anisette:$REV"
+# The patches Pear applies (patches/, and the CA the patched code trusts) change the image
+# without changing the upstream revision, so their hash is part of the tag and a label.
+# install.sh computes the same value with patch-id.sh.
+PATCHES="$("$HERE/patch-id.sh")"
+IMAGE="localhost/pear-passwords-anisette:$REV-$PATCHES"
 
-echo "anisette: building $IMAGE from Dadoum/anisette-v3-server@$REV"
-podman build --build-arg "ANISETTE_REV=$REV" -t "$IMAGE" -f "$HERE/Containerfile" "$HERE"
+echo "anisette: building $IMAGE from Dadoum/anisette-v3-server@$REV with patches $PATCHES"
+podman build --build-arg "ANISETTE_REV=$REV" --build-arg "PEAR_PATCHES=$PATCHES" \
+    -t "$IMAGE" -f "$HERE/Containerfile" "$HERE"
 
 # The image has to be able to say what it was built from, or it is no better
 # than the unlabelled upstream one.
 got="$(podman image inspect --format '{{index .Labels "org.opencontainers.image.revision"}}' "$IMAGE")"
+got_patches="$(podman image inspect --format '{{index .Labels "io.github.dragosol.pear-passwords.patches"}}' "$IMAGE")"
+if [[ "$got_patches" != "$PATCHES" ]]; then
+    echo "anisette: built image claims patches '$got_patches', expected '$PATCHES'" >&2
+    exit 1
+fi
 if [[ "$got" != "$REV" ]]; then
     echo "anisette: built image claims revision '$got', expected '$REV'" >&2
     exit 1

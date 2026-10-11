@@ -112,15 +112,20 @@ say "Building the anisette server from pinned source"
 # minutes the first time; after that the image is reused. See docs/anisette-provenance.md.
 anisette_rev="$(sed -n 's/^ARG ANISETTE_REV=\([0-9a-f]\{40\}\)$/\1/p' "$here/anisette/Containerfile")"
 [ -n "$anisette_rev" ] || die "could not read the pinned anisette revision from anisette/Containerfile"
-anisette_image="localhost/pear-passwords-anisette:$anisette_rev"
+# Pear's patches to that source (anisette/patches/) are part of the tag, so an image built
+# before a patch changed is rebuilt rather than reused.
+anisette_patches="$("$here/anisette/patch-id.sh")"
+anisette_image="localhost/pear-passwords-anisette:$anisette_rev-$anisette_patches"
 # A unit pointing at a tag nobody builds would fail at start with a bare "image not known".
 grep -qF "$anisette_image" "$here/systemd/pear-passwords-anisette.service" \
   || die "systemd/pear-passwords-anisette.service does not run $anisette_image"
-if [ "$(podman image inspect --format '{{index .Labels "org.opencontainers.image.revision"}}' \
-        "$anisette_image" 2>/dev/null)" = "$anisette_rev" ]; then
-  say "Already built at ${anisette_rev:0:12}, reusing it"
+anisette_rebuilt=0
+if [ "$(podman image inspect --format '{{index .Labels "org.opencontainers.image.revision"}} {{index .Labels "io.github.dragosol.pear-passwords.patches"}}' \
+        "$anisette_image" 2>/dev/null)" = "$anisette_rev $anisette_patches" ]; then
+  say "Already built at ${anisette_rev:0:12} with patches $anisette_patches, reusing it"
 else
   "$here/anisette/build.sh" "$anisette_rev"
+  anisette_rebuilt=1
 fi
 
 say "Installing the sign-in helper"
@@ -135,6 +140,10 @@ else
 fi
 systemctl --user daemon-reload
 systemctl --user enable --now pear-passwords-anisette.service
+# A unit already running keeps the image it started with until it restarts.
+if [ "$anisette_rebuilt" -eq 1 ]; then
+  systemctl --user try-restart pear-passwords-anisette.service
+fi
 fi
 
 # --- the stage -------------------------------------------------------------------------------

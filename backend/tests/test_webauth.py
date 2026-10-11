@@ -567,6 +567,67 @@ class AnisetteProvenanceTest(unittest.TestCase):
         self.assertRegex(doc, r"(?i)not .{0,24}pinned|no digest",
                          "the doc does not say the Apple APK is unpinned")
 
+    # --- Provision's session with Apple is TLS-verified (#10755) ------------------
+
+    def _patch_id(self):
+        """What anisette/patch-id.sh prints: sha256 of the sha256sum lines, first 12 digits."""
+        lines = ""
+        names = ["apple-root-ca.pem"] + sorted(
+            "patches/" + n for n in os.listdir(os.path.join(self.ROOT, "anisette", "patches"))
+            if n.endswith(".patch"))
+        for name in names:
+            with open(os.path.join(self.ROOT, "anisette", name), "rb") as fh:
+                lines += f"{hashlib.sha256(fh.read()).hexdigest()}  {name}\n"
+        return hashlib.sha256(lines.encode()).hexdigest()[:12]
+
+    def test_the_unit_runs_the_image_with_the_current_patches(self):
+        rev = re.search(r"^ARG ANISETTE_REV=([0-9a-f]{40})$",
+                        self._read("anisette", "Containerfile"), re.M).group(1)
+        script = subprocess.run([os.path.join(self.ROOT, "anisette", "patch-id.sh")],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(script, self._patch_id())
+        self.assertIn(f"localhost/pear-passwords-anisette:{rev}-{script}\n",
+                      self._read("systemd", "pear-passwords-anisette.service"),
+                      "the unit runs an image built with other patches (or none)")
+
+    def test_the_provision_patch_restores_verified_tls_to_apple(self):
+        patch = self._read("anisette", "patches", "provision-apple-tls.patch")
+        removed = [l[1:].strip() for l in patch.splitlines()
+                   if l.startswith("-") and not l.startswith("---")]
+        added = [l[1:].strip() for l in patch.splitlines()
+                 if l.startswith("+") and not l.startswith("+++")]
+        self.assertIn("request.sslSetVerifyPeer(false);", removed)
+        for line in ('enum appleRootCA = "/opt/apple-root-ca.pem";',
+                     "http.caInfo = appleRootCA;", "http.verifyPeer = true;",
+                     "http.verifyHost = true;", "http.maxRedirects = 0;",
+                     "http.url = appleURL(url);"):
+            self.assertIn(line, added)
+        self.assertFalse([l for l in added if "VerifyPeer(false" in l or "verifyHost = false" in l])
+        # every request in the session goes through appleFetch, the URL bag's two included
+        self.assertIn('string startProvisioningPlist = appleFetch(urlBag["midStartProvisioning"],',
+                      added)
+        self.assertIn('string endProvisioningPlist = appleFetch(urlBag["midFinishProvisioning"], '
+                      'format!"<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>', added)
+
+    def test_the_image_carries_the_one_root_the_patch_trusts(self):
+        with open(os.path.join(self.ROOT, "anisette", "apple-root-ca.pem"), "rb") as a, \
+                open(os.path.join(self.ROOT, "backend", "icp", "certs", "apple-root-ca.pem"),
+                     "rb") as b:
+            self.assertEqual(a.read(), b.read())
+        body = self._read("anisette", "Containerfile")
+        self.assertIn("COPY apple-root-ca.pem /opt/apple-root-ca.pem", body)
+        self.assertRegex(body, r"ARG PROVISION_REV=[0-9a-f]{40}\n")
+        self.assertIn("git -C provision apply /patches/provision-apple-tls.patch", body)
+        self.assertIn("! grep -n 'sslSetVerifyPeer(false)' provision/lib/provision/adi.d", body)
+
+    def test_the_installer_reuses_an_image_only_with_the_same_patches(self):
+        body = self._read("install.sh")
+        self.assertIn('anisette_patches="$("$here/anisette/patch-id.sh")"', body)
+        self.assertIn('anisette_image="localhost/pear-passwords-anisette:$anisette_rev-$anisette_patches"',
+                      body)
+        self.assertIn('= "$anisette_rev $anisette_patches" ]', body)
+        self.assertIn("systemctl --user try-restart pear-passwords-anisette.service", body)
+
     def test_the_installer_builds_before_enabling_the_unit(self):
         body = self._read("install.sh")
         self.assertLess(body.index("anisette/build.sh"),

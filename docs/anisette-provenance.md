@@ -31,10 +31,12 @@ The resulting image carries the revision in
 was built from:
 
     podman image inspect --format '{{index .Labels "org.opencontainers.image.revision"}}' \
-        localhost/pear-passwords-anisette:684895737aaf1a1c4586fcd5b67509ffd500a36c
+        localhost/pear-passwords-anisette:684895737aaf1a1c4586fcd5b67509ffd500a36c-<patches>
 
-Build it with `anisette/build.sh`. `install.sh` does this for you if the image
-is missing.
+The tag is the revision plus the id of Pear's patches to it (below), printed by
+`anisette/patch-id.sh`. Build it with `anisette/build.sh`. `install.sh` does
+this for you if no image with that revision and those patches exists, and then
+restarts the unit so it runs the new image.
 
 Upstream dependency versions are not resolved at build time from a floating
 range. They come from the `dub.selections.json` checked in at that commit,
@@ -42,6 +44,37 @@ which pins registry packages to exact versions and pins the four Dadoum git
 dependencies to exact commits, including `provision`
 (`7717ce1f7b3c9779fe9982005d07b6665071a239`), the library that actually drives
 Apple's ADI code.
+
+### Pear's patch to Provision: TLS to Apple is verified
+
+At that commit, Provision's provisioning session turns TLS peer verification
+off (`lib/provision/adi.d`, `request.sslSetVerifyPeer(false)`) for every request
+it sends to Apple: the URL bag from `gsa.apple.com` and the two provisioning
+POSTs, whose targets come from that bag. Those requests carry the machine's
+persistent device ID (`X-Mme-Device-Id`) and local-user UUID (`X-Apple-I-MD-LU`),
+so an on-path attacker could read them, replace the bag, and send the POSTs to
+a host of its choosing (reported by HANCORE-linux in
+omacom/omarchy-plugin-marketplace#10755). Upstream switched verification off
+because `gsa.apple.com` chains to Apple's own root, which public CA bundles do
+not contain.
+
+The Containerfile therefore fetches Provision itself, at the same commit, and
+applies `anisette/patches/provision-apple-tls.patch` before building it as a
+path dependency. It refuses a server revision that pins another Provision. The
+patch sends the session's requests through libcurl (`std.net.curl`) with:
+
+- `anisette/apple-root-ca.pem` (Apple Root CA, the same file the Python side
+  pins) as the only trusted root, so a certificate from any public CA is refused;
+- host-name verification, which the `requests` library Provision used does not
+  do at all;
+- no redirects;
+- every URL, the bag's two included, required to be `https` on `apple.com` or a
+  subdomain of it, with no user info.
+
+The patched image provisioned a fresh identity against Apple, and with
+`gsa.apple.com` pointed at a server holding a self-signed certificate for that
+name, the handshake ended with `unknown_ca` before any HTTP request (and so
+before any header) was sent.
 
 ## Why this is built locally instead of pulled
 
@@ -252,6 +285,7 @@ in git history, which is where the before-and-after lives.
 | Server source revision | Pinned to a full commit SHA and enforced at build time |
 | Server binary | Built here from that source, labelled with the revision |
 | D dependencies | Pinned to exact versions and commits by `dub.selections.json` |
+| Provision's TLS to Apple | Patched: Apple Root CA only, host name checked, `https://*.apple.com` only |
 | Base images | Pinned by digest |
 | Debian packages inside them | Not pinned, resolved at build time |
 | Build reproducibility | Not bit-reproducible; the revision label is the pin |
