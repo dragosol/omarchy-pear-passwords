@@ -797,7 +797,7 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
   |  {"rid":3,"state":"locked"}  |  {"rid":3,"error":"dismissed"|"denied"|...}
 
 {"op":"autofill-fill","rid":2,"origin":"https://github.com","id":"<id>"}
-  -> {"rid":2,"id":"<id>","username":"me","password":"..."}
+  -> {"rid":2,"id":"<id>","username":"me","password":"...","code":"123456"}   (code: if it has one)
   |  {"rid":2,"error":"locked"|"no-match"|"dismissed"|"denied"|"no-agent"|"busy"|
                       "rate-limited"|"prompt-pending"|"cancelled"|"bad-origin"|"insecure-origin"}
 ```
@@ -828,7 +828,8 @@ exact host match, rank 1 a related one. Name-only matches and inferred `aliases`
   `autofill` rate-limit bucket (one outstanding, 3 refused per minute per uid). An unknown
   handle and a non-matching one both give `no-match`. After approval the daemon re-checks that the
   uid is still unlocked and the entry still matches, opens the entry and replies with
-  username and password only. It also sends the UI an `autofill` event.
+  username and password, and the entry's current one-time code when it has one (the same
+  approval covers a site's code step). It also sends the UI an `autofill` event.
 - The browser, and the extension, then hold that one password. The origin is only as
   trustworthy as the browser that reported it.
 
@@ -924,4 +925,4 @@ traceback.
 | `purge-result` | migrate | – | purpose purge | `{ok:true}` |
 | `autofill-query` | autofill | – | – | `{state, host?, accounts?}` |
 | `autofill-names` | autofill | `.autofill-names` | tier 1 (a site not yet named) | `{state, host?, accounts?}` |
-| `autofill-fill` | autofill | `.autofill` | tier 1 | `{id, username, password}` |
+| `autofill-fill` | autofill | `.autofill` | tier 1 | `{id, username, password, code?}` |

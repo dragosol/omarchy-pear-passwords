@@ -412,10 +412,24 @@ class FillTests(Base):
         super().setUp()
         self.unlock()
 
+    def test_no_code_for_an_account_without_one(self):
+        real_open = self.store.open_entry
+
+        def no_totp(id):
+            sec = real_open(id)
+            return Secrets(password=sec.password, notes=sec.notes, totp_secret=None,
+                           apple_history=[])
+        self.store.open_entry = no_totp
+        self.assertNotIn("code", self.fill("gh1"))
+
     def test_fill_prompts_on_the_autofill_connection_and_returns_one_credential(self):
+        from icp import totp
+        self.reg.wall = lambda: 1_700_000_000.0
         r = self.fill("gh1")
+        # the account has a one-time code, so the same approval brings its current code
         self.assertEqual(r, {"id": self.h("gh1"), "username": "alice",
-                             "password": FAKE_PW + ":gh1"})
+                             "password": FAKE_PW + ":gh1",
+                             "code": totp.code(b"seed", at=1_700_000_000.0)})
         self.assertEqual(len(self.reg.dialogs), 1)
         conn, action, details = self.reg.dialogs[0]
         self.assertIs(conn, self.conn)
@@ -591,7 +605,7 @@ class HandleTests(Base):
             self.assertNotIn(id[3:], repr(q))          # nor its hex
         r = self.fill(raw=True, id=got[0])
         self.assertEqual(r["id"], got[0])
-        self.assertEqual(set(r), {"id", "username", "password"})
+        self.assertEqual(set(r), {"id", "username", "password", "code"})
 
     def test_a_guess_cannot_be_checked_offline(self):
         from icp.vstore import ids

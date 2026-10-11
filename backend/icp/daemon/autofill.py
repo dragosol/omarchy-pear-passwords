@@ -339,6 +339,17 @@ _HANDLE_CONTEXT = b"pear/v2/autofill-handle\x00"
 HANDLE_HEX = 32                      # 128 bits of HMAC-SHA256
 
 
+def _totp_code(reg, secrets_) -> str:
+    """The account's current one-time code, as op totp computes it for the window."""
+    import time as _time
+    from .. import totp
+    params = getattr(secrets_, "totp_params", None) or {}
+    wall = getattr(reg, "wall", None) or _time.time
+    return totp.code(secrets_.totp_secret, digits=int(params.get("digits") or 6),
+                     period=int(params.get("period") or totp.DEFAULT_PERIOD),
+                     algorithm=int(params.get("algorithm") or 0), at=wall())
+
+
 def handle_for(key: bytes, entry_id: str) -> str:
     """The opaque handle an autofill client sees for `entry_id` during this unlock."""
     mac = hmac.new(key, _HANDLE_CONTEXT + entry_id.encode("utf-8"), hashlib.sha256)
@@ -492,8 +503,8 @@ async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connecti
     session_registry.authorize(conn, ACTION_AUTOFILL, {"account": account_label(meta),
     "origin": host}); after approval, re-check the session is still unlocked and the entry
     still matches, then open the entry (a transient SK unseal via run_store) and return
-        {"id", "username", "password"}
-    Notifies the UI with {"event": "autofill", "id", "origin": host, "outcome"} where outcome
+        {"id", "username", "password"[, "code"]}
+    ("code": the entry's current one-time code, when it has one.) Notifies the UI with {"event": "autofill", "id", "origin": host, "outcome"} where outcome
     is "filled", "dismissed", "denied" or "failed". Holds the secret only for the reply.
 
     Raises OpError for every refusal authorize() raises, plus locked, no-match, bad-origin,
@@ -543,6 +554,10 @@ async def handle_autofill_fill(session_registry: SessionRegistry, conn: Connecti
             raise OpError("locked")
         reply = {"id": handle, "username": meta.username or "",
                  "password": secrets.password or ""}
+        if getattr(secrets, "totp_secret", None):
+            # The same approval covers the account's current one-time code, so a site's
+            # second step (a 6-digit code) needs no other dialog for this fill.
+            reply["code"] = _totp_code(reg, secrets)
         secrets = None
         conn.autofill_epoch = getattr(session, "epoch", 0)
     except OpError:

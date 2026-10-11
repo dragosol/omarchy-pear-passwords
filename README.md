@@ -118,7 +118,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "7412c073776ca08d53c9c8369c26cd0ff61d7eeaa8cbf286a488f2db62380886  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "f23218ab18670e073af66ded925c99c20d2083bac3100095ff920191e5e1881d  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -288,7 +288,8 @@ How a fill works:
   answers only "locked", and says nothing about which sites have accounts.
 - **Every fill shows its own dialog**: "A browser extension asks to fill the password for
   GitHub — me on github.com". No approval carries over to the next fill, and the browser never
-  gets the window's open account.
+  gets the window's open account. If the account has a verification code, the same approval
+  also gives the browser its current 6-digit code, for the site's code step.
 - Until a fill through it has been approved, a browser connection learns which accounts exist
   for a site only as opaque ids, not their usernames.
 - The account must match the site: the same host, or a subdomain or parent domain of a website

@@ -165,15 +165,16 @@ request for the daemon from `origin` and `id` only.
 
 ```json
 {"op":"fill","rid":3,"origin":"https://github.com","id":"<opaque>"}
--> {"rid":3,"id":"<opaque>","username":"me@example.com","password":"..."}
+-> {"rid":3,"id":"<opaque>","username":"me@example.com","password":"...","code":"123456"}
 -> {"rid":3,"error":"dismissed"}
 ```
 
 Raises the Pear dialog. The reply arrives when the dialog is answered, which can take half a
 minute (the fingerprint reader times out before the password field appears). After approval
 the daemon checks again that Pear is still unlocked and that the account still matches the
-origin; if either changed during the dialog, the fill fails. Only the username and password
-are returned: never notes, a one-time code or a code seed.
+origin; if either changed during the dialog, the fill fails. The username and password are
+returned, and `code`, the account's current one-time code, when it has one: the same approval
+covers a site's code step. Never notes or the code's seed.
 
 ### 4.5 Errors
 
@@ -181,7 +182,7 @@ are returned: never notes, a one-time code or a code seed.
 
 | code | meaning | what an extension should do |
 |---|---|---|
-| `locked` | Pear is locked or its window is closed | say "Open Pear Passwords to fill" |
+| `locked` | Pear is locked or its window is closed | ask `names` (4.3), which unlocks it for you |
 | `no-match` | the id is unknown, or its sites do not match this origin (the same answer for both) | query again |
 | `dismissed` | you closed the dialog | nothing |
 | `denied` | authentication failed | nothing |
