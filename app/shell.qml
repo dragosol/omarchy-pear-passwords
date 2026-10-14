@@ -56,31 +56,33 @@ ShellRoot {
     // that controls Hyprland can remove it (README, "What a program running as you can do").
     // Floating or regular is the "Open as" setting: a global the open handler reads, set on
     // every launch before the window maps. The handler is registered once per Hyprland
-    // session; a regular window also undoes an older session's float rule.
+    // session; a regular window also undoes an older session's float rule. enable/disable,
+    // never set/unset: Hyprland reads those as a toggle, so "regular" floated every newly
+    // tiled window. v4 because a v3 handler (the toggling one) may still be registered.
     readonly property bool windowFloating: root.settings.window_mode !== "regular"
     readonly property string windowRulesLua: "_G.__pear_passwords_float = "
         + (root.windowFloating ? "true " : "false ")
         + "hl.window_rule({ match = { class = [[^org\\.quickshell$]], "
         + "title = [[^Pear Passwords$]] }, no_screen_share = true }) "
-        + "if not _G.__pear_passwords_rules_v3 then "
+        + "if not _G.__pear_passwords_rules_v4 then "
         + "local m = { class = [[^org\\.quickshell$]], title = [[^Pear Passwords$]] } "
         + "hl.window_rule({ match = m, tag = [[-default-opacity]] }) "
         + "hl.window_rule({ match = m, opacity = [[1 override 1 override]] }) "
         + "hl.on([[window.open]], function(w) "
         + "if w.class ~= [[org.quickshell]] or w.title ~= [[Pear Passwords]] then return end "
         + "if _G.__pear_passwords_float == false then "
-        + "hl.dispatch(hl.dsp.window.float({ action = [[unset]], window = w })) "
+        + "hl.dispatch(hl.dsp.window.float({ action = [[disable]], window = w })) "
         + "else "
-        + "hl.dispatch(hl.dsp.window.float({ action = [[set]], window = w })) "
+        + "hl.dispatch(hl.dsp.window.float({ action = [[enable]], window = w })) "
         + "hl.dispatch(hl.dsp.window.center({ window = w })) "
         + "end end) "
-        + "_G.__pear_passwords_rules_v3 = true end"
+        + "_G.__pear_passwords_rules_v4 = true end"
     // The same choice for the window that is already open, when it changes in Settings.
     readonly property string windowModeLua: "_G.__pear_passwords_float = "
         + (root.windowFloating
-           ? "true hl.dispatch(hl.dsp.window.float({ action = [[set]], window = [[title:^Pear Passwords$]] })) "
+           ? "true hl.dispatch(hl.dsp.window.float({ action = [[enable]], window = [[title:^Pear Passwords$]] })) "
              + "hl.dispatch(hl.dsp.window.center({ window = [[title:^Pear Passwords$]] }))"
-           : "false hl.dispatch(hl.dsp.window.float({ action = [[unset]], window = [[title:^Pear Passwords$]] }))")
+           : "false hl.dispatch(hl.dsp.window.float({ action = [[disable]], window = [[title:^Pear Passwords$]] }))")
     readonly property string focusLua: "hl.dsp.focus({ window = \"title:^Pear Passwords$\" })"
     // What a site may look like before it is handed to Hyprland to open: a lowercase host of
     // two or more labels, an optional port and a plain path. Nothing that could end the Lua
