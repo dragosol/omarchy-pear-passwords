@@ -5,6 +5,7 @@ here needs root, a TPM or the real /var/lib/pear-passwords.
 """
 
 import ast
+import json
 import os
 import stat
 import tempfile
@@ -546,6 +547,14 @@ class SettingsTests(StoreCase):
         s.save_settings({"grant_s": 60, "idle_lock_s": 300, "clip_timeout_s": 30})
         self.assertEqual(s.load_settings()["grant_s"], 60)
         self.assertEqual(stat.S_IMODE((self.udir / "state.json").stat().st_mode), 0o600)
+
+    def test_window_mode_survives_a_reload(self):
+        s = vstore.UserStore.open(UID)
+        s.save_settings({**s.load_settings(), "window_mode": "regular"})
+        self.assertEqual(vstore.UserStore.open(UID).load_settings()["window_mode"], "regular")
+        for bad in ("tiled", 1, None, True):
+            fmt.atomic_write(self.udir / "state.json", json.dumps({"window_mode": bad}).encode())
+            self.assertEqual(s.load_settings()["window_mode"], "floating", bad)
 
     def test_no_lease_setting_survives(self):
         s = vstore.UserStore.open(UID)

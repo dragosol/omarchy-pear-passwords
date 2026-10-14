@@ -147,9 +147,14 @@ def load_settings(directory: Path) -> dict:
     except SealError:
         stored = None
     if isinstance(stored, dict):
-        for k in protocol.DEFAULT_SETTINGS:
+        for k, default in protocol.DEFAULT_SETTINGS.items():
             v = stored.get(k)
-            if isinstance(v, int) and not isinstance(v, bool):
+            # Each value keeps its default's type: window_mode is a string, the rest ints.
+            # Reading back only ints dropped "regular" on every daemon start.
+            if isinstance(default, str):
+                if isinstance(v, str) and (k != "window_mode" or v in protocol.WINDOW_MODES):
+                    out[k] = v
+            elif isinstance(v, int) and not isinstance(v, bool):
                 out[k] = v
         _state_keys(stored, out)
     return out
