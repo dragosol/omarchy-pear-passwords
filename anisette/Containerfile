@@ -1,148 +1,97 @@
-# Pear Passwords: anisette server built from pinned upstream source.
+# Pear Passwords: anisette server on Apple's Windows ADI, built from pinned source.
 #
-# Why this file exists: the published docker.io/dadoum/anisette-v3-server image
-# carries no OCI provenance labels and ships the server as a binary copied in
-# from a build that happened elsewhere, so nothing in it ties the running code
-# to a source revision. This Containerfile builds the server here, from one
-# named upstream commit, and labels the result with that commit.
+# Since October 2026 Apple's GrandSlam refuses anisette made by Apple's Android ADI (the
+# library anisette-v3-server loads): Apple ID sign-in is not served to Android clients, and a
+# client that claims another platform gets -80045. Apple's Windows ADI, CoreADI64.dll from
+# iCloud for Windows, is accepted when the client says it is iCloud for Windows. So this image
+# runs that DLL under Wine, through a small loader (loader/) built on Dadoum's apple-crates.
 #
-# Apple's libCoreADI.so / libstoreservicescore.so are NOT in this image. They
-# are fetched on first start by entrypoint.sh, which checks them against the
-# digests in apple-libs.sha256 and refuses to start the server on a mismatch.
-# See docs/anisette-provenance.md.
+# Apple's CoreADI64.dll is NOT in this image. entrypoint.sh fetches it on first start from the
+# Microsoft Store (fetch-coreadi.py), refuses anything that does not match coreadi.sha256, and
+# keeps it in the volume. See docs/anisette-provenance.md.
 
-# debian:stable-20250520-slim, linux/amd64
-ARG DEBIAN_BUILDER=docker.io/library/debian:stable-20250520-slim@sha256:bd002736c5671297bbc7b056bd693c9b214c47191a70505b1ae5ccc722572cc5
-# debian:stable-slim, linux/amd64, resolved 2026-10-07
-ARG DEBIAN_RUNTIME=docker.io/library/debian:stable-slim@sha256:d405c1e1d9eecbf30022d23766a0eea235e7f499aa33e357dfd29271a839f82a
+# rust:1-slim-trixie (Rust 1.99.1), linux/amd64, resolved 2026-11-12
+ARG RUST_BUILDER=docker.io/library/rust:1-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7
+# fedora-minimal:44, linux/amd64, resolved 2026-11-12. Fedora because its Wine (11.x) can build
+# the TLS client the loader provisions with; Debian trixie's Wine 10 fails inside crypt32 with
+# "Invalid parameter" before any connection is made.
+ARG RUNTIME=registry.fedoraproject.org/fedora-minimal:44@sha256:964ca942f6e28c5229eb81078f2d2e3ee0aa644871fb9b054507d26c1e569a77
 
-# Upstream revision to build. Full 40-character commit SHA only: a tag or a
-# branch name would reintroduce exactly the gap this file closes.
-ARG ANISETTE_REV=684895737aaf1a1c4586fcd5b67509ffd500a36c
-ARG ANISETTE_REPO=https://github.com/Dadoum/anisette-v3-server.git
+# apple-crates (LGPL-2.1-or-later), the one revision the loader is built against. Full
+# 40-character commit SHA only: a branch or a tag could move under the same name.
+ARG APPLE_CRATES_REV=b6e2ac2e5eb971fed221e298a043d6a61402645b
+ARG APPLE_CRATES_REPO=https://tangled.org/dadoum.zone/apple-crates
+# A short hash of Pear's own files in this directory (recipe-id.sh), recorded as a label and in
+# the image tag, so a changed loader or gate is never mistaken for an image already built.
+ARG PEAR_RECIPE=unset
 
-# The Provision library the server's dub.selections.json pins. It is fetched here instead, at
-# the same commit, so patches/provision-apple-tls.patch can be applied before it is built:
-# upstream turns TLS peer verification off for the provisioning session with Apple. The patch
-# verifies against Apple Root CA only (apple-root-ca.pem), checks the host name and allows the
-# URL bag to point only at https://*.apple.com (omacom/omarchy-plugin-marketplace#10755).
-ARG PROVISION_REV=7717ce1f7b3c9779fe9982005d07b6665071a239
-ARG PROVISION_REPO=https://github.com/Dadoum/Provision.git
-# A short hash of patches/, set by build.sh and recorded as a label and in the image tag, so
-# a changed patch is never mistaken for an image already built.
-ARG PEAR_PATCHES=unset
-
-FROM ${DEBIAN_BUILDER} AS builder
-ARG ANISETTE_REV
-ARG ANISETTE_REPO
-ARG PROVISION_REV
-ARG PROVISION_REPO
+FROM ${RUST_BUILDER} AS builder
+ARG APPLE_CRATES_REV
+ARG APPLE_CRATES_REPO
 
 RUN apt-get update \
- && apt-get install --no-install-recommends -y \
-      ca-certificates ldc git clang dub libz-dev libssl-dev libplist-dev libplist-2.0-4 \
+ && apt-get install --no-install-recommends -y ca-certificates git gcc-mingw-w64-x86-64 \
  && apt-get clean \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && rustup target add x86_64-pc-windows-gnu
 
-WORKDIR /opt/
+WORKDIR /src
 
-# Fetch exactly the pinned commit and refuse to build anything else. The
-# length check rejects an abbreviated SHA; the rev-parse check rejects a
-# repository that resolved the argument to something other than that commit.
-RUN test "${#ANISETTE_REV}" -eq 40 \
- && git init -q . \
- && git remote add origin "${ANISETTE_REPO}" \
- && git fetch -q --depth 1 origin "${ANISETTE_REV}" \
- && git -c advice.detachedHead=false checkout -q FETCH_HEAD \
- && test "$(git rev-parse HEAD)" = "${ANISETTE_REV}" \
- && echo "building anisette-v3-server at ${ANISETTE_REV}"
+# Fetch exactly the pinned commit and refuse to build anything else. The length check rejects
+# an abbreviated SHA; the rev-parse check rejects a repository that resolved it to another commit.
+RUN test "${#APPLE_CRATES_REV}" -eq 40 \
+ && git init -q apple-crates \
+ && git -C apple-crates remote add origin "${APPLE_CRATES_REPO}" \
+ && git -C apple-crates fetch -q --depth 1 origin "${APPLE_CRATES_REV}" \
+ && git -C apple-crates -c advice.detachedHead=false checkout -q FETCH_HEAD \
+ && test "$(git -C apple-crates rev-parse HEAD)" = "${APPLE_CRATES_REV}" \
+ && echo "building against apple-crates ${APPLE_CRATES_REV}"
 
-# Provision at the commit the server pins, patched, and swapped in as a path dependency. The
-# grep checks refuse a server revision that pins some other Provision, and a dub.json or
-# selections file the substitution did not change.
-COPY patches/ /patches/
-RUN test "${#PROVISION_REV}" -eq 40 \
- && grep -qF "\"provision\": {\"version\":\"${PROVISION_REV}\"" dub.selections.json \
- && git init -q provision \
- && git -C provision remote add origin "${PROVISION_REPO}" \
- && git -C provision fetch -q --depth 1 origin "${PROVISION_REV}" \
- && git -C provision -c advice.detachedHead=false checkout -q FETCH_HEAD \
- && test "$(git -C provision rev-parse HEAD)" = "${PROVISION_REV}" \
- && git -C provision apply --check /patches/provision-apple-tls.patch \
- && git -C provision apply /patches/provision-apple-tls.patch \
- && ! grep -n 'sslSetVerifyPeer(false)' provision/lib/provision/adi.d \
- && perl -0pi -e 's/"provision":\s*\{\s*"repository":\s*"git\+https:\/\/github\.com\/Dadoum\/Provision\.git",\s*"version":\s*"$ENV{PROVISION_REV}"\s*\}/"provision": {"path": "provision"}/' dub.json \
- && perl -0pi -e 's/"provision":\s*\{"version":"$ENV{PROVISION_REV}","repository":"git\+https:\/\/github\.com\/Dadoum\/Provision\.git"\}/"provision": {"path": "provision"}/' dub.selections.json \
- && grep -qF '"provision": {"path": "provision"}' dub.json \
- && grep -qF '"provision": {"path": "provision"}' dub.selections.json \
- && echo "Provision ${PROVISION_REV} patched with provision-apple-tls.patch"
+# Every registry crate is pinned, with its checksum, by loader/Cargo.lock; --locked refuses to
+# build if resolving would change it.
+COPY loader/ /src/loader/
+RUN cd /src/loader \
+ && cargo build --locked --release --target x86_64-pc-windows-gnu \
+ && cp target/x86_64-pc-windows-gnu/release/pear-coreadi.exe /src/pear-coreadi.exe
 
-# Dependency versions come from the checked-in dub.selections.json, which pins
-# registry packages to exact versions and the Dadoum git dependencies
-# (plist, plist-d, dynamic-loader) to exact commits; Provision is the patched copy above.
-RUN DC=ldc2 dub build -c "static" --build-mode allAtOnce -b release --compiler=ldc2 \
- && test -x /opt/anisette-v3-server
+FROM ${RUNTIME}
+ARG APPLE_CRATES_REV
+ARG RUNTIME
+ARG PEAR_RECIPE
 
-FROM ${DEBIAN_RUNTIME}
-ARG ANISETTE_REV
-ARG DEBIAN_RUNTIME
-ARG PROVISION_REV
-ARG PEAR_PATCHES
+# wine-core runs the loader (64-bit only), and wine-common has the files Wine's first start
+# copies into the prefix (without it that step retries a missing file forever); python3 and
+# ca-certificates are what fetch-coreadi.py downloads and checks the DLL with. Nothing else: no
+# wine-mono or Gecko, which the loader never uses, and no weak dependencies.
+RUN microdnf install -y --setopt=install_weak_deps=0 wine-core wine-common python3 ca-certificates shadow-utils \
+ && microdnf clean all
 
-# ca-certificates is what makes the first-start download from apps.mzstatic.com
-# a TLS-verified fetch rather than an unauthenticated one. curl and unzip are
-# what entrypoint.sh fetches and unpacks the APK with, so that the digests are
-# checked before the server ever sees a library.
-RUN apt-get update \
- && apt-get install --no-install-recommends -y \
-      ca-certificates curl unzip libplist-dev libplist-2.0-4 \
- && apt-get clean \
- && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -s /usr/sbin/nologin pear \
+ && mkdir -p /opt/pear /home/pear/data \
+ && chown pear:pear /home/pear/data
 
-WORKDIR /opt/
-COPY --from=builder /opt/anisette-v3-server /opt/anisette-v3-server
+COPY --from=builder /src/pear-coreadi.exe /opt/pear/pear-coreadi.exe
+# The gate, the digests it enforces and the one CA the Store fetch trusts travel in the image,
+# root-owned and read-only, so the server's own user cannot rewrite what checks it.
+COPY entrypoint.sh fetch-coreadi.py coreadi.sha256 microsoft-root-ca-2011.pem /opt/pear/
+RUN chown -R root:root /opt/pear \
+ && chmod 0555 /opt/pear/entrypoint.sh /opt/pear/fetch-coreadi.py /opt/pear/pear-coreadi.exe \
+ && chmod 0444 /opt/pear/coreadi.sha256 /opt/pear/microsoft-root-ca-2011.pem
 
-# The digests travel in the image, next to the gate that enforces them, so the
-# running container does not depend on the checkout still being present.
-COPY apple-libs.sha256 /opt/apple-libs.sha256
-COPY entrypoint.sh /opt/entrypoint.sh
-# The only CA the patched provisioning session trusts (see the builder stage).
-COPY apple-root-ca.pem /opt/apple-root-ca.pem
-
-RUN mkdir -p /opt/anisette-v3/provisioning
-
-# Same user and same paths as the upstream image, so an existing icp-anisette
-# volume keeps working and the machine identity in adi.pb is not re-minted.
-RUN useradd -ms /bin/bash Alcoholic \
- && mkdir /home/Alcoholic/.config/anisette-v3/lib/ -p \
- && chown -R Alcoholic /home/Alcoholic/ \
- && chmod -R +wx /home/Alcoholic/ \
- && chown -R Alcoholic /opt/ \
- && chmod -R +wx /opt/
-
-# After the blanket chmod above, not before it: the gate and the digests it
-# reads are the two files in this image that the server's own user has no
-# reason to be able to rewrite.
-RUN chown root:root /opt/entrypoint.sh /opt/apple-libs.sha256 /opt/apple-root-ca.pem \
- && chmod 0555 /opt/entrypoint.sh \
- && chmod 0444 /opt/apple-libs.sha256 /opt/apple-root-ca.pem
-
-# NOASSERTION is deliberate: as of the pinned revision the upstream repository
-# carries no LICENSE file and GitHub reports no license for it, so there is
-# nothing to cite. Claiming a license here would be an invention.
-LABEL org.opencontainers.image.title="anisette-v3-server (Pear Passwords build)" \
-      org.opencontainers.image.description="Anisette server for Apple sign-in, built from pinned upstream source for the Pear Passwords Omarchy plugin. Apple's libCoreADI.so and libstoreservicescore.so are downloaded at first start, not baked in, and are checked against apple-libs.sha256 before the server starts." \
-      org.opencontainers.image.source="https://github.com/Dadoum/anisette-v3-server" \
-      org.opencontainers.image.revision="${ANISETTE_REV}" \
-      io.github.dragosol.pear-passwords.provision.revision="${PROVISION_REV}" \
-      io.github.dragosol.pear-passwords.patches="${PEAR_PATCHES}" \
-      org.opencontainers.image.licenses="NOASSERTION" \
-      org.opencontainers.image.base.name="${DEBIAN_RUNTIME}" \
+LABEL org.opencontainers.image.title="Pear Passwords anisette (Windows ADI)" \
+      org.opencontainers.image.description="Anisette server for Apple sign-in for the Pear Passwords Omarchy plugin: Apple's CoreADI64.dll from iCloud for Windows, run under Wine through a loader built on apple-crates. The DLL is downloaded from the Microsoft Store at first start, not baked in, and is checked against coreadi.sha256 before it is loaded." \
+      org.opencontainers.image.source="https://github.com/dragosol/omarchy-pear-passwords" \
+      io.github.dragosol.pear-passwords.apple-crates.source="https://tangled.org/dadoum.zone/apple-crates" \
+      io.github.dragosol.pear-passwords.apple-crates.revision="${APPLE_CRATES_REV}" \
+      io.github.dragosol.pear-passwords.recipe="${PEAR_RECIPE}" \
+      org.opencontainers.image.licenses="LGPL-2.1-or-later" \
+      org.opencontainers.image.base.name="${RUNTIME}" \
       org.opencontainers.image.documentation="https://github.com/dragosol/omarchy-pear-passwords/blob/main/docs/anisette-provenance.md"
 
-USER Alcoholic
+USER pear
+WORKDIR /home/pear
+ENV WINEPREFIX=/home/pear/data/prefix \
+    WINEDLLOVERRIDES="mscoree,mshtml=" \
+    WINEDEBUG=-all
 EXPOSE 6969
-# The gate, not the server: it fetches and verifies the libraries, then execs
-# the server. Going straight to the server would restore upstream's unchecked
-# download, which is the finding this closes.
-ENTRYPOINT [ "/opt/entrypoint.sh" ]
+ENTRYPOINT [ "/opt/pear/entrypoint.sh" ]

@@ -826,3 +826,106 @@ def test_background_run_never_triggers_a_2fa_push(monkeypatch, au):
         apple._fresh_tokens(ctx, s, device=None, anisette=None)
     assert gsa.triggered == []
     assert store.status().get("needs_login") is True
+
+
+class _PushedCodeGSA:
+    """As iCloud for Windows, Apple can push the code during the SRP exchange: hsc 409, no au.
+    The second login (after the code) succeeds."""
+
+    def __init__(self):
+        self.calls = 0
+        self.triggered = []
+        self.submitted = []
+
+    def authenticate(self, username, password):
+        self.calls += 1
+        status = {"hsc": 409} if self.calls == 1 else {}
+        return {"Status": status}, {"adsid": "1", "GsIdmsToken": "t"}
+
+    def trigger_trusted_factor(self, dsid, idms):
+        self.triggered.append("trusted")
+        return True
+
+    def submit_trusted_factor(self, code, dsid, idms):
+        self.submitted.append(code)
+        return True
+
+
+def test_a_code_apple_already_pushed_is_submitted_without_asking_for_another():
+    # A second push would invalidate the code already on the person's screen.
+    from icp.auth import grandslam
+    gsa = _PushedCodeGSA()
+    asked = []
+    grandslam.authenticate(gsa, "a@example.test", "pw", lambda kind: asked.append(kind) or "123456")
+    assert asked == ["trusted"]
+    assert gsa.submitted == ["123456"]
+    assert gsa.triggered == []
+    assert gsa.calls == 2                       # signed in again with the device now trusted
+
+
+def test_a_pushed_code_with_nobody_present_stands_down():
+    from icp.auth import grandslam
+    from icp.auth.gsa import GSAError
+    gsa = _PushedCodeGSA()
+    with pytest.raises(GSAError):
+        grandslam.authenticate(gsa, "a@example.test", "pw", None)
+    assert gsa.submitted == [] and gsa.triggered == []
+
+
+def test_every_account_call_names_the_same_platform():
+    # Apple binds the PET and its tokens to the platform GSA issued them to, and refuses a call
+    # that names another one (loginDelegates: "incorrect password", escrowproxy: 401 -3001).
+    from icp import const
+    from icp.auth import icloud
+    from icp.escrow.srp import EscrowRecovery
+    from icp.transport import cloudkit
+    for info in (const.GSA_CLIENT_INFO, icloud.ICLOUD_CLIENT_INFO,
+                 EscrowRecovery.ESCROW_MME_CLIENT_INFO, cloudkit.CK_MME_CLIENT_INFO):
+        assert info.startswith(const.CLIENT_PLATFORM + " <"), info
+    # The platform the anisette helper's DLL really is: iCloud for Windows' AuthKit.
+    assert const.GSA_CLIENT_INFO.endswith("<com.apple.AuthKitWin/7.3 (com.apple.iCloud/15.10.0.39)>")
+    assert const.GSA_USER_AGENT == "com.apple.AuthKitWin/7.3"
+
+
+def test_the_gsa_request_carries_the_client_info_in_header_and_cpd():
+    from icp import const
+    from icp.auth import gsa as gsa_mod
+    from icp.auth.device import Device
+    import plistlib
+
+    class Anisette:
+        def headers(self):
+            return {"X-Apple-I-MD": "otp", "X-Apple-I-MD-M": "mid"}
+
+    sent = {}
+
+    class Resp:
+        status_code = 200
+        content = plistlib.dumps({"Response": {"Status": {"ec": -20970, "em": "x"}}})
+
+    client = gsa_mod.GSAClient(Device.new(), Anisette())
+
+    def request(method, url, **kw):
+        sent.update(kw)
+        return Resp()
+    client._request_http = request
+    with pytest.raises(gsa_mod.GSAError) as raised:
+        client.authenticate("nobody@example.test", "pw")
+    assert raised.value.ec == -20970
+    assert sent["headers"]["X-MMe-Client-Info"] == const.GSA_CLIENT_INFO
+    assert sent["headers"]["User-Agent"] == const.GSA_USER_AGENT
+    body = plistlib.loads(sent["data"])
+    assert body["Request"]["cpd"]["X-Mme-Client-Info"] == const.GSA_CLIENT_INFO
+
+
+def test_apples_status_number_reaches_the_journal_but_not_its_text(caplog):
+    from icp.auth.gsa import GSAError
+    from icp.daemon import handlers, server
+    err = handlers.apple_error(GSAError("init failed: ec=-80045 em='a@example.test'", ec=-80045))
+    assert err.code == "apple"
+    assert err.log_note == "Apple -80045"
+    assert "log_note" not in err.reply(1)
+    with caplog.at_level("INFO"):
+        server.log_outcome("signin", err.code + f" ({err.log_note})", 0.0)
+    assert "op signin: apple (Apple -80045)" in caplog.text
+    assert "example.test" not in caplog.text

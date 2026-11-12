@@ -432,7 +432,8 @@ Each of these was considered and rejected because it leaves a hole:
 
 ## 11. Open items
 
-- The anisette base images' `apt-get` packages are resolved at build time and not pinned
+- The anisette base images' packages (`apt-get` in the build stage, `microdnf` at runtime) are
+  resolved at build time and not pinned
   ([anisette-provenance.md](anisette-provenance.md)).
 - Gates G6 (screen lock) and the parts of G3/G5 that need real Hyprland and the Omarchy
   polkit agent have not run (section 8).

@@ -284,7 +284,8 @@ class Server:
         except OpError as e:
             out = e.reply(rid)
             field = e.extra.get("field")
-            log_outcome(op, e.code + (f" ({field})" if isinstance(field, str) else ""), started)
+            note = field if isinstance(field, str) else e.log_note
+            log_outcome(op, e.code + (f" ({note})" if note else ""), started)
         except asyncio.CancelledError:
             if op in LOGGED_OPS:
                 log_outcome(op, "cancelled (the window went away)", started)
@@ -298,8 +299,9 @@ class Server:
 
 # Ops whose outcome and duration always go to the journal: the ones that reach Apple or change
 # the vault, where a failure the window showed for a moment is otherwise gone. Any op that ends
-# in an error is logged too. Only the op, the error code and the field name are written - never
-# a value, and never an error's `detail` (Apple's text can name the account).
+# in an error is logged too. Only the op, the error code and the field name or Apple's status
+# number are written - never a value, and never an error's `detail` (Apple's text can name the
+# account).
 LOGGED_OPS = frozenset({"create", "set", "delete", "sync", "signin", "migrate-begin", "reset",
                         "tpm-move"})
 

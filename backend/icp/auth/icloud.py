@@ -7,6 +7,7 @@ import plistlib as plist
 
 import requests
 
+from .. import const
 from . import ca
 from .anisette import Anisette
 from .device import Device
@@ -20,17 +21,11 @@ logger = logging.getLogger(__name__)
 LOGIN_DELEGATES_URL = "https://setup.icloud.com/setup/iosbuddy/loginDelegates"
 ACCOUNT_SETTINGS_URL = "https://setup.icloud.com/setup/get_account_settings"
 
-# AOSKit/accountsd identity for the iCloud setup endpoints (distinct from the GSA akd UA).
-#
-# The hardware and OS must match what GSA claimed - loginDelegates is presented as the same
-# device that just cleared 2FA, and it previously described a MacBookPro18,3 on 13.4.1 while
-# GSA described something else entirely. Only the framework versions (AOSKit/accountsd) stay
-# put, since Apple's rejection keyed on the OS version, not on those.
+# AOSKit/accountsd identity for the iCloud setup endpoints, on the same platform GSA named:
+# loginDelegates takes a PET that GSA issued to that platform, and answers a mismatch as
+# "Your Apple ID or password was entered incorrectly" (const.CLIENT_PLATFORM).
 ICLOUD_USER_AGENT = "com.apple.iCloudHelper/282 CFNetwork/1640.0.3 Darwin/25.6.0"
-ICLOUD_CLIENT_INFO = (
-    "<Mac16,7> <Mac OS X;26.6;25G72> "
-    "<com.apple.AOSKit/282 (com.apple.accountsd/113)>"
-)
+ICLOUD_CLIENT_INFO = const.client_info(const.ICLOUD_SERVICE)
 
 
 class ICloudError(AppleError):

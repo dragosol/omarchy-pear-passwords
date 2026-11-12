@@ -263,14 +263,12 @@ class GatedTests(unittest.TestCase):
         self.assertEqual(h["x-apple-i-device-type"], "1")
         self.assertEqual(h["X-Apple-I-MD"], "x")
         # X-Mme-Client-Info carries the AuthKit/sbd item and OVERWRITES the anisette value.
-        # Compared against the constant, not a literal: the impersonated hardware has to be
-        # bumped when Apple raises its minimum, and pinning the version here just means the
-        # test has to be edited every time rather than actually checking anything.
+        # It names the platform GSA issued the PET to (escrowproxy answers a Mac identity with
+        # 401 -3001 for a PET issued to iCloud for Windows), compared against the constant.
         from icp import const
         self.assertEqual(h["X-Mme-Client-Info"], es.EscrowRecovery.ESCROW_MME_CLIENT_INFO)
         self.assertNotEqual(h["X-Mme-Client-Info"], "STALE-ANISETTE-VALUE")  # overrode anisette
-        self.assertIn(const.DEVICE_MODEL, h["X-Mme-Client-Info"])
-        self.assertIn(const.OS_VERSION, h["X-Mme-Client-Info"])
+        self.assertTrue(h["X-Mme-Client-Info"].startswith(const.CLIENT_PLATFORM + " "))
         self.assertIn("com.apple.sbd/638.100.48", h["X-Mme-Client-Info"])
 
     def test_user_action_label_exact(self):

@@ -1,0 +1,21 @@
+[package]
+name = "pear-coreadi"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "Pear Passwords' anisette server: Apple's Windows CoreADI64.dll, loaded with apple-crates, served on 127.0.0.1"
+license = "LGPL-2.1-or-later"
+
+# apple-crates is fetched by the Containerfile at one pinned commit and placed next to this
+# directory; nothing here names a registry copy or a branch of it.
+[dependencies]
+adi = { path = "../apple-crates/adi" }
+library-coreadi = { path = "../apple-crates/library-coreadi" }
+grandslam = { path = "../apple-crates/grandslam" }
+tokio = { version = "1", features = ["rt", "macros"] }
+serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+strip = true

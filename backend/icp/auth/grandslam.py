@@ -48,7 +48,11 @@ def authenticate(gsa: GSAClient, username: str, password: str,
                  list(spd), bool(spd.get("adsid") or spd.get("DsPrsId")),
                  bool(spd.get("GsIdmsToken") or spd.get("GsIdMS")))
 
-    if au in ("trustedDeviceSecondaryAuth", "secondaryAuth"):
+    # As iCloud for Windows, Apple may push the code to the trusted devices during the SRP
+    # exchange itself: HTTP-style status 409 and no auth mode. Asking for another push then
+    # would invalidate the code already on the person's screen, so it is only submitted.
+    pushed = status.get("hsc") == 409 and not au
+    if pushed or au in ("trustedDeviceSecondaryAuth", "secondaryAuth"):
         if twofa is None:
             # Nobody is there to type a code (a background sync): stand down BEFORE asking
             # Apple to push one, or the person's devices show a prompt nothing can answer.
@@ -58,8 +62,9 @@ def authenticate(gsa: GSAClient, username: str, password: str,
         if not dsid or not idms:
             raise GSAError(f"2FA required but missing dsid/GsIdMS in spd: keys={list(spd)}")
 
-        if au == "trustedDeviceSecondaryAuth":
-            gsa.trigger_trusted_factor(dsid, idms)
+        if pushed or au == "trustedDeviceSecondaryAuth":
+            if not pushed:
+                gsa.trigger_trusted_factor(dsid, idms)
             code = twofa("trusted")
             if not gsa.submit_trusted_factor(code, dsid, idms):
                 raise GSAError("trusted-device 2FA rejected")
@@ -86,7 +91,8 @@ def authenticate(gsa: GSAClient, username: str, password: str,
 
         # Re-authenticate: the device is now trusted, so this should NOT prompt again.
         r, spd = gsa.authenticate(username, password)
-        if r.get("Status", {}).get("au"):
+        after = r.get("Status", {})
+        if after.get("au") or after.get("hsc") == 409:
             raise GSAError("still being asked for 2FA after submitting a code")
 
     return spd

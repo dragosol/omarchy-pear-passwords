@@ -39,7 +39,7 @@ from .tickets import TicketError
 
 logger = logging.getLogger(__name__)
 
-VERSION = "2.0.3"
+VERSION = "2.1.0"
 
 _HOST_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
                       r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
@@ -191,7 +191,12 @@ def apple_error(e: BaseException) -> OpError:
     if isinstance(e, (ConnectionError, TimeoutError)):
         return OpError("network")
     if isinstance(e, AppleError):
-        return OpError("apple", detail=_detail(e))
+        err = OpError("apple", detail=_detail(e))
+        # Apple's own status number (GrandSlam's ec) goes to the journal; its text does not.
+        ec = getattr(e, "ec", None)
+        if isinstance(ec, int) and not isinstance(ec, bool):
+            err.log_note = f"Apple {ec}"
+        return err
     logger.error("Apple call failed: %s", type(e).__name__, exc_info=e)
     return OpError("internal")
 

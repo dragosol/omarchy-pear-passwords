@@ -4,8 +4,8 @@
 # the pear-passwords-autofill command, which the root uninstall removes.
 #
 # Only files whose bytes are what Pear wrote are removed (system/lib/user-files.sh); anything
-# you changed is listed and kept. The anisette helper's device identity (the icp-anisette
-# volume) and your 1.x data in ~/.config/icp* are kept unless you pass --purge, because
+# you changed is listed and kept. The anisette helper's device identity (the
+# pear-passwords-anisette volume, and 2.0's icp-anisette) and your 1.x data in ~/.config/icp* are kept unless you pass --purge, because
 # deleting them signs this computer out and Apple asks for a verification code next time.
 #
 #   ./uninstall.sh            keeps your passwords on this computer and its Apple sign-in
@@ -59,7 +59,7 @@ rm -rf -- "$PP_DATA_1X/venv" "$PP_DATA_1X/app" "$PP_DATA_1X/app.new" "$PP_DATA_1
           "$PP_STAGE_CACHE"
 [ ! -d "$PP_DATA_1X" ] || rmdir -- "$PP_DATA_1X" 2>/dev/null || kept+=("$PP_DATA_1X (holds other files)")
 # The locally built anisette image is a build artefact, not data: anisette/build.sh makes it
-# again. The icp-anisette volume holding the device identity is left alone unless --purge.
+# again. The volumes holding the device identity are left alone unless --purge.
 podman image rm -f $(podman images --filter reference='localhost/pear-passwords-anisette' \
                        --format '{{.ID}}' 2>/dev/null) >/dev/null 2>&1 || true
 
@@ -72,7 +72,7 @@ echo "Removed Pear Passwords from your home."
 if [ "$purge" -eq 1 ]; then
   read -r -p "Also delete this computer's Apple sign-in identity and your 1.x data in ~/.config/icp*? [y/N] " yn
   if [ "$yn" = "y" ] || [ "$yn" = "Y" ]; then
-    podman volume rm -f icp-anisette >/dev/null 2>&1 || true
+    podman volume rm -f pear-passwords-anisette icp-anisette >/dev/null 2>&1 || true
     rm -rf -- "$HOME/.config/icp" "$HOME"/.config/icp.v1-backup-*
     echo "Deleted the device identity and the 1.x data."
   fi

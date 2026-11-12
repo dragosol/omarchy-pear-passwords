@@ -32,7 +32,12 @@ logger = logging.getLogger(__name__)
 
 
 class GSAError(AppleError):
-    pass
+    """`ec` is GrandSlam's own status code when Apple gave one (e.g. -80045), so the daemon can
+    log the number without logging Apple's text, which may name the account."""
+
+    def __init__(self, message: str, ec: int | None = None):
+        super().__init__(message)
+        self.ec = ec
 
 
 class GSAClient:
@@ -55,6 +60,9 @@ class GSAClient:
             "svct": "iCloud",
         }
         cpd.update(identity_headers(self.device, self.anisette))
+        # iCloud for Windows repeats its client info inside cpd; GrandSlam checks it against the
+        # anisette data's platform like the header (const.CLIENT_PLATFORM).
+        cpd["X-Mme-Client-Info"] = const.GSA_CLIENT_INFO
         return cpd
 
     def _request_http(self, method: str, url: str, **kwargs) -> requests.Response:
@@ -88,7 +96,7 @@ class GSAClient:
         self.last_init_response = init
         logger.debug("GSA init response keys: %s", list(init))
         if "sp" not in init:
-            raise GSAError(f"init failed: {_status(init)}")
+            raise GSAError(f"init failed: {_status(init)}", ec=_ec(init))
         if init["sp"] not in ("s2k", "s2k_fo"):
             raise GSAError(f"unsupported protocol {init['sp']}")
 
@@ -102,7 +110,7 @@ class GSAClient:
         self.last_complete_response = complete
         logger.debug("GSA complete response keys: %s", list(complete))
         if "M2" not in complete:
-            raise GSAError(f"complete failed: {_status(complete)}")
+            raise GSAError(f"complete failed: {_status(complete)}", ec=_ec(complete))
         usr.verify_session(complete["M2"])
         if not usr.authenticated():
             raise GSAError("server session verification failed (imposter?)")
@@ -192,7 +200,7 @@ class GSAClient:
         identity_token = base64.b64encode(f"{dsid}:{idms_token}".encode()).decode()
         h = {
             "Content-Type": "text/x-xml-plist",
-            "User-Agent": "Xcode",
+            "User-Agent": const.GSA_USER_AGENT,
             "Accept": "text/x-xml-plist",
             "Accept-Language": "en-us",
             "X-Apple-Identity-Token": identity_token,
@@ -225,6 +233,11 @@ def _decrypt_cbc(usr, data: bytes) -> bytes:
     data = dec.update(data) + dec.finalize()
     unpadder = padding.PKCS7(128).unpadder()
     return unpadder.update(data) + unpadder.finalize()
+
+
+def _ec(r: dict) -> int | None:
+    ec = (r.get("Status") or r).get("ec")
+    return ec if isinstance(ec, int) and not isinstance(ec, bool) else None
 
 
 def _status(r: dict) -> str:

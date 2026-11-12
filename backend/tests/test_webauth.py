@@ -9,10 +9,12 @@ Run: .venv/bin/python -m unittest tests.test_webauth
 """
 
 import base64
+import contextlib
 import hashlib
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -521,9 +523,9 @@ class OneCommandInstallTest(unittest.TestCase):
 
 
 class AnisetteProvenanceTest(unittest.TestCase):
-    """The reviewer could not authenticate what source produced the published anisette image
-    or where its Apple libraries come from. The image is now built here from one pinned
-    upstream commit, and the chain is written down."""
+    """The anisette image is built here from one pinned apple-crates commit and Pear's own
+    loader, and Apple's CoreADI64.dll only ever runs if it is the exact file that was reviewed.
+    These keep that chain intact."""
 
     ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 
@@ -531,101 +533,91 @@ class AnisetteProvenanceTest(unittest.TestCase):
         with open(os.path.join(self.ROOT, *parts)) as fh:
             return fh.read()
 
+    def _rev(self):
+        found = re.search(r"^ARG APPLE_CRATES_REV=([0-9a-f]{40})$",
+                          self._read("anisette", "Containerfile"), re.M)
+        self.assertIsNotNone(found, "the pinned revision is gone or is not a full 40-char SHA")
+        return found.group(1)
+
     def test_the_revision_is_a_full_sha_and_appears_once(self):
         """An abbreviated SHA is not a pin, and a second copy of it is a thing that drifts."""
-        body = self._read("anisette", "Containerfile")
-        found = re.search(r"^ARG ANISETTE_REV=([0-9a-f]{40})$", body, re.M)
-        self.assertIsNotNone(found, "the pinned revision is gone or is not a full 40-char SHA")
-        rev = found.group(1)
-        # the unit must run exactly what the Containerfile pins
+        rev = self._rev()
         unit = self._read("systemd", "pear-passwords-anisette.service")
         self.assertIn(f"localhost/pear-passwords-anisette:{rev}", unit,
                       "the service runs an image the Containerfile does not build")
-        # build.sh must not carry its own copy of the revision
         self.assertNotIn(rev, self._read("anisette", "build.sh"),
                          "build.sh hardcodes the revision instead of reading the Containerfile")
 
-    def test_the_published_image_is_no_longer_run(self):
-        """It is still named in a comment, explaining why it is not used - which is fine. What
-        matters is that no line the unit executes mentions it."""
+    def test_the_build_checks_out_exactly_that_commit(self):
+        cf = self._read("anisette", "Containerfile")
+        self.assertIn('test "${#APPLE_CRATES_REV}" -eq 40', cf)
+        self.assertIn('test "$(git -C apple-crates rev-parse HEAD)" = "${APPLE_CRATES_REV}"', cf)
+        self.assertIn("cargo build --locked --release --target x86_64-pc-windows-gnu", cf,
+                      "the loader is built without its lock file")
+
+    def test_no_published_image_is_run(self):
+        """Comments may name images; no line the unit executes pulls one from a registry."""
         unit = self._read("systemd", "pear-passwords-anisette.service")
         for n, line in enumerate(unit.split("\n"), 1):
             if line.lstrip().startswith("#"):
                 continue
-            self.assertNotIn("docker.io/dadoum", line,
-                             f"line {n} still runs the unattested Docker Hub image: {line.strip()}")
+            self.assertNotIn("docker.io", line, f"line {n} runs a published image: {line.strip()}")
 
     def test_build_refuses_a_revision_that_is_not_a_full_sha(self):
         self.assertIn("[0-9a-f]{40}", self._read("anisette", "build.sh"),
                       "build.sh no longer validates the revision it is given")
 
-    def test_the_provenance_document_states_the_apple_library_source(self):
+    def test_the_provenance_document_states_where_the_dll_comes_from(self):
         doc = self._read("docs", "anisette-provenance.md")
-        for needed in ("apps.mzstatic.com", "libCoreADI.so", "libstoreservicescore.so"):
+        for needed in ("Microsoft Store", "CoreADI64.dll", "coreadi.sha256",
+                       "AppleInc.iCloud_15.10.39.0_x64__nzyj5cx40ttqa", "LGPL-2.1-or-later"):
             self.assertIn(needed, doc, f"the provenance doc no longer mentions {needed}")
-        # and must not oversell: the APK is not pinned
-        self.assertRegex(doc, r"(?i)not .{0,24}pinned|no digest",
-                         "the doc does not say the Apple APK is unpinned")
+        # and must not oversell: the download URL is not pinned, only what it serves
+        self.assertRegex(doc, r"(?i)url .{0,40}(expires|not pinned)",
+                         "the doc does not say the download URL itself is not pinned")
 
-    # --- Provision's session with Apple is TLS-verified (#10755) ------------------
+    # --- the image tag names Pear's recipe ---------------------------------------
 
-    def _patch_id(self):
-        """What anisette/patch-id.sh prints: sha256 of the sha256sum lines, first 12 digits."""
+    RECIPE_FILES = ("Containerfile", "entrypoint.sh", "fetch-coreadi.py", "coreadi.sha256",
+                    "microsoft-root-ca-2011.pem", "loader/Cargo.toml", "loader/Cargo.lock",
+                    "loader/src/main.rs")
+
+    def _recipe_id(self):
+        """What anisette/recipe-id.sh prints: sha256 of the sha256sum lines, first 12 digits."""
         lines = ""
-        names = ["apple-root-ca.pem"] + sorted(
-            "patches/" + n for n in os.listdir(os.path.join(self.ROOT, "anisette", "patches"))
-            if n.endswith(".patch"))
-        for name in names:
+        for name in self.RECIPE_FILES:
             with open(os.path.join(self.ROOT, "anisette", name), "rb") as fh:
                 lines += f"{hashlib.sha256(fh.read()).hexdigest()}  {name}\n"
         return hashlib.sha256(lines.encode()).hexdigest()[:12]
 
-    def test_the_unit_runs_the_image_with_the_current_patches(self):
-        rev = re.search(r"^ARG ANISETTE_REV=([0-9a-f]{40})$",
-                        self._read("anisette", "Containerfile"), re.M).group(1)
-        script = subprocess.run([os.path.join(self.ROOT, "anisette", "patch-id.sh")],
+    def test_the_unit_runs_the_image_with_the_current_recipe(self):
+        script = subprocess.run([os.path.join(self.ROOT, "anisette", "recipe-id.sh")],
                                 capture_output=True, text=True, check=True).stdout.strip()
-        self.assertEqual(script, self._patch_id())
-        self.assertIn(f"localhost/pear-passwords-anisette:{rev}-{script}\n",
+        self.assertEqual(script, self._recipe_id())
+        self.assertIn(f"localhost/pear-passwords-anisette:{self._rev()}-{script}\n",
                       self._read("systemd", "pear-passwords-anisette.service"),
-                      "the unit runs an image built with other patches (or none)")
+                      "the unit runs an image built from another recipe")
 
-    def test_the_provision_patch_restores_verified_tls_to_apple(self):
-        patch = self._read("anisette", "patches", "provision-apple-tls.patch")
-        removed = [l[1:].strip() for l in patch.splitlines()
-                   if l.startswith("-") and not l.startswith("---")]
-        added = [l[1:].strip() for l in patch.splitlines()
-                 if l.startswith("+") and not l.startswith("+++")]
-        self.assertIn("request.sslSetVerifyPeer(false);", removed)
-        for line in ('enum appleRootCA = "/opt/apple-root-ca.pem";',
-                     "http.caInfo = appleRootCA;", "http.verifyPeer = true;",
-                     "http.verifyHost = true;", "http.maxRedirects = 0;",
-                     "http.url = appleURL(url);"):
-            self.assertIn(line, added)
-        self.assertFalse([l for l in added if "VerifyPeer(false" in l or "verifyHost = false" in l])
-        # every request in the session goes through appleFetch, the URL bag's two included
-        self.assertIn('string startProvisioningPlist = appleFetch(urlBag["midStartProvisioning"],',
-                      added)
-        self.assertIn('string endProvisioningPlist = appleFetch(urlBag["midFinishProvisioning"], '
-                      'format!"<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>', added)
+    def test_every_file_the_image_copies_is_in_the_recipe(self):
+        """A file COPY'd into the image but left out of recipe-id.sh could change unnoticed."""
+        cf = self._read("anisette", "Containerfile")
+        copied = set()
+        for line in cf.splitlines():
+            if line.startswith("COPY ") and "--from=" not in line:
+                copied.update(line.split()[1:-1])
+        for name in copied:
+            name = name.rstrip("/")
+            self.assertTrue(any(f == name or f.startswith(name + "/") for f in self.RECIPE_FILES),
+                            f"{name} is copied into the image but not part of the recipe id")
+        self.assertIn('sha256sum Containerfile entrypoint.sh fetch-coreadi.py coreadi.sha256',
+                      self._read("anisette", "recipe-id.sh"))
 
-    def test_the_image_carries_the_one_root_the_patch_trusts(self):
-        with open(os.path.join(self.ROOT, "anisette", "apple-root-ca.pem"), "rb") as a, \
-                open(os.path.join(self.ROOT, "backend", "icp", "certs", "apple-root-ca.pem"),
-                     "rb") as b:
-            self.assertEqual(a.read(), b.read())
-        body = self._read("anisette", "Containerfile")
-        self.assertIn("COPY apple-root-ca.pem /opt/apple-root-ca.pem", body)
-        self.assertRegex(body, r"ARG PROVISION_REV=[0-9a-f]{40}\n")
-        self.assertIn("git -C provision apply /patches/provision-apple-tls.patch", body)
-        self.assertIn("! grep -n 'sslSetVerifyPeer(false)' provision/lib/provision/adi.d", body)
-
-    def test_the_installer_reuses_an_image_only_with_the_same_patches(self):
+    def test_the_installer_reuses_an_image_only_with_the_same_recipe(self):
         body = self._read("install.sh")
-        self.assertIn('anisette_patches="$("$here/anisette/patch-id.sh")"', body)
-        self.assertIn('anisette_image="localhost/pear-passwords-anisette:$anisette_rev-$anisette_patches"',
+        self.assertIn('anisette_recipe="$("$here/anisette/recipe-id.sh")"', body)
+        self.assertIn('anisette_image="localhost/pear-passwords-anisette:$anisette_rev-$anisette_recipe"',
                       body)
-        self.assertIn('= "$anisette_rev $anisette_patches" ]', body)
+        self.assertIn('= "$anisette_rev $anisette_recipe" ]', body)
         self.assertIn("systemctl --user try-restart pear-passwords-anisette.service", body)
 
     def test_the_installer_builds_before_enabling_the_unit(self):
@@ -634,98 +626,166 @@ class AnisetteProvenanceTest(unittest.TestCase):
                         body.index("enable --now pear-passwords-anisette.service"),
                         "the unit is enabled before the image it runs exists")
 
-    # --- the libraries are gated at startup, not merely recorded ---------------
+    def test_the_identity_is_pinned_so_restarts_keep_it(self):
+        """CoreADI derives the device id from the MAC address and host name, among others; a
+        container gets fresh ones on every start unless the unit fixes them, and Apple would
+        then see a new device (and ask for a code again) after every restart."""
+        unit = self._read("systemd", "pear-passwords-anisette.service")
+        self.assertIn("--hostname %m ", unit)
+        self.assertRegex(unit, r"--network pasta:--ns-mac-addr,([0-9a-f]{2}:){5}[0-9a-f]{2} ")
+        self.assertIn("-v pear-passwords-anisette:/home/pear/data", unit)
+        self.assertIn("-p 127.0.0.1:6969:6969", unit)
 
-    def _entrypoint_harness(self, tmp, core, ssc, preexisting=None):
-        """Run anisette/entrypoint.sh with its download stubbed out.
+    # --- the DLL is gated at startup, not merely recorded ------------------------
 
-        LIBDIR and DIGESTS are deliberately hardcoded in the real script, so that
-        an argument cannot point the gate at a directory the server does not read.
-        That also means they have to be rewritten to exercise it. The sed-like
-        replacements below are asserted to have applied: if the script changes
-        shape, this fails loudly rather than testing nothing.
-        """
-        libdir = os.path.join(tmp, "lib")
+    def _entrypoint_harness(self, tmp, fetched, preexisting=None, args=()):
+        """Run anisette/entrypoint.sh with the Store fetch and Wine stubbed out.
+
+        DATA and DIGESTS are hardcoded in the real script, so that nothing outside it can point
+        the gate at another directory; they have to be rewritten to exercise it. Each swap is
+        asserted to apply: if the script changes shape this fails loudly rather than testing
+        nothing."""
+        data = os.path.join(tmp, "data")
         digests = os.path.join(tmp, "digests")
         script = os.path.join(tmp, "entrypoint.sh")
-
         with open(digests, "w") as fh:
             fh.write("# comment the checker must skip\n\n")
-            fh.write(hashlib.sha256(b"REAL-CORE").hexdigest() + "  libCoreADI.so\n")
-            fh.write(hashlib.sha256(b"REAL-SSC").hexdigest() + "  libstoreservicescore.so\n")
-
+            fh.write("0" * 64 + "  AppleInc.iCloud_15.10.39.0_x64.msix\n")
+            fh.write(hashlib.sha256(b"REAL-DLL").hexdigest() + "  CoreADI64.dll\n")
         body = self._read("anisette", "entrypoint.sh")
         swaps = [
-            ("LIBDIR=/home/Alcoholic/.config/anisette-v3/lib", "LIBDIR=%s" % libdir),
-            ("DIGESTS=/opt/apple-libs.sha256", "DIGESTS=%s" % digests),
-            ('curl -fsSL "$APK_URL" -o "$tmp/applemusic.apk"', ":"),
-            ('unzip -p "$tmp/applemusic.apk" lib/x86_64/libCoreADI.so > "$tmp/libCoreADI.so"',
-             'printf "%s" "$FAKE_CORE" > "$tmp/libCoreADI.so"'),
-            ('unzip -p "$tmp/applemusic.apk" lib/x86_64/libstoreservicescore.so'
-             ' > "$tmp/libstoreservicescore.so"',
-             'printf "%s" "$FAKE_SSC" > "$tmp/libstoreservicescore.so"'),
-            ('exec /opt/anisette-v3-server "$@"', 'echo STARTED'),
+            ("DATA=/home/pear/data", "DATA=%s" % data),
+            ("DIGESTS=/opt/pear/coreadi.sha256", "DIGESTS=%s" % digests),
+            ('python3 -I /opt/pear/fetch-coreadi.py "$DLLDIR"',
+             'printf "%s" "$FAKE_DLL" > "$DLLDIR/CoreADI64.dll"'),
+            ("    wine wineboot --init\n", "    :\n"),
+            ("    wineserver --wait\n", "    :\n"),
+            ("exec wine /opt/pear/pear-coreadi.exe", "echo STARTED; exit 0; :"),
         ]
         for old, repl in swaps:
             self.assertIn(old, body, "entrypoint.sh no longer contains %r" % old)
             body = body.replace(old, repl)
         with open(script, "w") as fh:
             fh.write(body)
-        os.chmod(script, 0o755)
-
         if preexisting is not None:
-            os.makedirs(libdir, exist_ok=True)
-            for name, data in preexisting.items():
-                with open(os.path.join(libdir, name), "wb") as fh:
-                    fh.write(data)
+            os.makedirs(os.path.join(data, "coreadi"), exist_ok=True)
+            with open(os.path.join(data, "coreadi", "CoreADI64.dll"), "wb") as fh:
+                fh.write(preexisting)
+        env = dict(os.environ, FAKE_DLL=fetched, HOME=tmp,
+                   WINEPREFIX=os.path.join(data, "prefix"))
+        run = subprocess.run(["/bin/sh", script, *args], env=env, capture_output=True, text=True)
+        return run, os.path.join(data, "coreadi", "CoreADI64.dll")
 
-        env = dict(os.environ, FAKE_CORE=core, FAKE_SSC=ssc)
-        run = subprocess.run(["/bin/sh", script], env=env,
-                             capture_output=True, text=True)
-        return run, libdir
-
-    def test_matching_libraries_start_the_server(self):
+    def test_the_matching_dll_starts_the_server(self):
         with tempfile.TemporaryDirectory() as tmp:
-            run, libdir = self._entrypoint_harness(tmp, "REAL-CORE", "REAL-SSC")
+            run, dll = self._entrypoint_harness(tmp, "REAL-DLL")
             self.assertEqual(0, run.returncode, run.stderr)
             self.assertIn("STARTED", run.stdout)
-            self.assertTrue(os.path.exists(os.path.join(libdir, "libCoreADI.so")))
+            self.assertTrue(os.path.exists(dll))
 
-    def test_a_substituted_library_stops_the_server_and_is_not_installed(self):
-        """The finding: Apple's APK is mutable and the libraries were loaded unchecked."""
+    def test_a_substituted_dll_stops_the_server(self):
         with tempfile.TemporaryDirectory() as tmp:
-            run, libdir = self._entrypoint_harness(tmp, "REAL-CORE", "TAMPERED")
-            self.assertNotEqual(0, run.returncode, "a substituted library still started the server")
+            run, _ = self._entrypoint_harness(tmp, "TAMPERED")
+            self.assertNotEqual(0, run.returncode, "a substituted DLL still started the server")
             self.assertNotIn("STARTED", run.stdout)
             self.assertIn("REFUSING TO START", run.stderr)
-            self.assertFalse(os.path.exists(os.path.join(libdir, "libCoreADI.so")),
-                             "libraries were installed despite the digest mismatch")
 
-    def test_libraries_already_in_the_volume_are_checked_too(self):
-        """The volume outlives the image and is writable, so a previous start is not evidence."""
+    def test_a_dll_already_in_the_volume_is_checked_too(self):
+        """The volume outlives the image and is writable, so an earlier start is not evidence."""
         with tempfile.TemporaryDirectory() as tmp:
-            run, _ = self._entrypoint_harness(
-                tmp, "REAL-CORE", "REAL-SSC",
-                preexisting={"libCoreADI.so": b"REAL-CORE",
-                             "libstoreservicescore.so": b"SWAPPED-LATER"})
-            self.assertNotEqual(0, run.returncode,
-                                "a swapped library in the volume still started the server")
+            run, _ = self._entrypoint_harness(tmp, "REAL-DLL", preexisting=b"SWAPPED-LATER")
+            self.assertNotEqual(0, run.returncode, "a swapped DLL in the volume still started")
             self.assertIn("REFUSING TO START", run.stderr)
 
-    def test_the_container_runs_the_gate_and_not_the_server_directly(self):
-        cf = self._read("anisette", "Containerfile")
-        self.assertRegex(cf, r'ENTRYPOINT \[ "/opt/entrypoint\.sh" \]',
-                         "the image starts the server directly, bypassing the digest gate")
-        self.assertIn("COPY apple-libs.sha256 /opt/apple-libs.sha256", cf,
-                      "the digests are not in the image, so the gate has nothing to check against")
-        for tool in ("curl", "unzip"):
-            self.assertIn(tool, cf, "the runtime image cannot fetch and unpack the APK itself")
+    def test_the_gate_takes_no_arguments(self):
+        """Arguments could point the loader at another DLL than the one the gate checked."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run, _ = self._entrypoint_harness(tmp, "REAL-DLL", args=("--dll", "/tmp/x.dll"))
+            self.assertNotEqual(0, run.returncode)
+            self.assertNotIn("STARTED", run.stdout)
 
-    def test_the_gate_keeps_the_library_directory_out_of_argv(self):
-        """--adi-path moves where the server loads libraries from; the gate would
-        then be checking a directory nothing reads."""
-        body = self._read("anisette", "entrypoint.sh")
-        self.assertIn("--adi-path", body, "the gate no longer refuses to be pointed elsewhere")
+    def test_the_container_runs_the_gate_and_not_the_loader_directly(self):
+        cf = self._read("anisette", "Containerfile")
+        self.assertRegex(cf, r'ENTRYPOINT \[ "/opt/pear/entrypoint\.sh" \]',
+                         "the image starts the loader directly, bypassing the digest gate")
+        self.assertIn("COPY entrypoint.sh fetch-coreadi.py coreadi.sha256 microsoft-root-ca-2011.pem /opt/pear/", cf)
+        self.assertIn("chown -R root:root /opt/pear", cf)
+        self.assertIn("chmod 0444 /opt/pear/coreadi.sha256 /opt/pear/microsoft-root-ca-2011.pem", cf)
+        self.assertIn("USER pear", cf)
+
+    # --- the Store fetch refuses anything but the reviewed bytes ------------------
+
+    def _fetcher(self):
+        import importlib.util
+        path = os.path.join(self.ROOT, "anisette", "fetch-coreadi.py")
+        spec = importlib.util.spec_from_file_location("fetch_coreadi_under_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _run_fetch(self, member_bytes, package_digest_ok=True):
+        import base64
+        import io
+        import zipfile
+        fetch = self._fetcher()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr(fetch.MEMBER, member_bytes)
+        package = buf.getvalue()
+        sha1 = base64.b64encode(hashlib.sha1(package).digest()).decode()
+        fetch.PACKAGE_SHA1_B64 = sha1
+        pinned = {fetch.PACKAGE_NAME: hashlib.sha256(package).hexdigest()
+                  if package_digest_ok else "0" * 64,
+                  fetch.DLL_NAME: hashlib.sha256(b"REAL-DLL").hexdigest()}
+        fetch.digests = lambda: pinned
+        fetch.category_id = lambda: "category"
+        fetch.cookie = lambda: "cookie"
+        fetch.update_identity = lambda cookie, category: ("update", "1")
+        fetch.package_url = lambda update, revision: "http://tlu.dl.delivery.mp.microsoft.com/x"
+
+        def download(url, path):
+            with open(path, "wb") as fh:
+                fh.write(package)
+            return sha1, hashlib.sha256(package).hexdigest()
+        fetch.download = download
+        with tempfile.TemporaryDirectory() as out:
+            argv = sys.argv
+            sys.argv = ["fetch-coreadi.py", out]
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    fetch.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+            finally:
+                sys.argv = argv
+            return code, os.listdir(out)
+
+    def test_the_fetch_installs_only_the_pinned_dll(self):
+        code, files = self._run_fetch(b"REAL-DLL")
+        self.assertEqual(0, code)
+        self.assertEqual(["CoreADI64.dll"], files, "anything but the one DLL was left behind")
+
+    def test_the_fetch_refuses_a_package_with_another_digest(self):
+        code, files = self._run_fetch(b"REAL-DLL", package_digest_ok=False)
+        self.assertNotEqual(0, code)
+        self.assertEqual([], files, "a package that does not match still installed something")
+
+    def test_the_fetch_refuses_a_dll_with_another_digest(self):
+        code, files = self._run_fetch(b"TAMPERED")
+        self.assertNotEqual(0, code)
+        self.assertEqual([], files, "a DLL that does not match was installed")
+
+    def test_the_store_host_trusts_only_microsofts_root(self):
+        body = self._read("anisette", "fetch-coreadi.py")
+        self.assertIn('FE3_TLS = ssl.create_default_context(cafile=os.path.join(HERE, '
+                      '"microsoft-root-ca-2011.pem"))', body)
+        self.assertIn("tls=FE3_TLS", body)
+        pem = self._read("anisette", "microsoft-root-ca-2011.pem")
+        der = base64_der(pem)
+        self.assertEqual("847df6a78497943f27fc72eb93f9a637320a02b561d0a91b09e87a7807ed7c61",
+                         hashlib.sha256(der).hexdigest(),
+                         "microsoft-root-ca-2011.pem is not Microsoft Root Certificate Authority 2011")
 
     def test_build_output_is_not_shown_as_an_error(self):
         """podman writes build progress to stderr. 2.0's window never runs the build, so none
@@ -734,6 +794,12 @@ class AnisetteProvenanceTest(unittest.TestCase):
         self.assertNotIn("setupError", qml, "the window shows installer output again")
         self.assertNotRegex(qml, r"onRead: function \(line\) \{ if \(line\.trim\(\)\) root\.setupError",
                             "a single stderr line still becomes an error")
+
+
+def base64_der(pem: str) -> bytes:
+    import base64
+    body = "".join(l for l in pem.splitlines() if l and not l.startswith("-----"))
+    return base64.b64decode(body)
 
 
 if __name__ == "__main__":

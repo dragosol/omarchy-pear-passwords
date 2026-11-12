@@ -1,0 +1,10 @@
+# Apple's CoreADI64.dll and the package it is taken from. ENFORCED, not recorded:
+# fetch-coreadi.py refuses any package or DLL that does not match, and entrypoint.sh checks the
+# DLL in the volume again before every start, so editing this file changes what runs.
+#
+# Recorded 2026-11-11 from the Microsoft Store package AppleInc.iCloud_15.10.39.0_x64__nzyj5cx40ttqa
+# (iCloud for Windows 15.10.39, x64; Store product 9PKTQ5699M62), downloaded anonymously through
+# Microsoft's Store delivery service. The package's FE3 SHA-1 digest is P1Kpw7IV6KPQTx4bY13iRTC5uyA=.
+# The DLL's own version resource says iCloud for Windows 15.10.0.39. See docs/anisette-provenance.md.
+bdca7b5b8b2819d758cd7ba4ea25bd87b7cca1ae7dc25627e6cd02248d8d38ca  AppleInc.iCloud_15.10.39.0_x64.msix
+687133100a588c9da6e12d14b0a7a40be6c0870bd93cac9486866576f83298b0  CoreADI64.dll

@@ -29,8 +29,9 @@ CKDATABASE_SYNC_URL = "https://gateway.icloud.com/ckdatabase/api/client/record/s
 # A save is a different endpoint from the fetch, not just a different op type on /record/sync.
 CKDATABASE_SAVE_URL = "https://gateway.icloud.com/ckdatabase/api/client/record/save"
 CK_APP_INIT_URL = "https://gateway.icloud.com/setup/setup/ck/v1/ckAppInit"
-CK_MME_CLIENT_INFO = (f"<{const.DEVICE_MODEL}> <Mac OS X;{const.OS_VERSION};{const.OS_BUILD}> "
-                      "<com.apple.cloudkit.CloudKitDaemon/1970 (com.apple.cloudd/1970)>")
+# The header names the account's platform (const.CLIENT_PLATFORM), as every call made with its
+# tokens does; the protobuf device fields below keep describing the Mac the keychain peer is.
+CK_MME_CLIENT_INFO = const.client_info(const.CLOUDKIT_SERVICE)
 CUTTLEFISH_CONTAINER = "com.apple.security.keychain"
 CUTTLEFISH_BUNDLE = "com.apple.security.cuttlefish"   # CKCode (Cuttlefish) requests
 SECURITYD_BUNDLE = "com.apple.securityd"              # CKKS record fetches

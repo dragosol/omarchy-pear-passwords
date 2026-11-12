@@ -182,8 +182,9 @@ class EscrowRecovery:
 
     # escrowproxy wants the sbd UA + a fixed X-Mme-Client-Info that overwrites anisette's.
     ESCROW_USER_AGENT = "com.apple.sbd/638.100.48 com.apple.iCloudHelper/282"
-    ESCROW_MME_CLIENT_INFO = (f"<{const.DEVICE_MODEL}> <macOS;{const.OS_VERSION};{const.OS_BUILD}> "
-                              "<com.apple.AuthKit/1 (com.apple.sbd/638.100.48)>")
+    # On the platform the PET was issued to (const.CLIENT_PLATFORM); a Mac identity here is
+    # refused with 401 -3001 "Authentication failed".
+    ESCROW_MME_CLIENT_INFO = const.client_info(const.ESCROW_SERVICE)
 
     def __init__(self, host: str, email: str, pet: str, anisette, *, timeout: int = 30,
                  session: requests.Session | None = None):

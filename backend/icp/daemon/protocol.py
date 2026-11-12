@@ -231,6 +231,8 @@ class OpError(Exception):
         super().__init__(code)
         self.code = code
         self.extra = extra
+        # A short, secret-free note for the journal only (never sent), e.g. "Apple -80045".
+        self.log_note = ""
 
     def reply(self, rid) -> dict:
         return {"rid": rid, "error": self.code, **self.extra}

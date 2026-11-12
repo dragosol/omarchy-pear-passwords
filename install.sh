@@ -106,23 +106,24 @@ fi
 
 if [ "$stage_only" -eq 0 ]; then
 say "Building the anisette server from pinned source"
-# The sign-in helper is third-party code (Dadoum/anisette-v3-server). The published image on
-# Docker Hub has no provenance labels and ships a binary built elsewhere, so it is built here
-# instead, from the one upstream commit pinned in anisette/Containerfile. Takes a couple of
-# minutes the first time; after that the image is reused. See docs/anisette-provenance.md.
-anisette_rev="$(sed -n 's/^ARG ANISETTE_REV=\([0-9a-f]\{40\}\)$/\1/p' "$here/anisette/Containerfile")"
-[ -n "$anisette_rev" ] || die "could not read the pinned anisette revision from anisette/Containerfile"
-# Pear's patches to that source (anisette/patches/) are part of the tag, so an image built
-# before a patch changed is rebuilt rather than reused.
-anisette_patches="$("$here/anisette/patch-id.sh")"
-anisette_image="localhost/pear-passwords-anisette:$anisette_rev-$anisette_patches"
+# The sign-in helper runs Apple's Windows ADI under Wine through Pear's loader (anisette/loader),
+# built here against the one apple-crates commit pinned in anisette/Containerfile. Takes a few
+# minutes the first time; after that the image is reused. Its first start then downloads
+# iCloud for Windows from the Microsoft Store (337 MB) to take CoreADI64.dll out of it. See
+# docs/anisette-provenance.md.
+anisette_rev="$(sed -n 's/^ARG APPLE_CRATES_REV=\([0-9a-f]\{40\}\)$/\1/p' "$here/anisette/Containerfile")"
+[ -n "$anisette_rev" ] || die "could not read the pinned apple-crates revision from anisette/Containerfile"
+# Pear's own files in anisette/ (the loader, the gate, the digests) are part of the tag, so an
+# image built before one of them changed is rebuilt rather than reused.
+anisette_recipe="$("$here/anisette/recipe-id.sh")"
+anisette_image="localhost/pear-passwords-anisette:$anisette_rev-$anisette_recipe"
 # A unit pointing at a tag nobody builds would fail at start with a bare "image not known".
 grep -qF "$anisette_image" "$here/systemd/pear-passwords-anisette.service" \
   || die "systemd/pear-passwords-anisette.service does not run $anisette_image"
 anisette_rebuilt=0
-if [ "$(podman image inspect --format '{{index .Labels "org.opencontainers.image.revision"}} {{index .Labels "io.github.dragosol.pear-passwords.patches"}}' \
-        "$anisette_image" 2>/dev/null)" = "$anisette_rev $anisette_patches" ]; then
-  say "Already built at ${anisette_rev:0:12} with patches $anisette_patches, reusing it"
+if [ "$(podman image inspect --format '{{index .Labels "io.github.dragosol.pear-passwords.apple-crates.revision"}} {{index .Labels "io.github.dragosol.pear-passwords.recipe"}}' \
+        "$anisette_image" 2>/dev/null)" = "$anisette_rev $anisette_recipe" ]; then
+  say "Already built at ${anisette_rev:0:12} with recipe $anisette_recipe, reusing it"
 else
   "$here/anisette/build.sh" "$anisette_rev"
   anisette_rebuilt=1
