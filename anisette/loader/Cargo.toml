@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 publish = false
 description = "Pear Passwords' anisette server: Apple's Windows CoreADI64.dll, loaded with apple-crates, served on 127.0.0.1"
-license = "LGPL-2.1-or-later"
+license = "MIT"
 
 # apple-crates is fetched by the Containerfile at one pinned commit and placed next to this
 # directory; nothing here names a registry copy or a branch of it.

@@ -17,7 +17,7 @@ ARG RUST_BUILDER=docker.io/library/rust:1-slim-trixie@sha256:f6c4a35d21dbb3c89d7
 # "Invalid parameter" before any connection is made.
 ARG RUNTIME=registry.fedoraproject.org/fedora-minimal:44@sha256:964ca942f6e28c5229eb81078f2d2e3ee0aa644871fb9b054507d26c1e569a77
 
-# apple-crates (LGPL-2.1-or-later), the one revision the loader is built against. Full
+# apple-crates (MPL, per its author), the one revision the loader is built against. Full
 # 40-character commit SHA only: a branch or a tag could move under the same name.
 ARG APPLE_CRATES_REV=b6e2ac2e5eb971fed221e298a043d6a61402645b
 ARG APPLE_CRATES_REPO=https://tangled.org/dadoum.zone/apple-crates
@@ -84,7 +84,7 @@ LABEL org.opencontainers.image.title="Pear Passwords anisette (Windows ADI)" \
       io.github.dragosol.pear-passwords.apple-crates.source="https://tangled.org/dadoum.zone/apple-crates" \
       io.github.dragosol.pear-passwords.apple-crates.revision="${APPLE_CRATES_REV}" \
       io.github.dragosol.pear-passwords.recipe="${PEAR_RECIPE}" \
-      org.opencontainers.image.licenses="LGPL-2.1-or-later" \
+      org.opencontainers.image.licenses="MIT AND MPL-2.0" \
       org.opencontainers.image.base.name="${RUNTIME}" \
       org.opencontainers.image.documentation="https://github.com/dragosol/omarchy-pear-passwords/blob/main/docs/anisette-provenance.md"
 

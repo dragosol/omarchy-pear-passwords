@@ -570,7 +570,7 @@ class AnisetteProvenanceTest(unittest.TestCase):
     def test_the_provenance_document_states_where_the_dll_comes_from(self):
         doc = self._read("docs", "anisette-provenance.md")
         for needed in ("Microsoft Store", "CoreADI64.dll", "coreadi.sha256",
-                       "AppleInc.iCloud_15.10.39.0_x64__nzyj5cx40ttqa", "LGPL-2.1-or-later"):
+                       "AppleInc.iCloud_15.10.39.0_x64__nzyj5cx40ttqa", "MPL"):
             self.assertIn(needed, doc, f"the provenance doc no longer mentions {needed}")
         # and must not oversell: the download URL is not pinned, only what it serves
         self.assertRegex(doc, r"(?i)url .{0,40}(expires|not pinned)",

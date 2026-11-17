@@ -118,7 +118,7 @@ one command for you to run with sudo:
 
 <!-- pinned: tools/gen-sha256sums.sh keeps the hash below equal to sha256(SHA256SUMS) -->
 ```sh
-sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "c40c01c293ca7620b41abae3739725be7502964a3488e7be42890edb83eb4d8d  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
+sudo sh -c 'set -eu; h=$(getent passwd "${SUDO_USER:?run this with sudo}" | cut -d: -f6); s=$(mktemp -d /root/pear-stage.XXXXXX); trap "rm -rf \"$s\"" EXIT; cp -rT --no-preserve=all "$h/.cache/pear-passwords/stage" "$s"; cd "$s"; echo "cf2cc44f01faa50fccdeca89afe489d092ce08fb2b8c21c440aeb7125671257a  SHA256SUMS" | sha256sum -c --strict --quiet; sha256sum -c --strict --quiet SHA256SUMS; sh ./system/install-root.sh "$s"'
 ```
 
 The command copies the stage into a fresh directory only root can write, checks that its
@@ -582,7 +582,7 @@ fails until both are current.
 The backend builds on the original Linux iCloud sync backend by
 [Sankarsh Makam](https://github.com/Sank6) (MIT). Anisette data comes from Apple's Windows ADI,
 loaded with Dadoum's [apple-crates](https://tangled.org/dadoum.zone/apple-crates)
-(LGPL-2.1-or-later), built from source as described in
+(MPL, per its author), built from source as described in
 [docs/anisette-provenance.md](docs/anisette-provenance.md). Thanks to Dadoum for pointing the
 way to loading `CoreADI64.dll` directly.
 

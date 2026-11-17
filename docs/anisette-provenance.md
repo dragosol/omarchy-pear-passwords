@@ -55,8 +55,9 @@ hashed into that device id.
     repository  https://tangled.org/dadoum.zone/apple-crates
     commit      b6e2ac2e5eb971fed221e298a043d6a61402645b
     date        2026-10-27
-    license     LGPL-2.1-or-later (stated by the author on anisette-v3-server#61,
-                2026-11-12; the license file is to follow in the repository)
+    license     MPL (stated by the author on anisette-v3-server#61, 2026-11-13,
+                replacing the LGPL-2.1-or-later he named first; the version and the
+                license file are to follow in the repository)
 
 `anisette/Containerfile` builds against that commit and nothing else. It fetches
 the commit by its full 40-character SHA and aborts if `git rev-parse HEAD` does
@@ -78,8 +79,9 @@ with that revision and recipe exists, and then restarts the unit so it runs the
 new image. Nothing is pulled from a registry except the two base images, which
 are pinned by digest.
 
-The loader is built on this machine and never distributed as a binary, so the
-LGPL's relinking terms are met by the source being here.
+The loader (Pear's code, MIT) uses apple-crates' files unmodified and is built on
+this machine, never distributed as a binary; the MPL's file-level terms are met
+by apple-crates' source being fetched from its own repository at the pinned commit.
 
 ### Provisioning's TLS to Apple
 
@@ -145,7 +147,7 @@ it, and release that as a reviewed change.
 | Fedora / Debian packages inside them | Not pinned, resolved at build time |
 | Build reproducibility | Not bit-reproducible; the revision and recipe labels are the pin |
 | apple-crates history | Trusted, not independently verified; commits not signature-checked |
-| apple-crates license | LGPL-2.1-or-later per its author; no license file at the pinned commit |
+| apple-crates license | MPL per its author; no license file or version at the pinned commit |
 | DLL origin | The Microsoft Store's iCloud for Windows package, Apple Inc. |
 | Store delivery TLS | Microsoft Root Certificate Authority 2011 only |
 | Package and DLL bytes | Pinned by SHA-256 in `coreadi.sha256`, enforced before the DLL is written and on every start |
